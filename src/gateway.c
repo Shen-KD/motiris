@@ -76,6 +76,14 @@ static void safe_name(char *out, size_t n, const char *id) {
   out[j] = '\0';
 }
 
+static void mkdir_p(const char *path) {
+  char tmp[512];
+  snprintf(tmp, sizeof tmp, "%s", path);
+  for (char *p = tmp + 1; *p; p++)
+    if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+  mkdir(tmp, 0755);
+}
+
 static Session *get_session(const char *chat_id, int tools_on) {
   Session *s = find_session(chat_id);
   if (s) return s;
@@ -95,7 +103,7 @@ static Session *get_session(const char *chat_id, int tools_on) {
     size_t n = strlen(h) + 64;
     char *dir = malloc(n);
     snprintf(dir, n, "%s/.local/share/motiris/gateway", h);
-    mkdir(dir, 0755);
+    mkdir_p(dir);
     s->log_path = malloc(n);
     snprintf(s->log_path, n, "%s/%s.log", dir, ch);
     free(dir);

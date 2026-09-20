@@ -3,6 +3,17 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# kill any background jobs (mock servers) on any exit path, so failed
+# runs never leave orphan listeners holding test ports. dash's jobs -p
+# is unreliable on EXIT, so collect PIDs explicitly.
+MOCK_PIDS=""
+trap 'for p in $MOCK_PIDS; do kill "$p" 2>/dev/null || true; done; true' EXIT
+
+# isolate from any developer MOTIRIS_* env that would leak into tests
+# (shell-exported values intentionally override config.json)
+unset MOTIRIS_API_KEY MOTIRIS_MODEL MOTIRIS_BASE_URL MOTIRIS_PLUGIN_DIR \
+      MOTIRIS_GATEWAY_TOKEN MOTIRIS_WORKSPACE 2>/dev/null || true
+
 make motiris examples/hello_plugin.so >/dev/null 2>&1
 
 echo "== 1: agent loop runs end-to-end (echo transport)"
@@ -54,6 +65,7 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(("127.0.0.1",18099),H).serve_forever()
 ' &
 MOCKPID=$!
+MOCK_PIDS="$MOCK_PIDS $MOCKPID"
 sleep 0.5
 OUT=$(MOTIRIS_HOME="$TH8" ./motiris -p hi --transport libcurl --max-steps 1 -v 2>&1)
 kill $MOCKPID 2>/dev/null
@@ -66,6 +78,7 @@ GW=$(mktemp -d)
 printf '{"transport":"echo","tools":false}' > "$GW/config.json"
 MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18089 --no-tools >/dev/null 2>&1 &
 GWPID=$!
+MOCK_PIDS="$MOCK_PIDS $GWPID"
 sleep 0.3
 H=$(curl -s http://127.0.0.1:18089/health)
 echo "$H" | grep -q '"status":"ok"' || { echo "FAIL health: $H"; kill $GWPID 2>/dev/null; exit 1; }
@@ -75,6 +88,7 @@ kill $GWPID 2>/dev/null
 wait $GWPID 2>/dev/null || true
 MOTIRIS_GATEWAY_TOKEN=sekret MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18090 --no-tools >/dev/null 2>&1 &
 GWPID2=$!
+MOCK_PIDS="$MOCK_PIDS $GWPID2"
 sleep 0.3
 CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18090/health || true)
 [ "$CODE" = "401" ] || { echo "FAIL auth: got $CODE"; kill $GWPID2 2>/dev/null; exit 1; }
@@ -107,16 +121,66 @@ for port in (18091,18092):
     s = http.server.HTTPServer(("127.0.0.1",port),H); threading.Thread(target=s.serve_forever,daemon=True).start()
 threading.Event().wait()
 ' &
-M10PID=$!
+MOCKPID=$!
+MOCK_PIDS="$MOCK_PIDS $MOCKPID"
 sleep 0.5
 ROOT=$(pwd)
 cd "$F10/ws"
 O1=$(MOTIRIS_HOME="$F10/h1" MOTIRIS_WORKSPACE="$F10/ws" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
-echo "$O1" | grep -q 'hello content' || { echo "FAIL read: $O1"; kill $M10PID 2>/dev/null; exit 1; }
+echo "$O1" | grep -q 'hello content' || { echo "FAIL read: $O1"; exit 1; }
 O2=$(MOTIRIS_HOME="$F10/h2" MOTIRIS_WORKSPACE="$F10/ws" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
-echo "$O2" | grep -q 'outside workspace' || { echo "FAIL guard: $O2"; kill $M10PID 2>/dev/null; exit 1; }
-kill $M10PID 2>/dev/null
-wait $M10PID 2>/dev/null || true
+echo "$O2" | grep -q 'outside workspace' || { echo "FAIL guard: $O2"; exit 1; }
+kill $MOCKPID 2>/dev/null
+wait $MOCKPID 2>/dev/null || true
+cd "$ROOT"
 rm -rf "$F10"
+
+echo "== 11: web_fetch + memory + shell deny"
+F11=$(mktemp -d)
+mkdir -p "$F11/ws" "$F11/h3" "$F11/h4"
+printf '<html><body><h1>Hi there</h1><script>x</script>web ok</body></html>' > "$F11/ws/page.html"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18093/v1/chat/completions","shell_deny":"rm"}' > "$F11/h3/config.json"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18094/v1/chat/completions"}' > "$F11/h4/config.json"
+python3 -c '
+import http.server, json, threading, urllib.parse
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b=b"<html><body><h1>Hi there</h1><script>x</script>web ok</body></html>"
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            c = str(msgs[-1].get("content",""))[:120]
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"R:"+c}}]}
+        else:
+            port = self.server.server_address[1]
+            if port == 18093:
+                tc = {"name":"shell","arguments":json.dumps({"command":"rm /tmp/zz"})}
+            else:
+                tc = {"name":"memory_set","arguments":json.dumps({"key":"planet","value":"mars"})}
+            reply = {"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_w1","type":"function","function":tc}]}}]}
+        b = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+for port in (18093,18094):
+    s = http.server.HTTPServer(("127.0.0.1",port),H); threading.Thread(target=s.serve_forever,daemon=True).start()
+threading.Event().wait()
+' &
+M11PID=$!
+MOCK_PIDS="$MOCK_PIDS $M11PID"
+sleep 0.5
+ROOT=$(pwd)
+cd "$F11/ws"
+O3=$(MOTIRIS_HOME="$F11/h3" MOTIRIS_WORKSPACE="$F11/ws" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+echo "$O3" | grep -q 'blocked by shell policy' || { echo "FAIL deny: $O3"; kill $M11PID 2>/dev/null; exit 1; }
+O4=$(MOTIRIS_HOME="$F11/h4" MOTIRIS_WORKSPACE="$F11/ws" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+echo "$O4" | grep -q 'stored' || { echo "FAIL memory: $O4"; kill $M11PID 2>/dev/null; exit 1; }
+# memory persisted file exists
+ls "$HOME/.local/share/motiris/memory.json" >/dev/null 2>&1 || { echo "FAIL memory file"; kill $M11PID 2>/dev/null; exit 1; }
+kill $M11PID 2>/dev/null
+wait $M11PID 2>/dev/null || true
+cd "$ROOT"
+rm -rf "$F11"
 
 echo "smoke: all tests passed"

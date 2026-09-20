@@ -155,6 +155,9 @@ void motiris_apply_config(MotirisAgent *a) {
   if (cJSON_GetObjectItemCaseSensitive(j, "plugins"))
     motiris_set_plugins_enabled(a, jbool(j, "plugins", 1));
 
+  /* shell safety policy: "shell_allow": "git,ls", "shell_deny": "rm,sudo" */
+  motiris_set_shell_policy(jstr(j, "shell_allow"), jstr(j, "shell_deny"));
+
   /* provider fallback list: [{name, model, base_url, api_key_env}] */
   cJSON *provs = cJSON_GetObjectItemCaseSensitive(j, "providers");
   if (cJSON_IsArray(provs)) {
@@ -224,4 +227,59 @@ int motiris_init_config(void) {
   free(p);
   free(d);
   return rc;
+}
+
+/* ---------------- shell safety policy (issue #10) ---------------- */
+static char shell_allow[16][128];
+static int n_allow;
+static char shell_deny[16][128];
+static int n_deny;
+
+static void split_csv(char list[][128], int *n, const char *csv) {
+  *n = 0;
+  if (!csv) return;
+  const char *p = csv;
+  while (*p && *n < 16) {
+    const char *comma = strchr(p, ',');
+    size_t len = comma ? (size_t)(comma - p) : strlen(p);
+    while (len && (p[len-1] == ' ' || p[len-1] == '\t')) len--;
+    if (len > 0) {
+      if (len >= 128) len = 127;
+      memcpy(list[*n], p, len);
+      list[*n][len] = '\0';
+      (*n)++;
+    }
+    if (!comma) break;
+    p = comma + 1;
+  }
+}
+
+void motiris_set_shell_policy(const char *allow_csv, const char *deny_csv) {
+  split_csv(shell_allow, &n_allow, allow_csv);
+  split_csv(shell_deny, &n_deny, deny_csv);
+}
+
+char *motiris_shell_policy_check(const char *command) {
+  if (!command) return NULL;
+  for (int i = 0; i < n_deny; i++) {
+    if (!strncmp(command, shell_deny[i], strlen(shell_deny[i]))) {
+      size_t need = strlen(shell_deny[i]) + 48;
+      char *msg = malloc(need);
+      snprintf(msg, need,
+               "blocked by shell policy (deny prefix %s)", shell_deny[i]);
+      return msg;
+    }
+  }
+  if (n_allow > 0) {
+    for (int i = 0; i < n_allow; i++) {
+      if (!strncmp(command, shell_allow[i], strlen(shell_allow[i])))
+        return NULL;
+    }
+    char *msg = malloc(256);
+    snprintf(msg, 256,
+             "blocked by shell policy (not in allowlist, e.g. %s)",
+             shell_allow[0]);
+    return msg;
+  }
+  return NULL;
 }
