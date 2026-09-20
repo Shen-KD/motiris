@@ -30,8 +30,22 @@ static char *config_dir(void) {
   return p;
 }
 
+static char file_envs[16][64];
+static int n_file_envs;
+
 static void setenv_default(const char *key, const char *val) {
-  if (val && *val && !getenv(key)) setenv(key, val, 0);
+  if (val && *val && !getenv(key)) {
+    setenv(key, val, 0);
+    if (n_file_envs < 16) snprintf(file_envs[n_file_envs++], 64, "%s", key);
+  }
+}
+
+/* 1 = shell-exported (wins over config.json); 0 = unset or from env file */
+static int env_overrides(const char *key) {
+  if (!getenv(key)) return 0;
+  for (int i = 0; i < n_file_envs; i++)
+    if (!strcmp(file_envs[i], key)) return 0;
+  return 1;
 }
 
 /* parse KEY=VALUE lines; apply MOTIRIS_* vars as defaults */
@@ -120,8 +134,10 @@ void motiris_apply_config(MotirisAgent *a) {
   if (!j) { free(p); free(d); return; }
 
   const char *s;
-  if ((s = jstr(j, "model"))) motiris_set_model(a, s);
-  if ((s = jstr(j, "base_url"))) motiris_set_base_url(a, s);
+  if ((s = jstr(j, "model")) && !env_overrides("MOTIRIS_MODEL"))
+    motiris_set_model(a, s);
+  if ((s = jstr(j, "base_url")) && !env_overrides("MOTIRIS_BASE_URL"))
+    motiris_set_base_url(a, s);
   if ((s = jstr(j, "api_key_env"))) {
     const char *k = getenv(s);
     if (k) motiris_set_api_key(a, k);
