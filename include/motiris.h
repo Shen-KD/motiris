@@ -74,12 +74,20 @@ const char *motiris_last_error(MotirisAgent *a);
 /* built-in tools */
 void motiris_register_core_tools(MotirisAgent *a);
 void motiris_register_file_tools(MotirisAgent *a);  /* read/write/patch/search */
+void motiris_register_web_tools(MotirisAgent *a);   /* web_fetch/search */
+void motiris_register_memory_tools(MotirisAgent *a); /* memory get/set/list */
+void motiris_register_skill_tools(MotirisAgent *a, const char *dir);
 int  motiris_tools_enabled(MotirisAgent *a);
 
 /* ---- centralized config: $HOME/.motiris/{env,config.json} ---- */
 void motiris_load_env(void);                  /* call before new() */
 void motiris_apply_config(MotirisAgent *a);   /* defaults, CLI wins */
 int  motiris_init_config(void);               /* write templates */
+
+/* ---- shell safety policy (issue #10) ---- */
+void motiris_set_shell_policy(const char *allow_csv, const char *deny_csv);
+/* returns NULL if allowed, else malloc'd refusal reason */
+char *motiris_shell_policy_check(const char *command);
 
 /* ---- gateway: embedded HTTP service, session-per-chat_id ---- */
 int motiris_gateway_run(const char *listen_addr, const char *token,

@@ -39,6 +39,17 @@ static char *shell_call(const char *args_json, void *ud) {
   }
   const char *command = cmd->valuestring;
 
+  char *ban = motiris_shell_policy_check(command);
+  if (ban) {
+    cJSON_Delete(args);
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "error", ban);
+    free(ban);
+    char *s = cJSON_PrintUnformatted(r);
+    cJSON_Delete(r);
+    return s;
+  }
+
   int outpipe[2], errpipe[2];
   if (pipe(outpipe) || pipe(errpipe)) {
     cJSON_Delete(args);

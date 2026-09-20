@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
 
 static void usage(FILE *f) {
   fprintf(f,
@@ -31,6 +32,7 @@ static void usage(FILE *f) {
 "  -i, --interactive     force interactive REPL (default when tty)\n"
 "      --stream          stream tokens as they arrive (once-run mode)\n"
 "      --init            write $HOME/.motiris/{env,config.json} templates\n"
+"      --sessions [TERM] list session logs (grep TERM if given)\n"
 "      --gateway [LISTEN]  run as HTTP gateway (default :8899);\n"
 "                          token via MOTIRIS_GATEWAY_TOKEN\n"
 "  -h, --help            this help\n"
@@ -74,6 +76,51 @@ static char *load_skill_dir(const char *dir) {
 
 int motiris_repl(MotirisAgent *a);
 
+/* list gateway session logs under $HOME/.local/share/motiris/gateway */
+static int list_sessions(const char *term) {
+  const char *h = getenv("HOME");
+  if (!h) h = ".";
+  char dir[512];
+  snprintf(dir, sizeof dir, "%s/.local/share/motiris/gateway", h);
+  DIR *d = opendir(dir);
+  if (!d) { printf("no sessions yet\n"); return 0; }
+  struct dirent *e;
+  int shown = 0;
+  while ((e = readdir(d)) != NULL) {
+    size_t len = strlen(e->d_name);
+    if (len < 5 || strcmp(e->d_name + len - 4, ".log")) continue;
+    char path[600];
+    snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+    if (term) {
+      FILE *f = fopen(path, "r");
+      if (f) {
+        char line[65536];
+        long ln = 0;
+        while (fgets(line, sizeof line, f)) {
+          ln++;
+          if (strstr(line, term))
+            printf("%s:%ld:%s", e->d_name, ln, line);
+        }
+        fclose(f);
+      }
+      shown = 1;
+    } else {
+      FILE *f = fopen(path, "r");
+      long lines = 0;
+      if (f) {
+        int c;
+        while ((c = fgetc(f)) != EOF) if (c == '\n') lines++;
+        fclose(f);
+      }
+      printf("%-40s %ld lines\n", e->d_name, lines);
+      shown = 1;
+    }
+  }
+  closedir(d);
+  if (!shown && !term) printf("no sessions yet\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   const char *model = NULL, *base_url = NULL, *key = NULL;
   const char *system = NULL, *prompt = NULL, *skill_dir = NULL;
@@ -85,30 +132,87 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
 #define NEED() (i + 1 < argc ? argv[++i] : (usage(stderr), exit(2), ""))
-    if      (!strcmp(a, "-m") || !strcmp(a, "--model")) model = NEED();
-    else if (!strcmp(a, "-b") || !strcmp(a, "--base-url")) base_url = NEED();
-    else if (!strcmp(a, "-k") || !strcmp(a, "--api-key")) key = NEED();
-    else if (!strcmp(a, "-s") || !strcmp(a, "--system")) system = NEED();
-    else if (!strcmp(a, "-S") || !strcmp(a, "--skill-dir")) skill_dir = NEED();
-    else if (!strcmp(a, "-p") || !strcmp(a, "--prompt")) prompt = NEED();
-    else if (!strcmp(a, "-r") || !strcmp(a, "--resume")) resume = NEED();
-    else if (!strcmp(a, "--save")) save = NEED();
-    else if (!strcmp(a, "--transport")) transport = NEED();
-    else if (!strcmp(a, "--max-steps")) max_steps = atoi(NEED());
-    else if (!strcmp(a, "--no-tools")) no_tools = 1;
-    else if (!strcmp(a, "--plugin-dir")) plugin_dir = NEED();
-    else if (!strcmp(a, "--no-plugin")) no_plugin = 1;
-    else if (!strcmp(a, "-i") || !strcmp(a, "--interactive")) interactive = 1;
-    else if (!strcmp(a, "--stream")) stream = 1;
-    else if (!strcmp(a, "--init")) { return motiris_init_config() ? 2 : 0; }
-    else if (!strcmp(a, "--gateway")) {
-      gateway_mode = 1;
-      if (i + 1 < argc && argv[i + 1][0] != '-')
-        gateway_listen = argv[++i];
+    if (a[0] == '-' && a[1] && a[1] != '-') {
+      /* short options: -m -b -k -s -S -p -r -v -i -h */
+      switch (a[1]) {
+        case 'm': model = NEED(); break;
+        case 'b': base_url = NEED(); break;
+        case 'k': key = NEED(); break;
+        case 's': system = NEED(); break;
+        case 'S': skill_dir = NEED(); break;
+        case 'p': prompt = NEED(); break;
+        case 'r': resume = NEED(); break;
+        case 'v': verbose = 1; break;
+        case 'i': interactive = 1; break;
+        case 'h': usage(stdout); return 0;
+        default:
+          fprintf(stderr, "motiris: unknown option: %s\n", a);
+          usage(stderr);
+          return 2;
+      }
+      continue;
     }
-    else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) verbose = 1;
-    else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
-    else { fprintf(stderr, "motiris: unknown option: %s\n", a); usage(stderr); return 2; }
+    /* long options: --xxx, dispatch on third char then verify */
+    switch (a[2]) {
+      case 'm': /* --model | --max-steps */
+        if (!strcmp(a, "--model")) { model = NEED(); break; }
+        if (!strcmp(a, "--max-steps")) { max_steps = atoi(NEED()); break; }
+        goto unknown;
+      case 'b': /* --base-url */
+        if (!strcmp(a, "--base-url")) { base_url = NEED(); break; }
+        goto unknown;
+      case 'a': /* --api-key */
+        if (!strcmp(a, "--api-key")) { key = NEED(); break; }
+        goto unknown;
+      case 'g': /* --gateway */
+        if (!strcmp(a, "--gateway")) {
+          gateway_mode = 1;
+          if (i + 1 < argc && argv[i + 1][0] != '-')
+            gateway_listen = argv[++i];
+          break;
+        }
+        goto unknown;
+      case 's': /* --system | --save | --stream | --sessions | --skill-dir */
+        if (!strcmp(a, "--system")) { system = NEED(); break; }
+        if (!strcmp(a, "--save")) { save = NEED(); break; }
+        if (!strcmp(a, "--stream")) { stream = 1; break; }
+        if (!strcmp(a, "--sessions")) {
+          const char *term = (i + 1 < argc && argv[i + 1][0] != '-')
+              ? argv[++i] : NULL;
+          return list_sessions(term) ? 1 : 0;
+        }
+        if (!strcmp(a, "--skill-dir")) { skill_dir = NEED(); break; }
+        goto unknown;
+      case 'p': /* --prompt | --plugin-dir */
+        if (!strcmp(a, "--prompt")) { prompt = NEED(); break; }
+        if (!strcmp(a, "--plugin-dir")) { plugin_dir = NEED(); break; }
+        goto unknown;
+      case 'r': /* --resume */
+        if (!strcmp(a, "--resume")) { resume = NEED(); break; }
+        goto unknown;
+      case 't': /* --transport */
+        if (!strcmp(a, "--transport")) { transport = NEED(); break; }
+        goto unknown;
+      case 'n': /* --no-tools | --no-plugin */
+        if (!strcmp(a, "--no-tools")) { no_tools = 1; break; }
+        if (!strcmp(a, "--no-plugin")) { no_plugin = 1; break; }
+        goto unknown;
+      case 'i': /* --init | --interactive */
+        if (!strcmp(a, "--init")) { return motiris_init_config() ? 2 : 0; }
+        if (!strcmp(a, "--interactive")) { interactive = 1; break; }
+        goto unknown;
+      case 'v': /* --verbose */
+        if (!strcmp(a, "--verbose")) { verbose = 1; break; }
+        goto unknown;
+      case 'h': /* --help */
+        if (!strcmp(a, "--help")) { usage(stdout); return 0; }
+        goto unknown;
+      default:
+      unknown:
+        fprintf(stderr, "motiris: unknown option: %s\n", a);
+        usage(stderr);
+        return 2;
+    }
 #undef NEED
   }
 
@@ -133,11 +237,16 @@ int main(int argc, char **argv) {
   if (no_plugin) motiris_set_plugins_enabled(ag, 0);
   if (plugin_dir) motiris_set_plugin_dir(ag, plugin_dir);
   motiris_register_core_tools(ag);
-  if (motiris_tools_enabled(ag)) motiris_register_file_tools(ag);
+  if (motiris_tools_enabled(ag)) {
+    motiris_register_file_tools(ag);
+    motiris_register_web_tools(ag);
+    motiris_register_memory_tools(ag);
+  }
+  if (skill_dir) motiris_register_skill_tools(ag, skill_dir);
   if (motiris_plugins_enabled(ag)) motiris_load_plugins(ag, NULL);
 
-  /* skills: injected as system context (kept in front of user prompt) */
-  if (skill_dir) {
+  /* legacy --skill-dir injection kept only when tools are off */
+  if (skill_dir && !motiris_tools_enabled(ag)) {
     char *sk = load_skill_dir(skill_dir);
     if (sk && *sk) {
       if (system) {
