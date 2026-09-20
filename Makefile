@@ -9,8 +9,8 @@ PREFIX  ?= /usr/local
 
 SRC = src/vendor/cJSON.c src/transport.c src/tools.c src/plugin.c \
       src/agent.c src/repl.c src/config.c src/gateway.c src/filetools.c \
-      src/webtools.c src/memorytools.c src/skilltools.c \
-      src/main.c deps/linenoise/linenoise.c
+      src/webtools.c src/memorytools.c src/skilltools.c src/subagent.c \
+      src/cron.c src/main.c deps/linenoise/linenoise.c
 HDR = include/motiris.h
 
 motiris: $(SRC) $(HDR)

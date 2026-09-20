@@ -183,4 +183,41 @@ wait $M11PID 2>/dev/null || true
 cd "$ROOT"
 rm -rf "$F11"
 
+echo "== 12: cron --once + subagent spawn"
+F12=$(mktemp -d)
+mkdir -p "$F12/h"
+printf '{"transport":"echo"}' > "$F12/h/config.json"
+cat > "$F12/jobs.json" <<'JEOF'
+[{"id":"j1","interval_s":1,"prompt":"cron hello"}]
+JEOF
+CR=$(MOTIRIS_HOME="$F12/h" "$ROOT/motiris" --cron "$F12/jobs.json" --once 2>&1)
+echo "$CR" | grep -q 'echo round complete' || { echo "FAIL cron: $CR"; exit 1; }
+[ -f "$HOME/.local/share/motiris/cron/j1.log" ] || { echo "FAIL cron log"; exit 1; }
+grep -q 'rc=0' "$HOME/.local/share/motiris/cron/j1.log" || { echo "FAIL cron log rc"; cat "$HOME/.local/share/motiris/cron/j1.log"; exit 1; }
+MOTIRIS_HOME="$F12/h" python3 -c '
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            c = str(msgs[-1].get("content",""))[:120]
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"SUBOK "+c}}]}
+        else:
+            reply = {"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_s1","type":"function","function":{"name":"subagent","arguments":json.dumps({"task":"sub hi"})}}]}}]}
+        b = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18095),H).serve_forever()
+' &
+M12PID=$!
+MOCK_PIDS="$MOCK_PIDS $M12PID"
+sleep 0.5
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18095/v1/chat/completions"}' > "$F12/h/config.json"
+O5=$(MOTIRIS_HOME="$F12/h" MOTIRIS_BIN="$ROOT/motiris" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+echo "$O5" | grep -q 'SUBOK' || { echo "FAIL subagent: $O5"; exit 1; }
+kill $M12PID 2>/dev/null
+wait $M12PID 2>/dev/null || true
+rm -rf "$F12"
+
 echo "smoke: all tests passed"
