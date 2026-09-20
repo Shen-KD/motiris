@@ -1,16 +1,16 @@
-/* hello_plugin.c - example runtime plugin for mote.
+/* hello_plugin.c - example runtime plugin for hermote.
  *
  * Build:  cc -fPIC -shared -I../include -I../src/vendor -o hello_plugin.so \
  *             hello_plugin.c
- * Usage:  mkdir -p /tmp/mote-plugins && cp hello_plugin.so /tmp/mote-plugins/
- *         ./mote -p "say hello" --plugin-dir /tmp/mote-plugins
+ * Usage:  mkdir -p /tmp/hermote-plugins && cp hello_plugin.so /tmp/hermote-plugins/
+ *         ./hermote -p "say hello" --plugin-dir /tmp/hermote-plugins
  *
  * A plugin is a shared object exporting one symbol:
- *   int mote_plugin_init(MoteAgent *a, const MotePluginApi *api);
+ *   int hermote_plugin_init(HermoteAgent *a, const HermotePluginApi *api);
  * It registers tools (and could later register hooks/commands) through
- * the api struct. Uses only cJSON + mote.h - plugins stay tiny.
+ * the api struct. Uses only cJSON + hermote.h - plugins stay tiny.
  */
-#include "mote.h"
+#include "hermote.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -31,8 +31,8 @@ static char *hello_call(const char *args_json, void *ud) {
   return s;
 }
 
-int mote_plugin_init(MoteAgent *a, const MotePluginApi *api) {
-  MoteTool t = {
+int hermote_plugin_init(HermoteAgent *a, const HermotePluginApi *api) {
+  HermoteTool t = {
     .name = "hello",
     .description = "Return a friendly greeting for a given name.",
     .parameters = "{\"type\":\"object\",\"properties\":{\"name\":{"

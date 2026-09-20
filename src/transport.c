@@ -9,7 +9,7 @@
  *            exercises the tool-calling loop (great for smoke tests and
  *            dry runs without an API key).
  */
-#include "mote.h"
+#include "hermote.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +19,7 @@
 
 /* ---------------- curl child backend ---------------- */
 static const char *find_curl(void) {
-  const char *c = getenv("MOTE_CURL");
+  const char *c = getenv("HERMOTE_CURL");
   return (c && *c) ? c : "curl";
 }
 
@@ -112,7 +112,7 @@ static char *echo_response(const char *body) {
     cJSON *fn = cJSON_CreateObject();
     cJSON_AddStringToObject(fn, "name", "shell");
     cJSON_AddStringToObject(fn, "arguments",
-                            "{\"command\":\"echo 'mote works'\"}");
+                            "{\"command\":\"echo 'hermote works'\"}");
     cJSON_AddItemToObject(tc, "function", fn);
     cJSON_AddItemToObject(tc, "id", cJSON_CreateString("call_echo_1"));
     cJSON_AddItemToObject(tc, "type", cJSON_CreateString("function"));
@@ -137,7 +137,7 @@ static char *echo_response(const char *body) {
 }
 
 /* ---------------- dispatch ---------------- */
-char *mote_transport_send(const char *backend, const char *url,
+char *hermote_transport_send(const char *backend, const char *url,
                           const char *auth, const char *body, char **err) {
   if (err) *err = NULL;
   if (!backend || !strcmp(backend, "curl"))

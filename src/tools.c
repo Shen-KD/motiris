@@ -1,11 +1,11 @@
-/* tools.c - built-in tools for mote.
+/* tools.c - built-in tools for hermote.
  *
  * Tool contract: a tool is (name, description, parameters-json, handler).
  * The handler receives the arguments as JSON text and must return a
  * malloc'd JSON string (any shape); the agent wraps it as the model's
  * "tool" role message.
  */
-#include "mote.h"
+#include "hermote.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,7 +99,7 @@ static char *time_call(const char *args_json, void *ud) {
 }
 
 /* ---------------- registration ---------------- */
-static const MoteTool core_tools[] = {
+static const HermoteTool core_tools[] = {
   { "shell",
     "Run a shell command via /bin/sh and capture stdout, stderr and "
     "exit code. The command runs with the agent's uid - it can modify "
@@ -113,7 +113,7 @@ static const MoteTool core_tools[] = {
     time_call, NULL },
 };
 
-int mote_register_core_tools_count(void) {
+int hermote_register_core_tools_count(void) {
   return (int)(sizeof core_tools / sizeof core_tools[0]);
 }
-const MoteTool *mote_core_tools(void) { return core_tools; }
+const HermoteTool *hermote_core_tools(void) { return core_tools; }

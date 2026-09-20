@@ -1,4 +1,4 @@
-/* agent.c - the mote agent loop.
+/* agent.c - the hermote agent loop.
  *
  *   assemble request -> transport -> parse -> tool_calls?
  *        ^                                          |
@@ -8,7 +8,7 @@
  * Messages are kept as a cJSON array; each round appends. The loop is
  * bounded by max_steps so a misbehaving model cannot loop forever.
  */
-#include "mote.h"
+#include "hermote.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,13 +17,13 @@
 #define MAX_TOOLS 64
 #define DEF_BASE_URL "https://api.openai.com/v1/chat/completions"
 
-struct MoteAgent {
+struct HermoteAgent {
   char *model;
   char *base_url;
   char *api_key;
   char *system;
   cJSON *messages;         /* array of OpenAI message objects */
-  MoteTool tools[MAX_TOOLS];
+  HermoteTool tools[MAX_TOOLS];
   int ntools;
   char transport[16];
   int max_steps;
@@ -32,24 +32,24 @@ struct MoteAgent {
 };
 
 /* transport.c */
-char *mote_transport_send(const char *backend, const char *url,
+char *hermote_transport_send(const char *backend, const char *url,
                           const char *auth, const char *body, char **err);
 
 /* tools.c */
-int mote_register_core_tools_count(void);
-const MoteTool *mote_core_tools(void);
+int hermote_register_core_tools_count(void);
+const HermoteTool *hermote_core_tools(void);
 
-void mote_register_core_tools(MoteAgent *a) {
-  for (int i = 0; i < mote_register_core_tools_count(); i++)
-    mote_register_tool(a, &mote_core_tools()[i]);
+void hermote_register_core_tools(HermoteAgent *a) {
+  for (int i = 0; i < hermote_register_core_tools_count(); i++)
+    hermote_register_tool(a, &hermote_core_tools()[i]);
 }
 
 static char *sdup(const char *s) { return s ? strdup(s) : NULL; }
 
-MoteAgent *mote_new(void) {
-  MoteAgent *a = calloc(1, sizeof *a);
+HermoteAgent *hermote_new(void) {
+  HermoteAgent *a = calloc(1, sizeof *a);
   a->base_url = sdup(DEF_BASE_URL);
-  const char *m = getenv("MOTE_MODEL");
+  const char *m = getenv("HERMOTE_MODEL");
   a->model = sdup(m && *m ? m : "gpt-4o-mini");
   a->messages = cJSON_CreateArray();
   strcpy(a->transport, "curl");
@@ -57,7 +57,7 @@ MoteAgent *mote_new(void) {
   return a;
 }
 
-void mote_free(MoteAgent *a) {
+void hermote_free(HermoteAgent *a) {
   if (!a) return;
   free(a->model);
   free(a->base_url);
@@ -68,71 +68,71 @@ void mote_free(MoteAgent *a) {
   free(a);
 }
 
-void mote_set_model(MoteAgent *a, const char *m) {
+void hermote_set_model(HermoteAgent *a, const char *m) {
   free(a->model); a->model = sdup(m);
 }
-void mote_set_base_url(MoteAgent *a, const char *u) {
+void hermote_set_base_url(HermoteAgent *a, const char *u) {
   free(a->base_url); a->base_url = sdup(u);
 }
-void mote_set_api_key(MoteAgent *a, const char *k) {
+void hermote_set_api_key(HermoteAgent *a, const char *k) {
   free(a->api_key); a->api_key = sdup(k);
 }
-void mote_set_transport(MoteAgent *a, const char *n) {
+void hermote_set_transport(HermoteAgent *a, const char *n) {
   snprintf(a->transport, sizeof a->transport, "%s", n ? n : "curl");
 }
-void mote_set_max_steps(MoteAgent *a, int n) { a->max_steps = n; }
-void mote_set_verbose(MoteAgent *a, int on) { a->verbose = on; }
+void hermote_set_max_steps(HermoteAgent *a, int n) { a->max_steps = n; }
+void hermote_set_verbose(HermoteAgent *a, int on) { a->verbose = on; }
 
-const char *mote_last_error(MoteAgent *a) {
+const char *hermote_last_error(HermoteAgent *a) {
   static const char none[] = "";
   return a->last_error ? a->last_error : none;
 }
 
-static void set_error(MoteAgent *a, const char *msg, const char *arg) {
+static void set_error(HermoteAgent *a, const char *msg, const char *arg) {
   free(a->last_error);
   size_t n = strlen(msg) + (arg ? strlen(arg) : 0) + 2;
   a->last_error = malloc(n);
   snprintf(a->last_error, n, msg, arg ? arg : "");
 }
 
-void mote_set_system(MoteAgent *a, const char *sys) {
+void hermote_set_system(HermoteAgent *a, const char *sys) {
   free(a->system);
   a->system = sdup(sys);
 }
 
-void mote_add_user(MoteAgent *a, const char *msg) {
+void hermote_add_user(HermoteAgent *a, const char *msg) {
   cJSON *m = cJSON_CreateObject();
   cJSON_AddStringToObject(m, "role", "user");
   cJSON_AddStringToObject(m, "content", msg);
   cJSON_AddItemToArray(a->messages, m);
 }
 
-void mote_register_tool(MoteAgent *a, const MoteTool *t) {
+void hermote_register_tool(HermoteAgent *a, const HermoteTool *t) {
   if (!t || !t->name || a->ntools >= MAX_TOOLS) return;
   a->tools[a->ntools++] = *t;
 }
 
-void mote_unregister_tool(MoteAgent *a, const char *name) {
+void hermote_unregister_tool(HermoteAgent *a, const char *name) {
   for (int i = 0; i < a->ntools; i++) {
     if (!strcmp(a->tools[i].name, name)) {
       memmove(&a->tools[i], &a->tools[i + 1],
-              sizeof(MoteTool) * (size_t)(a->ntools - i - 1));
+              sizeof(HermoteTool) * (size_t)(a->ntools - i - 1));
       a->ntools--;
       return;
     }
   }
 }
 
-cJSON *mote_messages(MoteAgent *a) { return a->messages; }
+cJSON *hermote_messages(HermoteAgent *a) { return a->messages; }
 
-static const MoteTool *find_tool(MoteAgent *a, const char *name) {
+static const HermoteTool *find_tool(HermoteAgent *a, const char *name) {
   for (int i = 0; i < a->ntools; i++)
     if (!strcmp(a->tools[i].name, name)) return &a->tools[i];
   return NULL;
 }
 
 /* ---------------- request assembly ---------------- */
-static char *build_request(MoteAgent *a) {
+static char *build_request(HermoteAgent *a) {
   cJSON *req = cJSON_CreateObject();
   cJSON_AddStringToObject(req, "model", a->model);
 
@@ -152,7 +152,7 @@ static char *build_request(MoteAgent *a) {
   if (a->ntools > 0) {
     cJSON *tools = cJSON_CreateArray();
     for (int i = 0; i < a->ntools; i++) {
-      const MoteTool *t = &a->tools[i];
+      const HermoteTool *t = &a->tools[i];
       cJSON *td = cJSON_CreateObject();
       cJSON_AddItemToObject(td, "type", cJSON_CreateString("function"));
       cJSON *fn = cJSON_CreateObject();
@@ -176,7 +176,7 @@ static char *build_request(MoteAgent *a) {
 }
 
 /* ---------------- response handling ---------------- */
-static void push_tool_message(MoteAgent *a, const char *call_id,
+static void push_tool_message(HermoteAgent *a, const char *call_id,
                               const char *content) {
   cJSON *m = cJSON_CreateObject();
   cJSON_AddStringToObject(m, "role", "tool");
@@ -185,12 +185,12 @@ static void push_tool_message(MoteAgent *a, const char *call_id,
   cJSON_AddItemToArray(a->messages, m);
 }
 
-int mote_run(MoteAgent *a) {
-  const char *env_key = getenv("MOTE_API_KEY");
+int hermote_run(HermoteAgent *a) {
+  const char *env_key = getenv("HERMOTE_API_KEY");
   const char *key = a->api_key ? a->api_key : (env_key ? env_key : NULL);
 
   for (int step = 0; step < a->max_steps; step++) {
-    if (a->verbose) fprintf(stderr, "[mote] step %d: requesting model %s\n",
+    if (a->verbose) fprintf(stderr, "[hermote] step %d: requesting model %s\n",
                             step + 1, a->model);
 
     char *body = build_request(a);
@@ -204,7 +204,7 @@ int mote_run(MoteAgent *a) {
     }
 
     char *err = NULL;
-    char *resp = mote_transport_send(a->transport, a->base_url, authp,
+    char *resp = hermote_transport_send(a->transport, a->base_url, authp,
                                      body, &err);
     free(body);
     if (!resp) {
@@ -213,7 +213,7 @@ int mote_run(MoteAgent *a) {
       return 1;
     }
     if (a->verbose) {
-      fprintf(stderr, "[mote] response: %.200s%s\n", resp,
+      fprintf(stderr, "[hermote] response: %.200s%s\n", resp,
               strlen(resp) > 200 ? "..." : "");
     }
 
@@ -264,13 +264,13 @@ int mote_run(MoteAgent *a) {
             cJSON_GetObjectItemCaseSensitive(tc, "id"));
         if (!name) continue;
 
-        const MoteTool *t = find_tool(a, name);
+        const HermoteTool *t = find_tool(a, name);
         char *result;
         if (!t) {
           result = cJSON_PrintUnformatted(cJSON_CreateString(
               "error: unknown tool (not registered)"));
         } else {
-          if (a->verbose) fprintf(stderr, "[mote] tool call: %s(%s)\n",
+          if (a->verbose) fprintf(stderr, "[hermote] tool call: %s(%s)\n",
                                   name, args ? args : "");
           result = t->call(args ? args : "{}", t->ud);
           if (!result) result = cJSON_PrintUnformatted(
@@ -288,7 +288,7 @@ int mote_run(MoteAgent *a) {
         cJSON_GetObjectItemCaseSensitive(msg, "content"));
     if (content && *content) printf("%s\n", content);
     else if (!finish || strcmp(finish, "stop"))
-      fprintf(stderr, "[mote] warning: model stopped without output\n");
+      fprintf(stderr, "[hermote] warning: model stopped without output\n");
     cJSON_Delete(j);
     return 0;
   }
