@@ -31,16 +31,25 @@ static char *hello_call(const char *args_json, void *ud) {
   return s;
 }
 
+/* tool-call observer: fires on every tool invocation in this agent */
+static void hello_hook(const char *name, const char *args,
+                       const char *result, void *ud) {
+  (void)ud;
+  fprintf(stderr, "[hello_plugin] tool invoked: %s (%s) -> %.60s\n",
+          name, args, result ? result : "(null)");
+}
+
 int motiris_plugin_init(MotirisAgent *a, const MotirisPluginApi *api) {
   MotirisTool t = {
     .name = "hello",
     .description = "Return a friendly greeting for a given name.",
-    .parameters = "{\"type\":\"object\",\"properties\":{\"name\":{"
+    .parameters = "{\"type\":\"object\",\"properties\":{\"name\":{\""
                   "\"type\":\"string\"}}}",
     .call = hello_call,
     .ud = NULL,
   };
   api->register_tool(a, &t);
-  fprintf(stderr, "hello plugin: tool 'hello' registered\n");
+  api->add_tool_hook(a, hello_hook, NULL);
+  fprintf(stderr, "hello plugin: tool 'hello' registered (+tool hook active)\n");
   return 0;
 }

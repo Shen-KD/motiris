@@ -33,8 +33,9 @@ struct MotirisAgent {
   void *delta_ud;
   int tools_on, plugins_on;
   char *plugin_dir;
-  MotirisToolHook *tool_hook;
-  void *tool_hook_ud;
+  /* tool-call observers (multi-slot; plugins and repl can both watch) */
+  struct { MotirisToolHook *cb; void *ud; } tool_hooks[8];
+  int ntool_hooks;
   long tok_in, tok_out;
   MotirisProvider providers[8];
   int nproviders;
@@ -133,8 +134,14 @@ void motiris_set_stream(MotirisAgent *a, int on) { a->stream = !!on; }
 void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                            void *ud) { a->on_delta = cb; a->delta_ud = ud; }
 void motiris_set_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud) {
-  a->tool_hook = cb;
-  a->tool_hook_ud = ud;
+  a->ntool_hooks = 0; /* replace any existing observers */
+  motiris_add_tool_hook(a, cb, ud);
+}
+void motiris_add_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud) {
+  if (!a || !cb || a->ntool_hooks >= 8) return;
+  a->tool_hooks[a->ntool_hooks].cb = cb;
+  a->tool_hooks[a->ntool_hooks].ud = ud;
+  a->ntool_hooks++;
 }
 long motiris_tokens_in(MotirisAgent *a)  { return a->tok_in; }
 long motiris_tokens_out(MotirisAgent *a) { return a->tok_out; }
@@ -385,8 +392,9 @@ int motiris_run(MotirisAgent *a) {
                   result = t->call(args ? args : "{}", t->ud);
                   if (!result) result = cJSON_PrintUnformatted(
                       cJSON_CreateString("error: tool returned nothing"));
-                  if (a->tool_hook)
-                    a->tool_hook(name, args ? args : "{}", result, a->tool_hook_ud);
+                  for (int hi = 0; hi < a->ntool_hooks; hi++)
+                    a->tool_hooks[hi].cb(name, args ? args : "{}", result,
+                                         a->tool_hooks[hi].ud);
         }
         push_tool_message(a, id ? id : "", result);
         free(result);

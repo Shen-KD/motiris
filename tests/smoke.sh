@@ -369,4 +369,37 @@ kill $M16PID 2>/dev/null
 wait $M16PID 2>/dev/null || true
 rm -rf "$F16"
 
+echo "== 17: plugin tool hook fires on tool calls"
+F17=$(mktemp -d)
+mkdir -p "$F17/h" "$F17/pd"
+cp "$ROOT/examples/hello_plugin.so" "$F17/pd/"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18102/v1/chat/completions"}' > "$F17/h/config.json"
+python3 - <<'PY6' &
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = __import__("json").loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            r = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"greeted"}}]}
+        else:
+            r = {"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_h1","type":"function","function":{"name":"hello","arguments":"{\"name\": \"iris\"}"}}]}}]}
+        b = __import__("json").dumps(r).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18102),H).serve_forever()
+PY6
+M17PID=$!
+MOCK_PIDS="$MOCK_PIDS $M17PID"
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -q 18102 && break
+  sleep 0.3
+done
+O11=$(MOTIRIS_HOME="$F17/h" MOTIRIS_WORKSPACE="$F17" "$ROOT/motiris" -p hi --max-steps 3 --plugin-dir "$F17/pd" -k x 2>&1)
+echo "$O11" | grep -q 'tool invoked: hello' || { echo "FAIL plugin hook: $O11"; exit 1; }
+echo "$O11" | grep -q 'greeted' || { echo "FAIL plugin result: $O11"; exit 1; }
+kill $M17PID 2>/dev/null
+wait $M17PID 2>/dev/null || true
+rm -rf "$F17"
+
 echo "smoke: all tests passed"

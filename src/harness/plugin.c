@@ -29,6 +29,7 @@ static const MotirisPluginApi api = {
   .version = MOTIRIS_PLUGIN_API_VERSION,
   .register_tool = motiris_register_tool,
   .unregister_tool = motiris_unregister_tool,
+  .add_tool_hook = motiris_add_tool_hook,
 };
 
 static char *resolve_dir(const char *dir) {
