@@ -33,6 +33,8 @@ static void usage(FILE *f) {
 "      --stream          stream tokens as they arrive (once-run mode)\n"
 "      --init            write $HOME/.motiris/{env,config.json} templates\n"
 "      --sessions [TERM] list session logs (grep TERM if given)\n"
+"      --cron [FILE]     run scheduled jobs (JSON array); --once = run\n"
+"                        due jobs once and exit\n"
 "      --gateway [LISTEN]  run as HTTP gateway (default :8899);\n"
 "                          token via MOTIRIS_GATEWAY_TOKEN\n"
 "  -h, --help            this help\n"
@@ -128,6 +130,8 @@ int main(int argc, char **argv) {
   const char *gateway_listen = NULL;
   int no_tools = 0, no_plugin = 0, verbose = 0, max_steps = 0;
   int interactive = 0, stream = 0, gateway_mode = 0;
+  int cron_mode = 0, cron_once = 0;
+  const char *cron_file = NULL;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -197,6 +201,17 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--no-tools")) { no_tools = 1; break; }
         if (!strcmp(a, "--no-plugin")) { no_plugin = 1; break; }
         goto unknown;
+      case 'c': /* --cron */
+        if (!strcmp(a, "--cron")) {
+          cron_mode = 1;
+          if (i + 1 < argc && argv[i + 1][0] != '-')
+            cron_file = argv[++i];
+          break;
+        }
+        goto unknown;
+      case 'o': /* --once */
+        if (!strcmp(a, "--once")) { cron_once = 1; break; }
+        goto unknown;
       case 'i': /* --init | --interactive */
         if (!strcmp(a, "--init")) { return motiris_init_config() ? 2 : 0; }
         if (!strcmp(a, "--interactive")) { interactive = 1; break; }
@@ -223,6 +238,18 @@ int main(int argc, char **argv) {
     return motiris_gateway_run(gateway_listen, tok, !no_tools, verbose) ? 1 : 0;
   }
 
+  if (cron_mode) {
+    const char *file = cron_file;
+    char def[512];
+    if (!file) {
+      const char *h = getenv("HOME");
+      if (!h) h = ".";
+      snprintf(def, sizeof def, "%s/.config/motiris/cron.json", h);
+      file = def;
+    }
+    return motiris_cron_run(file, cron_once, verbose) ? 1 : 0;
+  }
+
   MotirisAgent *ag = motiris_new();
   motiris_apply_config(ag);   /* config.json defaults (CLI flags win below) */
   if (model) motiris_set_model(ag, model);
@@ -241,6 +268,7 @@ int main(int argc, char **argv) {
     motiris_register_file_tools(ag);
     motiris_register_web_tools(ag);
     motiris_register_memory_tools(ag);
+    motiris_register_subagent_tools(ag);
   }
   if (skill_dir) motiris_register_skill_tools(ag, skill_dir);
   if (motiris_plugins_enabled(ag)) motiris_load_plugins(ag, NULL);
