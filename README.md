@@ -159,6 +159,12 @@ cp examples/hello_plugin.so ~/.local/share/motiris/plugins/
 motiris -p "say hello to iris"   # plugin tool appears to the model automatically
 ```
 
+## Development
+
+Working notes for this repo (layout, build/test loop, extension
+points, trap log): [docs/DEVELOPING.md](docs/DEVELOPING.md). Release
+history: [CHANGELOG.md](CHANGELOG.md).
+
 ## Layout
 
 ```
