@@ -31,6 +31,8 @@ static void usage(FILE *f) {
 "  -i, --interactive     force interactive REPL (default when tty)\n"
 "      --stream          stream tokens as they arrive (once-run mode)\n"
 "      --init            write $HOME/.motiris/{env,config.json} templates\n"
+"      --gateway [LISTEN]  run as HTTP gateway (default :8899);\n"
+"                          token via MOTIRIS_GATEWAY_TOKEN\n"
 "  -h, --help            this help\n"
 "\n"
 "examples:\n"
@@ -76,8 +78,9 @@ int main(int argc, char **argv) {
   const char *model = NULL, *base_url = NULL, *key = NULL;
   const char *system = NULL, *prompt = NULL, *skill_dir = NULL;
   const char *resume = NULL, *save = NULL, *transport = NULL, *plugin_dir = NULL;
+  const char *gateway_listen = NULL;
   int no_tools = 0, no_plugin = 0, verbose = 0, max_steps = 0;
-  int interactive = 0, stream = 0;
+  int interactive = 0, stream = 0, gateway_mode = 0;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -98,6 +101,11 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "-i") || !strcmp(a, "--interactive")) interactive = 1;
     else if (!strcmp(a, "--stream")) stream = 1;
     else if (!strcmp(a, "--init")) { return motiris_init_config() ? 2 : 0; }
+    else if (!strcmp(a, "--gateway")) {
+      gateway_mode = 1;
+      if (i + 1 < argc && argv[i + 1][0] != '-')
+        gateway_listen = argv[++i];
+    }
     else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) verbose = 1;
     else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
     else { fprintf(stderr, "motiris: unknown option: %s\n", a); usage(stderr); return 2; }
@@ -105,6 +113,11 @@ int main(int argc, char **argv) {
   }
 
   motiris_load_env();   /* $HOME/.motiris/env -> env defaults */
+
+  if (gateway_mode) {
+    const char *tok = getenv("MOTIRIS_GATEWAY_TOKEN");
+    return motiris_gateway_run(gateway_listen, tok, !no_tools, verbose) ? 1 : 0;
+  }
 
   MotirisAgent *ag = motiris_new();
   motiris_apply_config(ag);   /* config.json defaults (CLI flags win below) */

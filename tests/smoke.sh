@@ -61,4 +61,25 @@ rm -rf "$TH8"
 echo "$OUT" | grep -q 'fallback ok' || { echo "FAIL: $OUT"; exit 1; }
 echo "$OUT" | grep -q 'provider dead failed' || { echo "FAIL: dead not attempted"; exit 1; }
 
+echo "== 9: gateway HTTP service + auth"
+GW=$(mktemp -d)
+printf '{"transport":"echo","tools":false}' > "$GW/config.json"
+MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18089 --no-tools >/dev/null 2>&1 &
+GWPID=$!
+sleep 0.3
+H=$(curl -s http://127.0.0.1:18089/health)
+echo "$H" | grep -q '"status":"ok"' || { echo "FAIL health: $H"; kill $GWPID 2>/dev/null; exit 1; }
+R=$(curl -s -X POST http://127.0.0.1:18089/v1/chat -d '{"chat_id":"g1","message":"hi"}')
+echo "$R" | grep -q 'echo round complete' || { echo "FAIL chat: $R"; kill $GWPID 2>/dev/null; exit 1; }
+kill $GWPID 2>/dev/null
+wait $GWPID 2>/dev/null || true
+MOTIRIS_GATEWAY_TOKEN=sekret MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18090 --no-tools >/dev/null 2>&1 &
+GWPID2=$!
+sleep 0.3
+CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18090/health || true)
+[ "$CODE" = "401" ] || { echo "FAIL auth: got $CODE"; kill $GWPID2 2>/dev/null; exit 1; }
+kill $GWPID2 2>/dev/null
+wait $GWPID2 2>/dev/null || true
+rm -rf "$GW"
+
 echo "smoke: all tests passed"

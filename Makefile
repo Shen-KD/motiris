@@ -8,7 +8,7 @@ LDFLAGS ?= -Wl,-l:libcurl.so.4
 PREFIX  ?= /usr/local
 
 SRC = src/vendor/cJSON.c src/transport.c src/tools.c src/plugin.c \
-      src/agent.c src/repl.c src/config.c src/main.c \
+      src/agent.c src/repl.c src/config.c src/gateway.c src/main.c \
       deps/linenoise/linenoise.c
 HDR = include/motiris.h
 

@@ -70,11 +70,19 @@ motiris -p hi --transport echo                          # offline demo
 motiris -p "review diff" -s "You are a code reviewer" -v
 motiris -p "continue" -r last-run.log                   # resume a session
 motiris -p "do X" --skill-dir ./skills                  # skills as context
+motiris --gateway :8899                                 # HTTP gateway
+curl -X POST localhost:8899/v1/chat -d '{"chat_id":"dev","message":"hi"}'
+# token-protected: MOTIRIS_GATEWAY_TOKEN=sekret motiris --gateway :8899
 ```
 
+The gateway keeps one context per `chat_id` (session logs survive
+restarts under `~/.local/share/motiris/gateway/`), exposes
+`GET /health` and `POST /v1/chat` (`{"chat_id","message","reset"?}`),
+and optionally requires `Authorization: Bearer $MOTIRIS_GATEWAY_TOKEN`.
+
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
-`MOTIRIS_PLUGIN_DIR`, `MOTIRIS_CURL`. Default endpoint:
-`https://api.openai.com/v1/chat/completions`.
+`MOTIRIS_PLUGIN_DIR`, `MOTIRIS_CURL`, `MOTIRIS_GATEWAY_TOKEN`. Default
+endpoint: `https://api.openai.com/v1/chat/completions`.
 
 Built-in tools (disable with `--no-tools`):
 

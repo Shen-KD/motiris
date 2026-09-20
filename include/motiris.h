@@ -79,4 +79,8 @@ void motiris_load_env(void);                  /* call before new() */
 void motiris_apply_config(MotirisAgent *a);   /* defaults, CLI wins */
 int  motiris_init_config(void);               /* write templates */
 
+/* ---- gateway: embedded HTTP service, session-per-chat_id ---- */
+int motiris_gateway_run(const char *listen_addr, const char *token,
+                        int tools_on, int verbose);  /* blocks; 0 on clean exit */
+
 #endif /* MOTIRIS_H */
