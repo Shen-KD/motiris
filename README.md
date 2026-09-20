@@ -2,6 +2,18 @@
 
 **Iris as a mote** — a featherweight C11 agent framework.
 
+## Quick install (from GitHub releases)
+
+```
+sh install.sh                 # latest release -> $HOME/bin (or ~/.local/bin)
+sh install.sh --skip-config   # binary only, keep your own config
+# knobs: --prefix DIR --model NAME --base-url URL --api-key-env VAR
+```
+
+Downloads the latest release asset, verifies its sha256, installs the
+binary, and writes `~/.motiris/{env,config.json}` (never overwrites an
+existing config). Build from source instead: `make && make install`.
+
 The name fuses **Iris** (Ἶρις, goddess of the rainbow and messenger of
 the gods, who carried the word across the bridge between worlds) with
 **mote** (a speck of dust). Motiris speaks for models — and weighs like a
