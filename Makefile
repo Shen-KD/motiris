@@ -1,7 +1,8 @@
 # motiris - Iris as a mote. Zero-dependency C11 build.
 CC      ?= cc
 CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -pedantic -D_POSIX_C_SOURCE=200809L
-LDFLAGS ?=
+CFLAGS  += -Ideps/libcurl/include
+LDFLAGS ?= -Wl,-l:libcurl.so.4
 PREFIX  ?= /usr/local
 
 SRC = src/vendor/cJSON.c src/transport.c src/tools.c src/plugin.c src/agent.c src/main.c

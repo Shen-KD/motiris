@@ -1,21 +1,88 @@
 /* transport.c - send a chat request, get the raw response body.
  *
  * Backends:
- *   curl   - spawn the system `curl` binary (default). Zero link-time
- *            dependencies; HTTPS/TLS handled by curl itself. The only
- *            external piece is a curl(1) on PATH, and it is only alive
- *            while a request is in flight - the agent itself stays tiny.
- *   echo   - no network. Returns a canned OpenAI-style response that
- *            exercises the tool-calling loop (great for smoke tests and
- *            dry runs without an API key).
+ *   libcurl - built-in C library backend (default). No child process:
+ *             curl handles HTTPS/TLS inside the agent, tied to the
+ *             libcurl shared library at runtime.
+ *   curl    - fallback: spawn the system `curl` binary (for hosts
+ *             without the libcurl dev headers at build time).
+ *   echo    - no network. Returns a canned OpenAI-style response that
+ *             exercises the tool-calling loop (smoke tests, dry runs).
+ *
+ * Default backend is "auto": use libcurl when available, else spawn.
  */
 #include "motiris.h"
+
+#include <curl/curl.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+
+typedef struct { char *data; size_t len; } Buf;
+
+static size_t curl_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
+  Buf *b = ud;
+  size_t n = sz * nm;
+  b->data = realloc(b->data, b->len + n + 1);
+  memcpy(b->data + b->len, ptr, n);
+  b->len += n;
+  b->data[b->len] = '\0';
+  return n;
+}
+
+static char *libcurl_send(const char *url, const char *auth,
+                          const char *body, char **err) {
+  CURL *c = curl_easy_init();
+  if (!c) { if (err) *err = strdup("libcurl init failed"); return NULL; }
+
+  struct curl_slist *hdrs = NULL;
+  hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+  hdrs = curl_slist_append(hdrs, "Accept: application/json");
+  if (auth) hdrs = curl_slist_append(hdrs, auth);
+
+  Buf out = {0};
+  curl_easy_setopt(c, CURLOPT_URL, url);
+  curl_easy_setopt(c, CURLOPT_POST, 1L);
+  curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
+  curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+  curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, 120L);
+  curl_easy_setopt(c, CURLOPT_USERAGENT, "motiris/0.1");
+
+  CURLcode rc = curl_easy_perform(c);
+  long http = 0;
+  curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http);
+  curl_slist_free_all(hdrs);
+  curl_easy_cleanup(c);
+
+  if (rc != CURLE_OK) {
+    if (err) {
+      size_t n = strlen(curl_easy_strerror(rc)) + 32;
+      char *m = malloc(n);
+      snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
+      *err = m;
+    }
+    free(out.data);
+    return NULL;
+  }
+  if (http != 200) {
+    if (err) {
+      size_t n = 128 + (out.data ? strlen(out.data) : 0);
+      char *m = malloc(n);
+      snprintf(m, n, "http status %ld: %.200s", http,
+               out.data ? out.data : "");
+      *err = m;
+    }
+    free(out.data);
+    return NULL;
+  }
+  return out.data;
+}
 
 /* ---------------- curl child backend ---------------- */
 static const char *find_curl(void) {
@@ -144,9 +211,11 @@ static char *echo_response(const char *body) {
 
 /* ---------------- dispatch ---------------- */
 char *motiris_transport_send(const char *backend, const char *url,
-                          const char *auth, const char *body, char **err) {
+                             const char *auth, const char *body, char **err) {
   if (err) *err = NULL;
-  if (!backend || !strcmp(backend, "curl"))
+  if (!backend || !strcmp(backend, "auto") || !strcmp(backend, "libcurl"))
+    return libcurl_send(url, auth, body, err);
+  if (!strcmp(backend, "curl"))
     return spawn_curl(url, auth, body, err);
   if (!strcmp(backend, "echo")) {
     cJSON *j = cJSON_Parse(body);

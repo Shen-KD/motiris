@@ -53,7 +53,7 @@ MotirisAgent *motiris_new(void) {
   const char *m = getenv("MOTIRIS_MODEL");
   a->model = sdup(m && *m ? m : "gpt-4o-mini");
   a->messages = cJSON_CreateArray();
-  strcpy(a->transport, "curl");
+  strcpy(a->transport, "auto");
   a->max_steps = 10;
   return a;
 }

@@ -23,9 +23,11 @@ agent process stays idle-quiet between requests.
   the core binary.
 - **Sessions** — append-only trace log (`--save`), resume replay (`-r`).
 - **Skills** — a directory of `.md` files injected as system context.
-- **Tiny core** — cJSON is the only vendored dependency; HTTP goes through
-  a short-lived `curl` child process (HTTPS/TLS handled by curl, the agent
-  itself never links a network stack).
+- **Tiny core** — cJSON is the only runtime-embedded vendor; HTTP goes
+  through a built-in libcurl C backend (no child process; HTTPS/TLS
+  handled by the system libcurl shared library). A spawn-`curl` fallback
+  exists for hosts without libcurl, and an offline `echo` backend for
+  tests.
 
 ## Architecture
 
@@ -55,8 +57,9 @@ make            # cc -O2, single binary ./motiris (stripped)
 make test       # offline smoke tests, no API key required
 ```
 
-Requires: a C11 compiler, `curl` on PATH at runtime, and `-ldl`
-(POSIX dlopen; glibc >= 2.34 needs no extra package).
+Requires: a C11 compiler and the libcurl shared library at runtime
+(libcurl dev headers are vendored in `deps/libcurl/`, pinned to the
+curl 8.18 ABI). No other dependencies.
 
 ## Usage
 
@@ -113,11 +116,12 @@ motiris -p "say hello to iris"   # plugin tool appears to the model automaticall
 ```
 include/motiris.h      public API: agent, tools, plugin ABI
 src/agent.c            agent loop, request assembly, tool dispatch
-src/transport.c        curl child / echo backends
+src/transport.c        libcurl C backend (default) / spawn-curl / echo
 src/tools.c            built-in tools (shell, time)
 src/plugin.c           .so loader (MOTIRIS_PLUGIN_DIR, --plugin-dir)
 src/main.c             CLI, sessions, skills
 src/vendor/cJSON.c/h   vendored cJSON (MIT)
+deps/libcurl/include/  vendored libcurl dev headers (curl 8.18 ABI)
 examples/              plugins, extensions
 tests/smoke.sh         offline test suite (make test)
 ```
