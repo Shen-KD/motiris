@@ -1,0 +1,42 @@
+name: release
+
+# Tag a version to publish:  git tag v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: make
+
+      - name: offline smoke tests
+        run: make test
+
+      - name: package artifacts
+        run: |
+          V=${GITHUB_REF_NAME#v}
+          tar czf motiris-${V}-linux-x86_64.tar.gz motiris
+          sha256sum motiris > motiris.sha256
+          { echo "motiris ${V}";
+            echo "commit: ${GITHUB_SHA::8}";
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)";
+            echo "binary: $(./motiris --version)";
+          } > motiris-info.txt
+          ls -la motiris motiris-*.tar.gz motiris.sha256 motiris-info.txt
+
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            motiris-*.tar.gz motiris.sha256 motiris-info.txt \
+            --title "motiris $GITHUB_REF_NAME" \
+            --notes "Built from ${GITHUB_SHA::8}; smoke suite (make test) passed. See README.md and ./motiris --help for usage."
