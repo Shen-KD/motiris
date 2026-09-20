@@ -47,9 +47,10 @@ static void stream_handle_data(StreamCtx *s, const char *payload) {
       cJSON_GetObjectItemCaseSensitive(delta, "content"));
   if (dc && *dc) {
     size_t n = strlen(dc);
-    s->content = realloc(s->content,
-        (s->content ? strlen(s->content) : 0) + n + 1);
-    strcat(s->content ? s->content : (s->content = malloc(1), s->content[0] = 0, s->content), dc);
+    size_t cur = s->content ? strlen(s->content) : 0;
+    s->content = realloc(s->content, cur + n + 1);
+    if (!cur) s->content[0] = '\0';   /* first delta: terminate before strcat */
+    strcat(s->content, dc);
     if (s->on_delta) s->on_delta(dc, s->ud);
   }
 
