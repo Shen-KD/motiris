@@ -28,6 +28,7 @@
 #define C_RED   "\033[31m"
 #define C_DIM   "\033[2m"
 #define C_BOLD  "\033[1m"
+#define C_YELLOW "\033[33m"
 
 static const char *const CMDS[] = { "/help", "/new", "/tools", "/exit", "/quit" };
 static const char *const CMDS_DESC[] = {
@@ -43,6 +44,41 @@ static void delta_print(const char *text, void *ud) {
   (void)ud;
   fputs(text, stdout);
   fflush(stdout);
+}
+
+/* copy at most n-1 chars, whitespace collapsed */
+static void clip(char *dst, size_t n, const char *src, size_t maxlen) {
+  size_t i = 0, o = 0;
+  int prev_sp = 0;
+  while (src[i] && o + 1 < n && o < maxlen) {
+    char c = src[i++];
+    if (c == '\n' || c == '\t' || c == '\r') c = ' ';
+    if (c == ' ') {
+      if (prev_sp) continue;
+      prev_sp = 1;
+    } else prev_sp = 0;
+    dst[o++] = c;
+  }
+  if (o >= maxlen && o + 1 < n) { dst[o++] = '.', dst[o++] = '.'; }
+  dst[o] = '\0';
+}
+
+/* tool-call observer: yellow ⚙ line with a short result digest */
+static void repl_tool_hook(const char *name, const char *args,
+                           const char *result, void *ud) {
+  (void)ud;
+  char abuf[80], rbuf[96];
+  clip(abuf, sizeof abuf, args ? args : "{}", 60);
+  int is_err = result && strstr(result, "\"error\"");
+  if (is_err) {
+    clip(rbuf, sizeof rbuf, result, 72);
+    printf("  " C_YELLOW "⚙ %s" C_RESET "(%s) " C_RED "✗ %s" C_RESET "\n",
+           name, abuf, rbuf);
+  } else {
+    clip(rbuf, sizeof rbuf, result, 72);
+    printf("  " C_YELLOW "⚙ %s" C_RESET "(%s) " C_DIM "→ %s" C_RESET "\n",
+           name, abuf, rbuf);
+  }
 }
 
 static const char *hist_path(void) {
@@ -115,6 +151,7 @@ static int handle_command(MotirisAgent *a, const char *line) {
 int motiris_repl(MotirisAgent *a) {
   motiris_set_stream(a, 1);
   motiris_set_stream_cb(a, delta_print, NULL);
+  motiris_set_tool_hook(a, repl_tool_hook, NULL);
   int color = isatty(1) ? 1 : 0;
 
   linenoiseSetCompletionCallback(repl_completion);
@@ -145,10 +182,18 @@ int motiris_repl(MotirisAgent *a) {
 
     printf(C_DIM "→ you" C_RESET "\n");
     if (color) printf(C_CYAN);
+    long ti0 = motiris_tokens_in(a), to0 = motiris_tokens_out(a);
     int rc = motiris_run(a);
+    long di = motiris_tokens_in(a) - ti0;
+    long dout = motiris_tokens_out(a) - to0;
     if (color) printf(C_RESET "\n");
     if (rc) fprintf(stderr, C_RED "motiris: %s" C_RESET "\n",
                     motiris_last_error(a));
+    if (di || dout)
+      printf(C_DIM "[tokens " C_RESET C_CYAN "↑%ld" C_RESET C_DIM
+             " " C_RESET C_GREEN "↓%ld" C_RESET C_DIM
+             " · total %ld]" C_RESET "\n",
+             di, dout, motiris_tokens_in(a) + motiris_tokens_out(a));
     printf("\n");
   }
   printf(C_DIM "bye" C_RESET "\n");

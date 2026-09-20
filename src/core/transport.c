@@ -32,12 +32,18 @@ typedef struct {
   /* aggregated final message (SSE deltas -> one complete message) */
   char *content;                    /* concatenated delta.content */
   cJSON *tool_calls;                /* array of {id,type,function} */
+  cJSON *usage;                     /* last-chunk usage, if provided */
 } StreamCtx;
 
 /* parse one "data: {json}" payload: extract delta and aggregate */
 static void stream_handle_data(StreamCtx *s, const char *payload) {
   cJSON *j = cJSON_Parse(payload);
   if (!j) return;
+  cJSON *use = cJSON_GetObjectItemCaseSensitive(j, "usage");
+  if (cJSON_IsObject(use)) {
+    cJSON_Delete(s->usage);
+    s->usage = cJSON_Duplicate(use, 1);
+  }
   cJSON *choice = cJSON_GetArrayItem(
       cJSON_GetObjectItemCaseSensitive(j, "choices"), 0);
   cJSON *delta = choice ? cJSON_GetObjectItemCaseSensitive(choice, "delta") : NULL;
@@ -223,7 +229,8 @@ static char *libcurl_send_stream(const char *url, const char *auth,
       snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
       *err = m;
     }
-    free(s.content); cJSON_Delete(s.tool_calls); free(s.line);
+    free(s.content); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
+    free(s.line);
     return NULL;
   }
   if (http != 200) {
@@ -232,7 +239,8 @@ static char *libcurl_send_stream(const char *url, const char *auth,
       snprintf(m, 96, "http status %ld (stream)", http);
       *err = m;
     }
-    free(s.content); cJSON_Delete(s.tool_calls); free(s.line);
+    free(s.content); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
+    free(s.line);
     return NULL;
   }
 
@@ -251,6 +259,7 @@ static char *libcurl_send_stream(const char *url, const char *auth,
       cJSON_CreateString(s.tool_calls ? "tool_calls" : "stop"));
   cJSON_AddItemToArray(choices, choice);
   cJSON_AddItemToObject(resp, "choices", choices);
+  if (s.usage) cJSON_AddItemToObject(resp, "usage", s.usage);
   free(s.content);
   free(s.line);
   return cJSON_PrintUnformatted(resp);
