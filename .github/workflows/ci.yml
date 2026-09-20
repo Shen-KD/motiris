@@ -79,7 +79,7 @@ jobs:
 
       - name: install build deps (rpm distros)
         if: matrix.container != ''
-        run: dnf install -y --setopt=install_weak_deps=False gcc make libcurl python3 iproute
+        run: dnf install -y --setopt=install_weak_deps=False gcc make python3 iproute
 
       - name: build
         run: make ${{ matrix.cc && format('CC={0}', matrix.cc) }}
