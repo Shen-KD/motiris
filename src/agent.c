@@ -63,6 +63,7 @@ void motiris_set_plugin_dir(MotirisAgent *a, const char *d) {
   a->plugin_dir = sdup(d);
 }
 void motiris_set_tools_enabled(MotirisAgent *a, int on) { a->tools_on = !!on; }
+int motiris_tools_enabled(MotirisAgent *a) { return a->tools_on; }
 void motiris_set_plugins_enabled(MotirisAgent *a, int on) { a->plugins_on = !!on; }
 int motiris_plugins_enabled(MotirisAgent *a) { return a->plugins_on; }
 const char *motiris_plugin_dir(MotirisAgent *a) { return a->plugin_dir; }

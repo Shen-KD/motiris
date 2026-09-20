@@ -73,6 +73,8 @@ const char *motiris_last_error(MotirisAgent *a);
 
 /* built-in tools */
 void motiris_register_core_tools(MotirisAgent *a);
+void motiris_register_file_tools(MotirisAgent *a);  /* read/write/patch/search */
+int  motiris_tools_enabled(MotirisAgent *a);
 
 /* ---- centralized config: $HOME/.motiris/{env,config.json} ---- */
 void motiris_load_env(void);                  /* call before new() */
