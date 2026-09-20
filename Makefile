@@ -42,8 +42,8 @@ libmotiris_harness.a: $(HARNESS_OBJ)
 	ar rcs $@ $^
 
 motiris: libmotiris_core.a libmotiris_tools.a libmotiris_harness.a \
-		src/main.o src/vendor/cJSON.o deps/linenoise/linenoise.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ src/main.o src/vendor/cJSON.o \
+		src/main.o src/compat.o src/vendor/cJSON.o deps/linenoise/linenoise.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ src/main.o src/compat.o src/vendor/cJSON.o \
 		deps/linenoise/linenoise.o \
 		-Wl,--start-group libmotiris_core.a libmotiris_tools.a \
 		libmotiris_harness.a -Wl,--end-group \
