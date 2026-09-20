@@ -49,11 +49,24 @@ typedef int (*motiris_plugin_init_fn)(MotirisAgent *a, const MotirisPluginApi *a
 int motiris_load_plugins(MotirisAgent *a, const char *dir);  /* 0 on success */
 void motiris_set_transport(MotirisAgent *a, const char *name);  /* "curl"|"echo" */
 void motiris_set_max_steps(MotirisAgent *a, int n);
+void motiris_set_plugins_enabled(MotirisAgent *a, int on);
+void motiris_set_tools_enabled(MotirisAgent *a, int on);
+void motiris_set_plugin_dir(MotirisAgent *a, const char *dir);
+int  motiris_plugins_enabled(MotirisAgent *a);
+const char *motiris_plugin_dir(MotirisAgent *a);
 void motiris_set_verbose(MotirisAgent *a, int on);
+void motiris_set_stream(MotirisAgent *a, int on);      /* SSE streaming */
+void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
+                           void *ud);   /* per-token sink (default stdout) */
 int  motiris_run(MotirisAgent *a);   /* 0 on success */
 const char *motiris_last_error(MotirisAgent *a);
 
 /* built-in tools */
 void motiris_register_core_tools(MotirisAgent *a);
+
+/* ---- centralized config: $HOME/.motiris/{env,config.json} ---- */
+void motiris_load_env(void);                  /* call before new() */
+void motiris_apply_config(MotirisAgent *a);   /* defaults, CLI wins */
+int  motiris_init_config(void);               /* write templates */
 
 #endif /* MOTIRIS_H */

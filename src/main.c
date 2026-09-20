@@ -28,6 +28,9 @@ static void usage(FILE *f) {
 "  -r, --resume FILE     resume previous session log\n"
 "      --save FILE       persist session log to FILE\n"
 "  -v, --verbose         print step/tool/trace to stderr\n"
+"  -i, --interactive     force interactive REPL (default when tty)\n"
+"      --stream          stream tokens as they arrive (once-run mode)\n"
+"      --init            write $HOME/.motiris/{env,config.json} templates\n"
 "  -h, --help            this help\n"
 "\n"
 "examples:\n"
@@ -67,11 +70,14 @@ static char *load_skill_dir(const char *dir) {
   return buf;
 }
 
+int motiris_repl(MotirisAgent *a);
+
 int main(int argc, char **argv) {
   const char *model = NULL, *base_url = NULL, *key = NULL;
   const char *system = NULL, *prompt = NULL, *skill_dir = NULL;
   const char *resume = NULL, *save = NULL, *transport = NULL, *plugin_dir = NULL;
   int no_tools = 0, no_plugin = 0, verbose = 0, max_steps = 0;
+  int interactive = 0, stream = 0;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -89,13 +95,19 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--no-tools")) no_tools = 1;
     else if (!strcmp(a, "--plugin-dir")) plugin_dir = NEED();
     else if (!strcmp(a, "--no-plugin")) no_plugin = 1;
+    else if (!strcmp(a, "-i") || !strcmp(a, "--interactive")) interactive = 1;
+    else if (!strcmp(a, "--stream")) stream = 1;
+    else if (!strcmp(a, "--init")) { return motiris_init_config() ? 2 : 0; }
     else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) verbose = 1;
     else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
     else { fprintf(stderr, "motiris: unknown option: %s\n", a); usage(stderr); return 2; }
 #undef NEED
   }
 
+  motiris_load_env();   /* $HOME/.motiris/env -> env defaults */
+
   MotirisAgent *ag = motiris_new();
+  motiris_apply_config(ag);   /* config.json defaults (CLI flags win below) */
   if (model) motiris_set_model(ag, model);
   if (base_url) motiris_set_base_url(ag, base_url);
   if (key) motiris_set_api_key(ag, key);
@@ -103,8 +115,12 @@ int main(int argc, char **argv) {
   if (transport) motiris_set_transport(ag, transport);
   if (max_steps > 0) motiris_set_max_steps(ag, max_steps);
   motiris_set_verbose(ag, verbose);
-  if (!no_tools) motiris_register_core_tools(ag);
-  if (!no_plugin) motiris_load_plugins(ag, plugin_dir);
+  if (stream) motiris_set_stream(ag, 1);
+  if (no_tools) motiris_set_tools_enabled(ag, 0);
+  if (no_plugin) motiris_set_plugins_enabled(ag, 0);
+  if (plugin_dir) motiris_set_plugin_dir(ag, plugin_dir);
+  motiris_register_core_tools(ag);
+  if (motiris_plugins_enabled(ag)) motiris_load_plugins(ag, NULL);
 
   /* skills: injected as system context (kept in front of user prompt) */
   if (skill_dir) {
@@ -132,7 +148,12 @@ int main(int argc, char **argv) {
   }
 
   if (prompt) motiris_add_user(ag, prompt);
-  else if (!isatty(0)) {
+  else if (interactive || isatty(0)) {
+    /* interactive REPL: multi-turn, streaming, history */
+    int rc = motiris_repl(ag);
+    motiris_free(ag);
+    return rc;
+  } else {
     char *in = read_stdin();
     if (*in) motiris_add_user(ag, in);
     free(in);

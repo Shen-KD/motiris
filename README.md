@@ -129,3 +129,23 @@ tests/smoke.sh         offline test suite (make test)
 ## License
 
 MIT. cJSON (vendored) is MIT (c) Dave Gamble et al.
+
+## CI & branch protection
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR: gcc
+build, offline smoke tests, clang `-Werror` build, plugin example
+compile, binary size check, and uploads the signed binary as an
+artifact. The job is named `ci` — that exact name is the required status
+check on `main`.
+
+`main` is protected: PR-only (no direct pushes, no force push, no
+deletions), requires the `ci` check to pass. Solo developers can still
+merge their own PRs. Local layer: a pre-push hook blocks accidental
+direct pushes to main:
+
+```
+git config core.hooksPath .githooks     # enable hook (already set for dev)
+git checkout -b feat/foo && ... && git push -u origin HEAD
+gh pr create --base main --head feat/foo --title "..." --body "..."
+gh pr merge --squash --delete-branch
+```

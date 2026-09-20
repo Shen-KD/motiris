@@ -66,7 +66,7 @@ static void load_one(MotirisAgent *a, const char *path) {
 }
 
 int motiris_load_plugins(MotirisAgent *a, const char *dir) {
-  (void)a;
+  if (motiris_plugin_dir(a) && *motiris_plugin_dir(a)) dir = motiris_plugin_dir(a);
   char *d = resolve_dir(dir);
 
   DIR *dh = opendir(d);

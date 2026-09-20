@@ -1,0 +1,12 @@
+#!/bin/sh
+# pre-push hook: block direct pushes to main. Enable with:
+#   git config core.hooksPath .githooks
+# Merges go through PRs (gh pr merge bypasses this hook server-side).
+while read local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main)
+      echo "ERROR: direct push to main is not allowed. Use a PR."
+      exit 1 ;;
+  esac
+done
+exit 0

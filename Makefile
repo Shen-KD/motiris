@@ -1,12 +1,16 @@
 # motiris - Iris as a mote. Zero-dependency C11 build.
 CC      ?= cc
-CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -pedantic -D_POSIX_C_SOURCE=200809L
+CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
 CFLAGS  += -Ideps/libcurl/include
 LDFLAGS ?= -Wl,-l:libcurl.so.4
 PREFIX  ?= /usr/local
 
-SRC = src/vendor/cJSON.c src/transport.c src/tools.c src/plugin.c src/agent.c src/main.c
+SRC = src/vendor/cJSON.c src/transport.c src/tools.c src/plugin.c \
+      src/agent.c src/repl.c src/config.c src/main.c \
+      deps/linenoise/linenoise.c
 HDR = include/motiris.h
+
+CFLAGS += -Ideps/linenoise
 
 motiris: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -Iinclude -Isrc/vendor -o $@ $(SRC) $(LDFLAGS) -ldl -Wl,--export-dynamic

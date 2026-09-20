@@ -28,23 +28,42 @@ struct MotirisAgent {
   char transport[16];
   int max_steps;
   int verbose;
+  int stream;
+  void (*on_delta)(const char *, void *);
+  void *delta_ud;
+  int tools_on, plugins_on;
+  char *plugin_dir;
   char *last_error;
 };
 
 /* transport.c */
 char *motiris_transport_send(const char *backend, const char *url,
-                          const char *auth, const char *body, char **err);
+                             const char *auth, const char *body, char **err);
+char *motiris_transport_send_stream(const char *backend, const char *url,
+                                    const char *auth, const char *body,
+                                    void (*on_delta)(const char *, void *),
+                                    void *ud, char **err);
 
 /* tools.c */
 int motiris_register_core_tools_count(void);
 const MotirisTool *motiris_core_tools(void);
 
 void motiris_register_core_tools(MotirisAgent *a) {
+  if (!a->tools_on) return;
   for (int i = 0; i < motiris_register_core_tools_count(); i++)
     motiris_register_tool(a, &motiris_core_tools()[i]);
 }
 
 static char *sdup(const char *s) { return s ? strdup(s) : NULL; }
+
+void motiris_set_plugin_dir(MotirisAgent *a, const char *d) {
+  free(a->plugin_dir);
+  a->plugin_dir = sdup(d);
+}
+void motiris_set_tools_enabled(MotirisAgent *a, int on) { a->tools_on = !!on; }
+void motiris_set_plugins_enabled(MotirisAgent *a, int on) { a->plugins_on = !!on; }
+int motiris_plugins_enabled(MotirisAgent *a) { return a->plugins_on; }
+const char *motiris_plugin_dir(MotirisAgent *a) { return a->plugin_dir; }
 
 MotirisAgent *motiris_new(void) {
   MotirisAgent *a = calloc(1, sizeof *a);
@@ -55,6 +74,8 @@ MotirisAgent *motiris_new(void) {
   a->messages = cJSON_CreateArray();
   strcpy(a->transport, "auto");
   a->max_steps = 10;
+  a->tools_on = 1;
+  a->plugins_on = 1;
   return a;
 }
 
@@ -64,6 +85,7 @@ void motiris_free(MotirisAgent *a) {
   free(a->base_url);
   free(a->api_key);
   free(a->system);
+  free(a->plugin_dir);
   free(a->last_error);
   cJSON_Delete(a->messages);
   free(a);
@@ -79,8 +101,11 @@ void motiris_set_api_key(MotirisAgent *a, const char *k) {
   free(a->api_key); a->api_key = sdup(k);
 }
 void motiris_set_transport(MotirisAgent *a, const char *n) {
-  snprintf(a->transport, sizeof a->transport, "%s", n ? n : "curl");
+  snprintf(a->transport, sizeof a->transport, "%s", n ? n : "auto");
 }
+void motiris_set_stream(MotirisAgent *a, int on) { a->stream = !!on; }
+void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
+                           void *ud) { a->on_delta = cb; a->delta_ud = ud; }
 void motiris_set_max_steps(MotirisAgent *a, int n) { a->max_steps = n; }
 void motiris_set_verbose(MotirisAgent *a, int on) { a->verbose = on; }
 
@@ -171,6 +196,7 @@ static char *build_request(MotirisAgent *a) {
   }
 
   cJSON_AddNumberToObject(req, "temperature", 0.2);
+  if (a->stream) cJSON_AddTrueToObject(req, "stream");
   char *body = cJSON_PrintUnformatted(req);
   cJSON_Delete(req);
   return body;
@@ -205,8 +231,14 @@ int motiris_run(MotirisAgent *a) {
     }
 
     char *err = NULL;
-    char *resp = motiris_transport_send(a->transport, a->base_url, authp,
-                                     body, &err);
+        char *resp;
+        if (a->stream)
+          resp = motiris_transport_send_stream(a->transport, a->base_url, authp,
+                                               body, a->on_delta, a->delta_ud,
+                                               &err);
+        else
+          resp = motiris_transport_send(a->transport, a->base_url, authp,
+                                        body, &err);
     free(body);
     if (!resp) {
       set_error(a, err ? "transport error: %s" : "transport error", err);
