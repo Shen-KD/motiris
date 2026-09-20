@@ -1,26 +1,26 @@
-# hermote - Hermes as a mote. Zero-dependency C11 build.
+# motiris - Iris as a mote. Zero-dependency C11 build.
 CC      ?= cc
 CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -pedantic -D_POSIX_C_SOURCE=200809L
 LDFLAGS ?=
 PREFIX  ?= /usr/local
 
 SRC = src/vendor/cJSON.c src/transport.c src/tools.c src/plugin.c src/agent.c src/main.c
-HDR = include/hermote.h
+HDR = include/motiris.h
 
-hermote: $(SRC) $(HDR)
+motiris: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -Iinclude -Isrc/vendor -o $@ $(SRC) $(LDFLAGS) -ldl -Wl,--export-dynamic
 	-strip $@
 
-examples/hello_plugin.so: examples/hello_plugin.c include/hermote.h
+examples/hello_plugin.so: examples/hello_plugin.c include/motiris.h
 	$(CC) $(CFLAGS) -fPIC -shared -Iinclude -Isrc/vendor -o $@ $<
 
-test: hermote
+test: motiris
 	sh tests/smoke.sh
 
 clean:
-	rm -f hermote
+	rm -f motiris
 
-install: hermote
-	install -m 0755 hermote $(PREFIX)/bin/hermote
+install: motiris
+	install -m 0755 motiris $(PREFIX)/bin/motiris
 
 .PHONY: test clean install

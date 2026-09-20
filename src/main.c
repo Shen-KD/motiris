@@ -1,8 +1,8 @@
-/* main.c - hermote CLI: a single static-ish binary, no runtime deps.
- *   hermote -p "summarize this repo" -m deepseek-chat -b <url> -v
- *   echo "$(cat prompt.txt)" | hermote              (stdin as prompt)
+/* main.c - motiris CLI: a single static-ish binary, no runtime deps.
+ *   motiris -p "summarize this repo" -m deepseek-chat -b <url> -v
+ *   echo "$(cat prompt.txt)" | motiris              (stdin as prompt)
  */
-#include "hermote.h"
+#include "motiris.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,14 +10,14 @@
 
 static void usage(FILE *f) {
   fprintf(f,
-"hermote - Hermes as a mote: agent = model + harness, in one tiny binary.\n"
+"motiris - Iris as a mote: agent = model + harness, in one tiny binary.\n"
 "\n"
-"usage: hermote [options]\n"
+"usage: motiris [options]\n"
 "\n"
-"  -m, --model NAME      model id (env HERMOTE_MODEL, default gpt-4o-mini)\n"
+"  -m, --model NAME      model id (env MOTIRIS_MODEL, default gpt-4o-mini)\n"
 "  -b, --base-url URL    chat completions endpoint\n"
 "                        (default https://api.openai.com/v1/chat/completions)\n"
-"  -k, --api-key KEY     bearer token (env HERMOTE_API_KEY)\n"
+"  -k, --api-key KEY     bearer token (env MOTIRIS_API_KEY)\n"
 "  -s, --system TEXT     system prompt\n"
 "  -S, --skill-dir DIR   read *.md files here, inject as system prompt\n"
 "  -p, --prompt TEXT     user prompt (default: read stdin)\n"
@@ -30,8 +30,8 @@ static void usage(FILE *f) {
 "  -h, --help            this help\n"
 "\n"
 "examples:\n"
-"  hermote -p \"what time is it?\" -m deepseek-chat -k $DEEPSEEK_API_KEY\n"
-"  printf 'list this dir' | hermote --transport echo          # offline demo\n");
+"  motiris -p \"what time is it?\" -m deepseek-chat -k $DEEPSEEK_API_KEY\n"
+"  printf 'list this dir' | motiris --transport echo          # offline demo\n");
 }
 
 static char *read_stdin(void) {
@@ -90,20 +90,20 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--no-plugin")) no_plugin = 1;
     else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) verbose = 1;
     else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
-    else { fprintf(stderr, "hermote: unknown option: %s\n", a); usage(stderr); return 2; }
+    else { fprintf(stderr, "motiris: unknown option: %s\n", a); usage(stderr); return 2; }
 #undef NEED
   }
 
-  HermoteAgent *ag = hermote_new();
-  if (model) hermote_set_model(ag, model);
-  if (base_url) hermote_set_base_url(ag, base_url);
-  if (key) hermote_set_api_key(ag, key);
-  if (system) hermote_set_system(ag, system);
-  if (transport) hermote_set_transport(ag, transport);
-  if (max_steps > 0) hermote_set_max_steps(ag, max_steps);
-  hermote_set_verbose(ag, verbose);
-  if (!no_tools) hermote_register_core_tools(ag);
-  if (!no_plugin) hermote_load_plugins(ag, plugin_dir);
+  MotirisAgent *ag = motiris_new();
+  if (model) motiris_set_model(ag, model);
+  if (base_url) motiris_set_base_url(ag, base_url);
+  if (key) motiris_set_api_key(ag, key);
+  if (system) motiris_set_system(ag, system);
+  if (transport) motiris_set_transport(ag, transport);
+  if (max_steps > 0) motiris_set_max_steps(ag, max_steps);
+  motiris_set_verbose(ag, verbose);
+  if (!no_tools) motiris_register_core_tools(ag);
+  if (!no_plugin) motiris_load_plugins(ag, plugin_dir);
 
   /* skills: injected as system context (kept in front of user prompt) */
   if (skill_dir) {
@@ -113,9 +113,9 @@ int main(int argc, char **argv) {
         size_t n = strlen(system) + strlen(sk) + 4;
         char *both = malloc(n);
         snprintf(both, n, "%s\n\n%s", system, sk);
-        hermote_set_system(ag, both);
+        motiris_set_system(ag, both);
         free(both);
-      } else hermote_set_system(ag, sk);
+      } else motiris_set_system(ag, sk);
     }
     free(sk);
   }
@@ -123,35 +123,35 @@ int main(int argc, char **argv) {
   /* resume: replay a saved session log line by line */
   if (resume) {
     FILE *f = fopen(resume, "r");
-    if (!f) { fprintf(stderr, "hermote: cannot open %s\n", resume); return 2; }
+    if (!f) { fprintf(stderr, "motiris: cannot open %s\n", resume); return 2; }
     char line[65536];
     while (fgets(line, sizeof line, f))
-      if (line[0] == 'U') hermote_add_user(ag, line + 1);
+      if (line[0] == 'U') motiris_add_user(ag, line + 1);
     fclose(f);
   }
 
-  if (prompt) hermote_add_user(ag, prompt);
+  if (prompt) motiris_add_user(ag, prompt);
   else {
     char *in = read_stdin();
-    if (*in) hermote_add_user(ag, in);
+    if (*in) motiris_add_user(ag, in);
     free(in);
   }
 
-  cJSON *msgs = hermote_messages(ag);
+  cJSON *msgs = motiris_messages(ag);
   if (!msgs || !msgs->child) {
-    fprintf(stderr, "hermote: no prompt (use -p or pipe stdin)\n");
-    hermote_free(ag);
+    fprintf(stderr, "motiris: no prompt (use -p or pipe stdin)\n");
+    motiris_free(ag);
     return 2;
   }
 
-  int rc = hermote_run(ag);
-  if (rc) fprintf(stderr, "hermote: %s\n", hermote_last_error(ag));
+  int rc = motiris_run(ag);
+  if (rc) fprintf(stderr, "motiris: %s\n", motiris_last_error(ag));
   if (save) {
     /* append-only trace: U=user, A=assistant content, T=tool result.
        resume (-r) replays U lines; the rest stay for human inspection. */
     FILE *f = fopen(save, "a");
     if (f) {
-      for (cJSON *m = hermote_messages(ag)->child; m; m = m->next) {
+      for (cJSON *m = motiris_messages(ag)->child; m; m = m->next) {
         const char *role = cJSON_GetStringValue(
             cJSON_GetObjectItemCaseSensitive(m, "role"));
         const char *content = cJSON_GetStringValue(
@@ -169,6 +169,6 @@ int main(int argc, char **argv) {
       fclose(f);
     }
   }
-  hermote_free(ag);
+  motiris_free(ag);
   return rc;
 }
