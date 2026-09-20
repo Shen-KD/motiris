@@ -1,7 +1,9 @@
 # motiris - Iris as a mote. Zero-dependency C11 build.
 CC      ?= cc
 CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
-CFLAGS  += -Ideps/libcurl/include
+# include paths live in CPPFLAGS so overriding CFLAGS (e.g. -Werror in CI)
+# never drops the vendored headers
+CPPFLAGS ?= -Iinclude -Isrc/vendor -Ideps/libcurl/include -Ideps/linenoise
 LDFLAGS ?= -Wl,-l:libcurl.so.4
 PREFIX  ?= /usr/local
 
@@ -10,10 +12,8 @@ SRC = src/vendor/cJSON.c src/transport.c src/tools.c src/plugin.c \
       deps/linenoise/linenoise.c
 HDR = include/motiris.h
 
-CFLAGS += -Ideps/linenoise
-
 motiris: $(SRC) $(HDR)
-	$(CC) $(CFLAGS) -Iinclude -Isrc/vendor -o $@ $(SRC) $(LDFLAGS) -ldl -Wl,--export-dynamic
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $(SRC) $(LDFLAGS) -ldl -Wl,--export-dynamic
 	-strip $@
 
 examples/hello_plugin.so: examples/hello_plugin.c include/motiris.h

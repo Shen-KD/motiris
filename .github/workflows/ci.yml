@@ -20,9 +20,9 @@ jobs:
         run: make test
 
       - name: build with clang -Werror
-        run: make clean && \
-             make CC=clang CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror \
-             -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE"
+        run: |
+          make clean
+          make CC=clang CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE"
 
       - name: plugin example still compiles
         run: make examples/hello_plugin.so
