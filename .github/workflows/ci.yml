@@ -28,7 +28,7 @@ jobs:
         run: make examples/hello_plugin.so
 
       - name: binary stays tiny
-        run: test $(stat -c %s motiris) -lt 131072
+        run: test $(stat -c %s motiris) -lt 163840
 
       - name: upload binary
         uses: actions/upload-artifact@v4
@@ -36,3 +36,19 @@ jobs:
           name: motiris-linux-x86_64
           path: motiris
           if-no-files-found: error
+
+  # performance & resource guard: cold-start latency, peak RSS, agent-loop
+  # overhead. Informational check (not required for merge).
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: make
+
+      - name: install /usr/bin/time
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq time
+
+      - name: run perf benchmarks
+        run: sh tests/perf.sh

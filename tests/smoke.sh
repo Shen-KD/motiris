@@ -319,4 +319,10 @@ kill $M14PID 2>/dev/null
 wait $M14PID 2>/dev/null || true
 rm -rf "$F14"
 
+echo "== 15: repl via pipe (commands + run + exit)"
+O9=$(printf '/help\nhi\n/exit\n' | "$ROOT/motiris" -i --transport echo --no-plugin 2>&1)
+echo "$O9" | grep -q 'echo round complete' || { echo "FAIL repl run: $O9"; exit 1; }
+echo "$O9" | grep -q '/help' || { echo "FAIL repl help: $O9"; exit 1; }
+echo "$O9" | grep -q 'bye' || { echo "FAIL repl exit: $O9"; exit 1; }
+
 echo "smoke: all tests passed"
