@@ -33,6 +33,9 @@ struct MotirisAgent {
   void *delta_ud;
   int tools_on, plugins_on;
   char *plugin_dir;
+  MotirisToolHook *tool_hook;
+  void *tool_hook_ud;
+  long tok_in, tok_out;
   MotirisProvider providers[8];
   int nproviders;
   char *last_error;
@@ -129,6 +132,12 @@ void motiris_set_transport(MotirisAgent *a, const char *n) {
 void motiris_set_stream(MotirisAgent *a, int on) { a->stream = !!on; }
 void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                            void *ud) { a->on_delta = cb; a->delta_ud = ud; }
+void motiris_set_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud) {
+  a->tool_hook = cb;
+  a->tool_hook_ud = ud;
+}
+long motiris_tokens_in(MotirisAgent *a)  { return a->tok_in; }
+long motiris_tokens_out(MotirisAgent *a) { return a->tok_out; }
 void motiris_set_max_steps(MotirisAgent *a, int n) { a->max_steps = n; }
 void motiris_set_verbose(MotirisAgent *a, int on) { a->verbose = on; }
 
@@ -316,6 +325,14 @@ int motiris_run(MotirisAgent *a) {
                   pname(a, pi), last_err);
         continue;
       }
+      /* accumulate usage/token stats from this response */
+      cJSON *usage = cJSON_GetObjectItemCaseSensitive(j, "usage");
+      if (cJSON_IsObject(usage)) {
+        cJSON *pt = cJSON_GetObjectItemCaseSensitive(usage, "prompt_tokens");
+        cJSON *ct = cJSON_GetObjectItemCaseSensitive(usage, "completion_tokens");
+        if (cJSON_IsNumber(pt)) a->tok_in += (long)pt->valuedouble;
+        if (cJSON_IsNumber(ct)) a->tok_out += (long)ct->valuedouble;
+      }
       break; /* got a usable response */
     }
 
@@ -364,10 +381,12 @@ int motiris_run(MotirisAgent *a) {
               "error: unknown tool (not registered)"));
         } else {
           if (a->verbose) fprintf(stderr, "[motiris] tool call: %s(%s)\n",
-                                  name, args ? args : "");
-          result = t->call(args ? args : "{}", t->ud);
-          if (!result) result = cJSON_PrintUnformatted(
-              cJSON_CreateString("error: tool returned nothing"));
+                                          name, args ? args : "");
+                  result = t->call(args ? args : "{}", t->ud);
+                  if (!result) result = cJSON_PrintUnformatted(
+                      cJSON_CreateString("error: tool returned nothing"));
+                  if (a->tool_hook)
+                    a->tool_hook(name, args ? args : "{}", result, a->tool_hook_ud);
         }
         push_tool_message(a, id ? id : "", result);
         free(result);

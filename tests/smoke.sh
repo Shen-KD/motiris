@@ -325,4 +325,48 @@ echo "$O9" | grep -q 'echo round complete' || { echo "FAIL repl run: $O9"; exit 
 echo "$O9" | grep -q '/help' || { echo "FAIL repl help: $O9"; exit 1; }
 echo "$O9" | grep -q 'bye' || { echo "FAIL repl exit: $O9"; exit 1; }
 
+echo "== 16: repl shows tool calls + token stats"
+F16=$(mktemp -d)
+mkdir -p "$F16/h"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18101/v1/chat/completions"}' > "$F16/h/config.json"
+python3 - <<'PY5' &
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = __import__("json").loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            d = ("data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n"
+                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                 "data: {\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":10}}\n\n"
+                 "data: [DONE]\n\n")
+        else:
+            d = ("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_t1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n"
+                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\": \\\"x.txt\\\"}\"}}]}}]}\n\n"
+                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+                 "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":25}}\n\n"
+                 "data: [DONE]\n\n")
+        b = d.encode()
+        self.send_response(200)
+        self.send_header("Content-Type","text/event-stream")
+        self.send_header("Content-Length",str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18101),H).serve_forever()
+PY5
+M16PID=$!
+MOCK_PIDS="$MOCK_PIDS $M16PID"
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -q 18101 && break
+  sleep 0.3
+done
+O10=$(MOTIRIS_HOME="$F16/h" MOTIRIS_WORKSPACE="$F16" sh -c 'printf "hi\n/exit\n" | "$0" -i -k x' "$ROOT/motiris" 2>&1)
+echo "$O10" | grep -q 'read_file' || { echo "FAIL tool line: $O10"; exit 1; }
+echo "$O10" | grep -q '↑140' || { echo "FAIL tokens in: $O10"; exit 1; }
+echo "$O10" | grep -q '↓35' || { echo "FAIL tokens out: $O10"; exit 1; }
+kill $M16PID 2>/dev/null
+wait $M16PID 2>/dev/null || true
+rm -rf "$F16"
+
 echo "smoke: all tests passed"

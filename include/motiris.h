@@ -71,6 +71,15 @@ void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
 int  motiris_run(MotirisAgent *a);   /* 0 on success */
 const char *motiris_last_error(MotirisAgent *a);
 
+/* tool-invocation observer: called after each tool executes */
+typedef void (MotirisToolHook)(const char *name, const char *args,
+                               const char *result, void *ud);
+void motiris_set_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud);
+
+/* cumulative token counters across all turns of this agent */
+long motiris_tokens_in(MotirisAgent *a);
+long motiris_tokens_out(MotirisAgent *a);
+
 /* built-in tools */
 void motiris_register_core_tools(MotirisAgent *a);
 void motiris_register_file_tools(MotirisAgent *a);  /* read/write/patch/search */
