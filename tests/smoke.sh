@@ -36,4 +36,8 @@ OUT=$(./motiris -r "$F" --transport echo)
 echo "$OUT" | grep -q 'echo round complete' || { echo "FAIL: resume"; exit 1; }
 rm -f "$F"
 
+echo "== 7: env config honored (MOTIRIS_MODEL)"
+OUT=$(MOTIRIS_MODEL=foo-model ./motiris -p hi --transport echo -v 2>&1)
+echo "$OUT" | grep -q 'requesting model foo-model' || { echo FAIL; exit 1; }
+
 echo "smoke: all tests passed"

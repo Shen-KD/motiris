@@ -69,8 +69,9 @@ motiris -p "continue" -r last-run.log                   # resume a session
 motiris -p "do X" --skill-dir ./skills                  # skills as context
 ```
 
-Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_PLUGIN_DIR`,
-`MOTIRIS_CURL`. Default endpoint: `https://api.openai.com/v1/chat/completions`.
+Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
+`MOTIRIS_PLUGIN_DIR`, `MOTIRIS_CURL`. Default endpoint:
+`https://api.openai.com/v1/chat/completions`.
 
 Built-in tools (disable with `--no-tools`):
 

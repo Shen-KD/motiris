@@ -48,7 +48,8 @@ static char *sdup(const char *s) { return s ? strdup(s) : NULL; }
 
 MotirisAgent *motiris_new(void) {
   MotirisAgent *a = calloc(1, sizeof *a);
-  a->base_url = sdup(DEF_BASE_URL);
+  const char *u = getenv("MOTIRIS_BASE_URL");
+  a->base_url = sdup(u && *u ? u : DEF_BASE_URL);
   const char *m = getenv("MOTIRIS_MODEL");
   a->model = sdup(m && *m ? m : "gpt-4o-mini");
   a->messages = cJSON_CreateArray();
