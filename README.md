@@ -90,6 +90,12 @@ Built-in tools (disable with `--no-tools`):
   **Your uid, no sandbox. Use with care.**
 - `time()` — UTC ISO-8601 + unix seconds.
 
+File tools (workspace = `MOTIRIS_WORKSPACE` or cwd; paths outside it are
+rejected):
+
+- `read_file(path)` / `write_file(path, content)` / `patch(path, old, new)`
+- `search_files(pattern, path?)` — recursive regex grep, returns matches.
+
 ## Writing a tool (compile-time)
 
 ```c

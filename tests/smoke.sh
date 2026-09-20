@@ -82,4 +82,41 @@ kill $GWPID2 2>/dev/null
 wait $GWPID2 2>/dev/null || true
 rm -rf "$GW"
 
+echo "== 10: file tools via agent loop (read ok + workspace guard)"
+F10=$(mktemp -d)
+mkdir -p "$F10/ws" "$F10/h1" "$F10/h2"
+printf 'hello content\n' > "$F10/ws/hello.txt"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18091/v1/chat/completions"}' > "$F10/h1/config.json"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18092/v1/chat/completions"}' > "$F10/h2/config.json"
+python3 -c '
+import http.server, json, threading
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            c = str(msgs[-1].get("content",""))[:150]
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"R:"+c}}]}
+        else:
+            p = "/etc/passwd" if self.server.server_address[1] == 18092 else "hello.txt"
+            reply = {"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_f1","type":"function","function":{"name":"read_file","arguments":json.dumps({"path":p})}}]}}]}
+        b = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+for port in (18091,18092):
+    s = http.server.HTTPServer(("127.0.0.1",port),H); threading.Thread(target=s.serve_forever,daemon=True).start()
+threading.Event().wait()
+' &
+M10PID=$!
+sleep 0.5
+ROOT=$(pwd)
+cd "$F10/ws"
+O1=$(MOTIRIS_HOME="$F10/h1" MOTIRIS_WORKSPACE="$F10/ws" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+echo "$O1" | grep -q 'hello content' || { echo "FAIL read: $O1"; kill $M10PID 2>/dev/null; exit 1; }
+O2=$(MOTIRIS_HOME="$F10/h2" MOTIRIS_WORKSPACE="$F10/ws" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+echo "$O2" | grep -q 'outside workspace' || { echo "FAIL guard: $O2"; kill $M10PID 2>/dev/null; exit 1; }
+kill $M10PID 2>/dev/null
+wait $M10PID 2>/dev/null || true
+rm -rf "$F10"
+
 echo "smoke: all tests passed"

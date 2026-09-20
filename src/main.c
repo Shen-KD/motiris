@@ -133,6 +133,7 @@ int main(int argc, char **argv) {
   if (no_plugin) motiris_set_plugins_enabled(ag, 0);
   if (plugin_dir) motiris_set_plugin_dir(ag, plugin_dir);
   motiris_register_core_tools(ag);
+  if (motiris_tools_enabled(ag)) motiris_register_file_tools(ag);
   if (motiris_plugins_enabled(ag)) motiris_load_plugins(ag, NULL);
 
   /* skills: injected as system context (kept in front of user prompt) */
