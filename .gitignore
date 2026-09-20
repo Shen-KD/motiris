@@ -1,3 +1,3 @@
 motiris
 examples/*.so
-*.o
+*.o*.a
