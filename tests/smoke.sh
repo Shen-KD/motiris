@@ -286,4 +286,37 @@ kill $M13PID 2>/dev/null
 wait $M13PID 2>/dev/null || true
 rm -rf "$F13"
 
+echo "== 14: SSE streaming aggregation (delta merge)"
+F14=$(mktemp -d)
+mkdir -p "$F14/h"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18100/v1/chat/completions","stream":true}' > "$F14/h/config.json"
+python3 - <<'PY4' &
+import http.server, threading
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length",0)))
+        body = "".join(
+            'data: {"choices":[{"delta":{"content":"%s"}}]}\n\n' % c
+            for c in ("hel", "lo ", "world")) + "data: [DONE]\n\n"
+        b = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type","text/event-stream")
+        self.send_header("Content-Length",str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18100),H).serve_forever()
+PY4
+M14PID=$!
+MOCK_PIDS="$MOCK_PIDS $M14PID"
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -q 18100 && break
+  sleep 0.3
+done
+O8=$(MOTIRIS_HOME="$F14/h" "$ROOT/motiris" -p hi --max-steps 1 --stream -k x 2>&1)
+echo "$O8" | grep -q 'hello world' || { echo "FAIL stream: $O8"; exit 1; }
+kill $M14PID 2>/dev/null
+wait $M14PID 2>/dev/null || true
+rm -rf "$F14"
+
 echo "smoke: all tests passed"
