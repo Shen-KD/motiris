@@ -78,6 +78,7 @@ void motiris_register_web_tools(MotirisAgent *a);   /* web_fetch/search */
 void motiris_register_memory_tools(MotirisAgent *a); /* memory get/set/list */
 void motiris_register_skill_tools(MotirisAgent *a, const char *dir);
 void motiris_register_subagent_tools(MotirisAgent *a);  /* subagent */
+void motiris_register_browser_tools(MotirisAgent *a);  /* browser_fetch */
 int  motiris_tools_enabled(MotirisAgent *a);
 
 /* ---- centralized config: $HOME/.motiris/{env,config.json} ---- */
@@ -96,5 +97,9 @@ int motiris_gateway_run(const char *listen_addr, const char *token,
 
 /* ---- cron: scheduled agent runs ---- */
 int motiris_cron_run(const char *jobs_file, int once, int verbose);
+
+/* ---- MCP: register remote tools from an external stdio server ---- */
+int motiris_register_mcp_server(MotirisAgent *a, const char *name,
+                                const char *cmd, const char *const *args);
 
 #endif /* MOTIRIS_H */

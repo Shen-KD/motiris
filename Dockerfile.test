@@ -1,0 +1,9 @@
+# Test image for motiris: compile + offline smoke tests in isolation.
+# Build:  docker build -t motiris-test -f Dockerfile.test .
+# Run:    docker run --rm -u $(id -u):$(id -g) \
+#           -v $PWD:/app -w /app -e HOME=/tmp/home \
+#           motiris-test bash -c 'mkdir -p /tmp/home && make clean && make && sh tests/smoke.sh'
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libc6-dev make libcurl4 python3 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*

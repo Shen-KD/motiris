@@ -10,7 +10,7 @@ PREFIX  ?= /usr/local
 SRC = src/vendor/cJSON.c src/transport.c src/tools.c src/plugin.c \
       src/agent.c src/repl.c src/config.c src/gateway.c src/filetools.c \
       src/webtools.c src/memorytools.c src/skilltools.c src/subagent.c \
-      src/cron.c src/main.c deps/linenoise/linenoise.c
+      src/cron.c src/mcp.c src/browser.c src/main.c deps/linenoise/linenoise.c
 HDR = include/motiris.h
 
 motiris: $(SRC) $(HDR)
@@ -23,10 +23,18 @@ examples/hello_plugin.so: examples/hello_plugin.c include/motiris.h
 test: motiris
 	sh tests/smoke.sh
 
+# run the full smoke suite inside a throwaway container: isolated HOME,
+# ports and processes (no orphan mocks on the host)
+test-docker:
+	docker build -q -t motiris-test -f Dockerfile.test .
+	docker run --rm -u $(shell id -u):$(shell id -g) \
+		-v $(CURDIR):/app -w /app -e HOME=/tmp/home \
+		motiris-test bash -c 'mkdir -p /tmp/home && make clean && make && sh tests/smoke.sh'
+
 clean:
 	rm -f motiris
 
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test clean install
+.PHONY: test test-docker clean install
