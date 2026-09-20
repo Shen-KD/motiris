@@ -269,6 +269,7 @@ int main(int argc, char **argv) {
     motiris_register_web_tools(ag);
     motiris_register_memory_tools(ag);
     motiris_register_subagent_tools(ag);
+    motiris_register_browser_tools(ag);
   }
   if (skill_dir) motiris_register_skill_tools(ag, skill_dir);
   if (motiris_plugins_enabled(ag)) motiris_load_plugins(ag, NULL);

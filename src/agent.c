@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_TOOLS 64
+#define MAX_TOOLS 128
 #define DEF_BASE_URL "https://api.openai.com/v1/chat/completions"
 
 struct MotirisAgent {

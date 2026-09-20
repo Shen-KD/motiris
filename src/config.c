@@ -158,6 +158,27 @@ void motiris_apply_config(MotirisAgent *a) {
   /* shell safety policy: "shell_allow": "git,ls", "shell_deny": "rm,sudo" */
   motiris_set_shell_policy(jstr(j, "shell_allow"), jstr(j, "shell_deny"));
 
+  /* MCP servers: [{name, cmd, args: []}] -> register remote tools */
+  cJSON *mcps = cJSON_GetObjectItemCaseSensitive(j, "mcp_servers");
+  if (cJSON_IsArray(mcps)) {
+    cJSON *srv;
+    cJSON_ArrayForEach(srv, mcps) {
+      const char *nm = jstr(srv, "name");
+      const char *cmd = jstr(srv, "cmd");
+      if (!nm || !cmd) continue;
+      const char *args[16];
+      int na = 0;
+      cJSON *ar = cJSON_GetObjectItemCaseSensitive(srv, "args");
+      if (cJSON_IsArray(ar)) {
+        cJSON *ai;
+        cJSON_ArrayForEach(ai, ar)
+          if (na < 15 && cJSON_IsString(ai)) args[na++] = ai->valuestring;
+      }
+      args[na] = NULL;
+      motiris_register_mcp_server(a, nm, cmd, args);
+    }
+  }
+
   /* provider fallback list: [{name, model, base_url, api_key_env}] */
   cJSON *provs = cJSON_GetObjectItemCaseSensitive(j, "providers");
   if (cJSON_IsArray(provs)) {

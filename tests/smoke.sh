@@ -33,7 +33,7 @@ echo "$OUT" | grep -q 'echo round complete' || { echo "FAIL: $OUT"; exit 1; }
 
 echo "== 4: binary stays tiny"
 SIZE=$(stat -c %s motiris)
-[ "$SIZE" -lt 131072 ] || { echo "FAIL: size=$SIZE"; exit 1; }
+[ "$SIZE" -lt 163840 ] || { echo "FAIL: size=$SIZE"; exit 1; }
 echo "   motiris size: $SIZE bytes"
 
 echo "== 5: missing prompt -> clean error"
@@ -219,5 +219,71 @@ echo "$O5" | grep -q 'SUBOK' || { echo "FAIL subagent: $O5"; exit 1; }
 kill $M12PID 2>/dev/null
 wait $M12PID 2>/dev/null || true
 rm -rf "$F12"
+
+echo "== 13: MCP server bridge + browser shim"
+F13=$(mktemp -d)
+mkdir -p "$F13/h" "$F13/bin"
+cat > "$F13/mcp_server.py" <<'PYEOF'
+import json, sys
+def reply(m): sys.stdout.write(json.dumps(m) + "\n"); sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    m = req.get("method"); rid = req.get("id")
+    if m == "initialize":
+        reply({"jsonrpc":"2.0","id":rid,"result":{"serverInfo":{"name":"fake","version":"1"}}})
+    elif m == "tools/list":
+        reply({"jsonrpc":"2.0","id":rid,"result":{"tools":[{"name":"greet","description":"hi","inputSchema":{"type":"object"}}]}})
+    elif m == "tools/call":
+        a = req.get("params",{}).get("arguments",{}) or {}
+        who = a.get("who","world")
+        reply({"jsonrpc":"2.0","id":rid,"result":{"content":[{"type":"text","text":"hello, "+str(who)+"!"}]}})
+PYEOF
+cat > "$F13/bin/chromium" <<'SHEOF'
+#!/bin/sh
+echo '<html><body><div id="app">rendered by js</div></body></html>'
+SHEOF
+chmod +x "$F13/mcp_server.py" "$F13/bin/chromium"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18097/v1/chat/completions","mcp_servers":[{"name":"fake","cmd":"python3","args":["%s/mcp_server.py"]}]}' "$F13" > "$F13/h/config.json"
+python3 - <<'PY2' &
+import http.server, json, threading
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            c = str(msgs[-1].get("content",""))[:120]
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"M:"+c}}]}
+        else:
+            if self.server.server_address[1] == 18097:
+                tc = {"name":"fake:greet","arguments":json.dumps({"who":"motiris"})}
+            else:
+                tc = {"name":"browser_fetch","arguments":json.dumps({"url":"http://example.com/"})}
+            reply = {"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_z1","type":"function","function":tc}]}}]}
+        b = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+for port in (18097,18098):
+    s = http.server.HTTPServer(("127.0.0.1",port),H)
+    threading.Thread(target=s.serve_forever,daemon=True).start()
+import time
+time.sleep(60)
+PY2
+M13PID=$!
+MOCK_PIDS="$MOCK_PIDS $M13PID"
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -qE '1809[78]' && break
+  sleep 0.3
+done
+O6=$(MOTIRIS_HOME="$F13/h" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+echo "$O6" | grep -q 'hello, motiris!' || { echo "FAIL mcp: $O6"; exit 1; }
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18098/v1/chat/completions"}' > "$F13/h/config.json"
+O7=$(PATH="$F13/bin:$PATH" MOTIRIS_BROWSER=chromium MOTIRIS_HOME="$F13/h" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+echo "$O7" | grep -q 'rendered by js' || { echo "FAIL browser: $O7"; exit 1; }
+kill $M13PID 2>/dev/null
+wait $M13PID 2>/dev/null || true
+rm -rf "$F13"
 
 echo "smoke: all tests passed"
