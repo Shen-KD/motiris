@@ -23,11 +23,21 @@ typedef struct MotirisTool {
 
 MotirisAgent *motiris_new(void);
 void motiris_free(MotirisAgent *a);
-void motiris_set_model(MotirisAgent *a, const char *model);
-void motiris_set_base_url(MotirisAgent *a, const char *url);   /* full chat endpoint */
-void motiris_set_api_key(MotirisAgent *a, const char *key);
+void motiris_set_model(MotirisAgent *a, const char *m);
+void motiris_set_base_url(MotirisAgent *a, const char *u);
+void motiris_set_api_key(MotirisAgent *a, const char *k);
 void motiris_set_system(MotirisAgent *a, const char *sys);
 void motiris_add_user(MotirisAgent *a, const char *msg);
+
+/* ---- multi-provider fallback ---- */
+typedef struct MotirisProvider {
+  const char *name;
+  const char *model;
+  const char *base_url;
+  const char *api_key;   /* resolved key, or NULL for keyless */
+} MotirisProvider;
+void motiris_add_provider(MotirisAgent *a, const MotirisProvider *p); /* copied */
+int  motiris_provider_count(MotirisAgent *a);
 void motiris_register_tool(MotirisAgent *a, const MotirisTool *t); /* copied */
 void motiris_unregister_tool(MotirisAgent *a, const char *name); /* runtime unplug */
 cJSON *motiris_messages(MotirisAgent *a);                        /* session log */

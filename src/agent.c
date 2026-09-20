@@ -33,6 +33,8 @@ struct MotirisAgent {
   void *delta_ud;
   int tools_on, plugins_on;
   char *plugin_dir;
+  MotirisProvider providers[8];
+  int nproviders;
   char *last_error;
 };
 
@@ -65,6 +67,20 @@ void motiris_set_plugins_enabled(MotirisAgent *a, int on) { a->plugins_on = !!on
 int motiris_plugins_enabled(MotirisAgent *a) { return a->plugins_on; }
 const char *motiris_plugin_dir(MotirisAgent *a) { return a->plugin_dir; }
 
+void motiris_add_provider(MotirisAgent *a, const MotirisProvider *p) {
+  if (!p || !p->model || !p->base_url || a->nproviders >= 8) return;
+  MotirisProvider *d = &a->providers[a->nproviders++];
+  d->name = p->name ? strdup(p->name) : NULL;
+  d->model = strdup(p->model);
+  d->base_url = strdup(p->base_url);
+  d->api_key = p->api_key ? strdup(p->api_key) : NULL;
+}
+int motiris_provider_count(MotirisAgent *a) { return a->nproviders; }
+
+static const char *pname(const MotirisAgent *a, int pi) {
+  return a->providers[pi].name ? a->providers[pi].name : a->providers[pi].model;
+}
+
 MotirisAgent *motiris_new(void) {
   MotirisAgent *a = calloc(1, sizeof *a);
   const char *u = getenv("MOTIRIS_BASE_URL");
@@ -86,6 +102,12 @@ void motiris_free(MotirisAgent *a) {
   free(a->api_key);
   free(a->system);
   free(a->plugin_dir);
+  for (int i = 0; i < a->nproviders; i++) {
+    free((char *)a->providers[i].name);
+    free((char *)a->providers[i].model);
+    free((char *)a->providers[i].base_url);
+    free((char *)a->providers[i].api_key);
+  }
   free(a->last_error);
   cJSON_Delete(a->messages);
   free(a);
@@ -158,9 +180,9 @@ static const MotirisTool *find_tool(MotirisAgent *a, const char *name) {
 }
 
 /* ---------------- request assembly ---------------- */
-static char *build_request(MotirisAgent *a) {
+static char *build_request(MotirisAgent *a, const char *model) {
   cJSON *req = cJSON_CreateObject();
-  cJSON_AddStringToObject(req, "model", a->model);
+  cJSON_AddStringToObject(req, "model", model);
 
   /* messages: [ {role:system}, ...history ] */
   cJSON *msgs = cJSON_CreateArray();
@@ -214,54 +236,91 @@ static void push_tool_message(MotirisAgent *a, const char *call_id,
 
 int motiris_run(MotirisAgent *a) {
   const char *env_key = getenv("MOTIRIS_API_KEY");
-  const char *key = a->api_key ? a->api_key : (env_key ? env_key : NULL);
+  const char *fallback_key = a->api_key ? a->api_key : (env_key ? env_key : NULL);
+  int np = a->nproviders > 0 ? a->nproviders : 1;
 
   for (int step = 0; step < a->max_steps; step++) {
-    if (a->verbose) fprintf(stderr, "[motiris] step %d: requesting model %s\n",
-                            step + 1, a->model);
+    char *last_err = NULL;
+    cJSON *j = NULL;
 
-    char *body = build_request(a);
-    if (!body) { set_error(a, "request assembly failed", NULL); return 1; }
+    /* try providers in order; on transport/parse/api error, fail over */
+    for (int pi = 0; pi < np; pi++) {
+      const char *model, *url, *key;
+      if (np > 1) {
+        model = a->providers[pi].model;
+        url = a->providers[pi].base_url;
+        key = a->providers[pi].api_key
+            ? a->providers[pi].api_key : fallback_key;
+      } else {
+        model = a->model;
+        url = a->base_url;
+        key = fallback_key;
+      }
+      if (a->verbose)
+        fprintf(stderr, "[motiris] step %d: %s via %s\n", step + 1, model,
+                np > 1 ? pname(a, pi) : "default provider");
 
-    char auth[512];
-    char *authp = NULL;
-    if (key) {
-      size_t n = snprintf(auth, sizeof auth, "Authorization: Bearer %s", key);
-      if (n < sizeof auth) authp = auth;
+      char *body = build_request(a, model);
+      if (!body) { set_error(a, "request assembly failed", NULL); return 1; }
+
+      char auth[512];
+      char *authp = NULL;
+      if (key) {
+        size_t n = snprintf(auth, sizeof auth,
+                            "Authorization: Bearer %s", key);
+        if (n < sizeof auth) authp = auth;
+      }
+
+      char *err = NULL;
+      char *resp = a->stream
+          ? motiris_transport_send_stream(a->transport, url, authp, body,
+                                          a->on_delta, a->delta_ud, &err)
+          : motiris_transport_send(a->transport, url, authp, body, &err);
+      free(body);
+      if (!resp) {
+        free(last_err);
+        last_err = malloc((err ? strlen(err) : 0) + 32);
+        sprintf(last_err, "transport error: %s", err ? err : "(unknown)");
+        free(err);
+        if (a->verbose && np > 1)
+          fprintf(stderr, "[motiris] provider %s failed: %s\n",
+                  pname(a, pi), last_err);
+        continue;
+      }
+      if (a->verbose) {
+        fprintf(stderr, "[motiris] response: %.200s%s\n", resp,
+                strlen(resp) > 200 ? "..." : "");
+      }
+
+      j = cJSON_Parse(resp);
+      free(resp);
+      if (!j) {
+        free(last_err);
+        last_err = strdup("cannot parse model response");
+        continue;
+      }
+      cJSON *errj = cJSON_GetObjectItemCaseSensitive(j, "error");
+      if (errj) {
+        const char *em = cJSON_IsObject(errj)
+            ? cJSON_GetStringValue(
+                  cJSON_GetObjectItemCaseSensitive(errj, "message"))
+            : cJSON_GetStringValue(errj);
+        free(last_err);
+        last_err = malloc((em ? strlen(em) : 0) + 16);
+        sprintf(last_err, "api error: %s", em ? em : "(unknown)");
+        cJSON_Delete(j);
+        j = NULL;
+        if (a->verbose && np > 1)
+          fprintf(stderr, "[motiris] provider %s failed: %s\n",
+                  pname(a, pi), last_err);
+        continue;
+      }
+      break; /* got a usable response */
     }
 
-    char *err = NULL;
-        char *resp;
-        if (a->stream)
-          resp = motiris_transport_send_stream(a->transport, a->base_url, authp,
-                                               body, a->on_delta, a->delta_ud,
-                                               &err);
-        else
-          resp = motiris_transport_send(a->transport, a->base_url, authp,
-                                        body, &err);
-    free(body);
-    if (!resp) {
-      set_error(a, err ? "transport error: %s" : "transport error", err);
-      free(err);
-      return 1;
-    }
-    if (a->verbose) {
-      fprintf(stderr, "[motiris] response: %.200s%s\n", resp,
-              strlen(resp) > 200 ? "..." : "");
-    }
-
-    cJSON *j = cJSON_Parse(resp);
-    free(resp);
-    if (!j) { set_error(a, "cannot parse model response", NULL); return 1; }
-
-    /* error body? {"error": {...}} */
-    cJSON *errj = cJSON_GetObjectItemCaseSensitive(j, "error");
-    if (errj) {
-      const char *em = cJSON_IsObject(errj)
-          ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(errj, "message"))
-          : cJSON_GetStringValue(errj);
-      set_error(a, "api error: %s", em ? em : "(unknown)");
-      cJSON_Delete(j);
+    if (!j) {
+      set_error(a, "%s", last_err ? last_err : "all providers failed");
+      free(last_err);
       return 1;
     }
 
