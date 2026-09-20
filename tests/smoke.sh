@@ -38,6 +38,27 @@ rm -f "$F"
 
 echo "== 7: env config honored (MOTIRIS_MODEL)"
 OUT=$(MOTIRIS_MODEL=foo-model ./motiris -p hi --transport echo -v 2>&1)
-echo "$OUT" | grep -q 'requesting model foo-model' || { echo FAIL; exit 1; }
+echo "$OUT" | grep -q 'foo-model via' || { echo FAIL; exit 1; }
+
+echo "== 8: provider fallback (dead -> mock)"
+TH8=$(mktemp -d)
+printf '{"providers":[{"name":"dead","model":"p1","base_url":"http://127.0.0.1:1/v1/chat/completions"},{"name":"mock","model":"p2","base_url":"http://127.0.0.1:18099/v1/chat/completions"}]}' > "$TH8/config.json"
+python3 -c '
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length",0)))
+        b=json.dumps({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"fallback ok"}}]}).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18099),H).serve_forever()
+' &
+MOCKPID=$!
+sleep 0.5
+OUT=$(MOTIRIS_HOME="$TH8" ./motiris -p hi --transport libcurl --max-steps 1 -v 2>&1)
+kill $MOCKPID 2>/dev/null
+rm -rf "$TH8"
+echo "$OUT" | grep -q 'fallback ok' || { echo "FAIL: $OUT"; exit 1; }
+echo "$OUT" | grep -q 'provider dead failed' || { echo "FAIL: dead not attempted"; exit 1; }
 
 echo "smoke: all tests passed"

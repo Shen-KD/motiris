@@ -154,6 +154,25 @@ void motiris_apply_config(MotirisAgent *a) {
     motiris_set_tools_enabled(a, jbool(j, "tools", 1));
   if (cJSON_GetObjectItemCaseSensitive(j, "plugins"))
     motiris_set_plugins_enabled(a, jbool(j, "plugins", 1));
+
+  /* provider fallback list: [{name, model, base_url, api_key_env}] */
+  cJSON *provs = cJSON_GetObjectItemCaseSensitive(j, "providers");
+  if (cJSON_IsArray(provs)) {
+    for (cJSON *p = provs->child; p; p = p->next) {
+      if (!cJSON_IsObject(p)) continue;
+      const char *pm = jstr(p, "model");
+      const char *pu = jstr(p, "base_url");
+      if (!pm || !pu) continue;
+      const char *keyenv = jstr(p, "api_key_env");
+      MotirisProvider mp = {
+        .name = jstr(p, "name"),
+        .model = pm,
+        .base_url = pu,
+        .api_key = keyenv ? getenv(keyenv) : NULL,
+      };
+      motiris_add_provider(a, &mp);
+    }
+  }
   cJSON_Delete(j);
   free(p);
   free(d);
