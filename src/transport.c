@@ -58,14 +58,20 @@ static char *spawn_curl(const char *url, const char *auth,
     dup2(outpipe[1], 1);
     close(inpipe[0]); close(inpipe[1]);
     close(outpipe[0]); close(outpipe[1]);
+    /* build argv dynamically: no -H auth header when there is no key */
     const char *curl = find_curl();
-    execlp(curl, curl, "-sS", "-L", "--max-time", "120",
-           "-X", "POST", url,
-           "-H", "Content-Type: application/json",
-           "-H", "Accept: application/json",
-           auth ? "-H" : "", auth ? auth : "",
-           "--data-binary", "@-",
-           (char *)NULL);
+    char *argv[16];
+    int ai = 0;
+    argv[ai++] = (char *)curl;
+    argv[ai++] = "-sS"; argv[ai++] = "-L";
+    argv[ai++] = "--max-time"; argv[ai++] = "120";
+    argv[ai++] = "-X"; argv[ai++] = "POST"; argv[ai++] = (char *)url;
+    argv[ai++] = "-H"; argv[ai++] = "Content-Type: application/json";
+    argv[ai++] = "-H"; argv[ai++] = "Accept: application/json";
+    if (auth) { argv[ai++] = "-H"; argv[ai++] = (char *)auth; }
+    argv[ai++] = "--data-binary"; argv[ai++] = "@-";
+    argv[ai] = NULL;
+    execvp(curl, argv);
     _exit(127);
   }
 

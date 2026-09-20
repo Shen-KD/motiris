@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static void usage(FILE *f) {
   fprintf(f,
@@ -131,7 +132,7 @@ int main(int argc, char **argv) {
   }
 
   if (prompt) motiris_add_user(ag, prompt);
-  else {
+  else if (!isatty(0)) {
     char *in = read_stdin();
     if (*in) motiris_add_user(ag, in);
     free(in);
