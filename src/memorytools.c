@@ -20,13 +20,21 @@ static char *err_json(const char *msg) {
   return s;
 }
 
+static void mkdir_p(const char *path) {
+  char tmp[512];
+  snprintf(tmp, sizeof tmp, "%s", path);
+  for (char *p = tmp + 1; *p; p++)
+    if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+  mkdir(tmp, 0755);
+}
+
 static char *memory_path(void) {
   const char *h = getenv("HOME");
   if (!h) h = ".";
   size_t n = strlen(h) + 48;
   char *dir = malloc(n);
   snprintf(dir, n, "%s/.local/share/motiris", h);
-  mkdir(dir, 0755);
+  mkdir_p(dir);
   char *p = malloc(n);
   snprintf(p, n, "%s/memory.json", dir);
   free(dir);
@@ -50,16 +58,18 @@ static cJSON *load_memory(void) {
   return j ? j : cJSON_CreateObject();
 }
 
-static void save_memory(cJSON *mem) {
+static int save_memory(cJSON *mem) {
   char *p = memory_path();
   FILE *f = fopen(p, "w");
+  int rc = 0;
   if (f) {
     char *s = cJSON_PrintUnformatted(mem);
-    fwrite(s, 1, strlen(s), f);
+    rc = fwrite(s, 1, strlen(s), f) == strlen(s) ? 0 : -1;
     free(s);
     fclose(f);
-  }
+  } else rc = -1;
   free(p);
+  return rc;
 }
 
 /* ---------------- memory_set ---------------- */
@@ -76,12 +86,15 @@ static char *mem_set_call(const char *args_json, void *ud) {
   cJSON *mem = load_memory();
   free(cJSON_DetachItemFromObject(mem, key));
   cJSON_AddStringToObject(mem, key, value ? value : "");
-  save_memory(mem);
+  int ok = save_memory(mem);
   cJSON_Delete(mem);
   cJSON_Delete(args);
 
   cJSON *r = cJSON_CreateObject();
-  cJSON_AddStringToObject(r, "ok", "stored");
+  if (ok == 0)
+    cJSON_AddStringToObject(r, "ok", "stored");
+  else
+    cJSON_AddStringToObject(r, "error", "cannot persist memory file");
   char *s = cJSON_PrintUnformatted(r);
   cJSON_Delete(r);
   return s;
