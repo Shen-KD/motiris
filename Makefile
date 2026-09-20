@@ -12,6 +12,12 @@ CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
 # include paths live in CPPFLAGS so overriding CFLAGS (e.g. -Werror in CI)
 # never drops the vendored headers
 CPPFLAGS ?= -Iinclude -Isrc/vendor -Ideps/libcurl/include -Ideps/linenoise
+# build metadata for --version (survives CFLAGS overrides in CI)
+MOTIRIS_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+MOTIRIS_DT  := $(shell date -u +%Y%m%d)
+MOTIRIS_VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null || echo 0.1.0)
+CPPFLAGS += -DMOTIRIS_SHA=\"$(MOTIRIS_SHA)\" -DMOTIRIS_DT=\"$(MOTIRIS_DT)\" \
+            -DMOTIRIS_VERSION=\"$(MOTIRIS_VERSION)\"
 LDFLAGS ?= -Wl,-l:libcurl.so.4
 PREFIX  ?= /usr/local
 
@@ -36,8 +42,8 @@ libmotiris_harness.a: $(HARNESS_OBJ)
 	ar rcs $@ $^
 
 motiris: libmotiris_core.a libmotiris_tools.a libmotiris_harness.a \
-		src/main.o src/vendor/cJSON.o deps/linenoise/linenoise.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ src/main.o src/vendor/cJSON.o \
+		src/main.o src/compat.o src/vendor/cJSON.o deps/linenoise/linenoise.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ src/main.o src/compat.o src/vendor/cJSON.o \
 		deps/linenoise/linenoise.o \
 		-Wl,--start-group libmotiris_core.a libmotiris_tools.a \
 		libmotiris_harness.a -Wl,--end-group \

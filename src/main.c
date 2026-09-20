@@ -31,6 +31,7 @@ static void usage(FILE *f) {
 "  -v, --verbose         print step/tool/trace to stderr\n"
 "  -i, --interactive     force interactive REPL (default when tty)\n"
 "      --stream          stream tokens as they arrive (once-run mode)\n"
+"      --version         print version and exit\n"
 "      --init            write $HOME/.motiris/{env,config.json} templates\n"
 "      --sessions [TERM] list session logs (grep TERM if given)\n"
 "      --cron [FILE]     run scheduled jobs (JSON array); --once = run\n"
@@ -216,8 +217,13 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--init")) { return motiris_init_config() ? 2 : 0; }
         if (!strcmp(a, "--interactive")) { interactive = 1; break; }
         goto unknown;
-      case 'v': /* --verbose */
+      case 'v': /* --verbose | --version */
         if (!strcmp(a, "--verbose")) { verbose = 1; break; }
+        if (!strcmp(a, "--version")) {
+          printf("motiris %s (%s, built %s)\n", MOTIRIS_VERSION,
+                 MOTIRIS_SHA, MOTIRIS_DT);
+          return 0;
+        }
         goto unknown;
       case 'h': /* --help */
         if (!strcmp(a, "--help")) { usage(stdout); return 0; }

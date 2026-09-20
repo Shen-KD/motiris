@@ -52,3 +52,40 @@ jobs:
 
       - name: run perf benchmarks
         run: sh tests/perf.sh
+
+  # build+test compatibility across mainstream distros/compilers.
+  # Informational (not required for merge), guards the release matrix.
+  compat-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04 gcc-11
+            os: ubuntu-22.04
+          - name: ubuntu-24.04 gcc-13
+            os: ubuntu-24.04
+          - name: ubuntu-26.04 gcc-15
+            os: ubuntu-26.04
+          - name: centos-stream9 gcc-11
+            os: ubuntu-latest
+            container: quay.io/centos/centos:stream9
+          - name: ubuntu-latest clang
+            os: ubuntu-latest
+            cc: clang
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build deps (rpm distros)
+        if: matrix.container != ''
+        run: dnf install -y --setopt=install_weak_deps=False gcc make python3 iproute
+
+      - name: build
+        run: make ${{ matrix.cc && format('CC={0}', matrix.cc) }}
+
+      - name: offline smoke tests
+        run: sh tests/smoke.sh
+
+      - name: plugin example compiles
+        run: make examples/hello_plugin.so
