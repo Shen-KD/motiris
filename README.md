@@ -72,6 +72,8 @@ motiris -p "continue" -r last-run.log                   # resume a session
 motiris -p "do X" --skill-dir ./skills                  # skills as context
 motiris --gateway :8899                                 # HTTP gateway
 curl -X POST localhost:8899/v1/chat -d '{"chat_id":"dev","message":"hi"}'
+motiris --cron jobs.json --once                          # scheduled jobs
+motiris --sessions [TERM]                                # list/search logs
 # token-protected: MOTIRIS_GATEWAY_TOKEN=sekret motiris --gateway :8899
 ```
 
@@ -95,6 +97,26 @@ rejected):
 
 - `read_file(path)` / `write_file(path, content)` / `patch(path, old, new)`
 - `search_files(pattern, path?)` — recursive regex grep, returns matches.
+
+Knowledge & delegation tools:
+
+- `web_fetch(url)` — libcurl GET, HTML stripped to text
+- `web_search(query)` — DuckDuckGo lite (keyless), titles+links
+- `memory_set(key, value)` / `memory_get(key?)` — persistent JSON memory
+  (`~/.local/share/motiris/memory.json`)
+- `skill_list()` / `skill_load(name)` — SKILL.md frontmatter index,
+  on-demand loading (`--skill-dir DIR`)
+- `subagent(task)` — run a fresh `motiris` child (no tools, isolated)
+- `browser_fetch(url)` — render via headless chromium (`--dump-dom`),
+  needs a chromium binary; `MOTIRIS_BROWSER` overrides
+
+MCP servers (`"mcp_servers": [{"name","cmd","args":[]}]` in config.json)
+register each remote tool as `<server>:<tool>`; `tools/call` is bridged
+over stdio JSON-RPC.
+
+Shell safety policy: config `"shell_allow": "git,ls"` /
+`"shell_deny": "rm,sudo"` (prefix match, deny wins) is enforced in the
+shell tool.
 
 ## Writing a tool (compile-time)
 
@@ -132,13 +154,35 @@ include/motiris.h      public API: agent, tools, plugin ABI
 src/agent.c            agent loop, request assembly, tool dispatch
 src/transport.c        libcurl C backend (default) / spawn-curl / echo
 src/tools.c            built-in tools (shell, time)
+src/filetools.c        read/write/patch/search (workspace-guarded)
+src/webtools.c         web_fetch / web_search
+src/memorytools.c      persistent memory tools
+src/skilltools.c       SKILL.md index + on-demand load
+src/subagent.c         child-agent delegation tool
+src/browser.c          headless chromium fetch
+src/mcp.c              MCP stdio client (JSON-RPC)
+src/gateway.c          embedded HTTP gateway (session-per-chat_id)
+src/cron.c             scheduled agent runs
 src/plugin.c           .so loader (MOTIRIS_PLUGIN_DIR, --plugin-dir)
-src/main.c             CLI, sessions, skills
+src/main.c             CLI parsing (switch), --sessions, modes
 src/vendor/cJSON.c/h   vendored cJSON (MIT)
 deps/libcurl/include/  vendored libcurl dev headers (curl 8.18 ABI)
 examples/              plugins, extensions
 tests/smoke.sh         offline test suite (make test)
+Dockerfile.test        isolated test image (make test-docker)
 ```
+
+## Testing
+
+```
+make test          # offline smoke suite (13 checks, no network/key needed)
+make test-docker   # same suite inside a throwaway debian container
+                   # (clean HOME/ports/processes, mirrors CI)
+```
+
+Test image: `gcc libc6-dev make libcurl4 python3 curl` on
+debian:bookworm-slim — mock LLM/MCP servers run inside the container, so
+nothing leaks onto the host.
 
 ## License
 
