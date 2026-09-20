@@ -1,3 +1,4 @@
 motiris
 examples/*.so
 *.o*.a
+src/*.o
