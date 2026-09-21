@@ -33,11 +33,16 @@ make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
 ```
 
-CI (`.github/workflows/ci.yml`) runs: gcc build, smoke, clang -Werror
-build, plugin example compile, binary size (<163840), then `perf` and
-the `compat-matrix` job (ubuntu 22.04 gcc-11 / 24.04 gcc-13 / 26.04
-gcc-15 / centos-stream9 container / clang). `ci` is the required check
-on main, the others are informational.
+CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
+by the aggregate `ci` job (that exact name is the required status check
+on main): `build` (gcc clean compile+link, size guard, artifact),
+`clang` (full -Werror build), `test-core` / `test-tools` / `test-repl` /
+`test-skills` / `test-schema` (component-scoped smoke groups, see
+`tests/smoke.sh <group>`), `plugins` (example .so with gcc + clang
+-Werror), `tools` (component static libs compile independently with
+clang -Werror). `perf` and `compat-matrix` are informational
+(ubuntu 22.04 gcc-11 / 24.04 gcc-13 / 26.04 gcc-15 / centos-stream9
+container / clang).
 
 ## Release & install
 

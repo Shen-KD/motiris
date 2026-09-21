@@ -7,25 +7,22 @@ on:
     branches: [main]
 
 jobs:
-  # job name is the required status check context for branch protection
+  # aggregate gate — THIS job name is the required status check on main
   ci:
+    runs-on: ubuntu-latest
+    needs: [build, clang, test-core, test-tools, test-repl, test-skills,
+            test-schema, plugins, tools]
+    steps:
+      - run: echo "all gating jobs passed"
+
+  # full clean compile + link (gcc) + size guard + binary artifact
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: build (gcc)
-        run: make
-
-      - name: offline smoke tests
-        run: make test
-
-      - name: build with clang -Werror
-        run: |
-          make clean
-          make CC=clang CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE"
-
-      - name: plugin example still compiles
-        run: make examples/hello_plugin.so
+      - name: clean build + link (gcc)
+        run: make clean && make
 
       - name: binary stays tiny
         run: test $(stat -c %s motiris) -lt 163840
@@ -36,6 +33,80 @@ jobs:
           name: motiris-linux-x86_64
           path: motiris
           if-no-files-found: error
+
+  # strict full build with clang -Werror (every warning fails the job)
+  clang:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: full compile + link with clang -Werror
+        run: |
+          make clean
+          make CC=clang CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE"
+
+  # component-scoped smoke runs (sh tests/smoke.sh <group>)
+  test-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: smoke — core (agent loop, plugins, save/resume, env)
+        run: sh tests/smoke.sh core
+
+  test-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: smoke — tools (fallback, gateway, file/web/memory, cron, MCP, SSE)
+        run: sh tests/smoke.sh tools
+
+  test-repl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: smoke — repl (commands, banner, token stats, /skills)
+        run: sh tests/smoke.sh repl
+
+  test-skills:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: smoke — skills & sessions (skill_patch/write, /sessions, /resume)
+        run: sh tests/smoke.sh skills
+
+  test-schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: smoke — per-tool schema files (override, invalid json, plugin dir)
+        run: sh tests/smoke.sh schema
+
+  # plugin artifacts compile standalone (flat + per-tool dir layout)
+  plugins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: plugin example compiles (gcc)
+        run: make examples/hello_plugin.so
+
+      - name: plugin example compiles (clang -Werror)
+        run: |
+          make clean
+          make examples/hello_plugin.so CC=clang \
+            CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -fPIC -shared"
+
+  # component static libs compile/link independently (tools, core, harness)
+  tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: component libs compile independently (clang -Werror)
+        run: |
+          make clean
+          make libmotiris_core.a libmotiris_tools.a libmotiris_harness.a \
+            CC=clang CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE"
 
   # performance & resource guard: cold-start latency, peak RSS, agent-loop
   # overhead. Informational check (not required for merge).
@@ -84,7 +155,7 @@ jobs:
       - name: build
         run: make ${{ matrix.cc && format('CC={0}', matrix.cc) }}
 
-      - name: offline smoke tests
+      - name: offline smoke tests (full suite)
         run: sh tests/smoke.sh
 
       - name: plugin example compiles
