@@ -402,4 +402,109 @@ kill $M17PID 2>/dev/null
 wait $M17PID 2>/dev/null || true
 rm -rf "$F17"
 
+echo "== 18: repl banner shows model / skills / tools"
+F18=$(mktemp -d)
+mkdir -p "$F18/skills"
+printf -- '---\nname: banner-skill\ndescription: demo\n---\nbody\n' > "$F18/skills/banner.md"
+O12=$(printf '/exit\n' | MOTIRIS_MODEL=banner-model "$ROOT/motiris" -i \
+      --transport echo --no-plugin --skill-dir "$F18/skills" 2>&1)
+echo "$O12" | grep -q 'banner-model' || { echo "FAIL banner model: $O12"; exit 1; }
+echo "$O12" | grep -q 'banner-skill' || { echo "FAIL banner skill: $O12"; exit 1; }
+echo "$O12" | grep -q 'shell' || { echo "FAIL banner tools: $O12"; exit 1; }
+rm -rf "$F18"
+
+echo "== 19: repl /skills lists skills from --skill-dir"
+F19=$(mktemp -d)
+printf -- '---\nname: skill-nineteen\ndescription: filter me\n---\nbody\n' > "$F19/nineteen.md"
+O13=$(printf '/skills\n/exit\n' | "$ROOT/motiris" -i --transport echo \
+      --no-plugin --skill-dir "$F19" 2>&1)
+echo "$O13" | grep -q 'skill-nineteen' || { echo "FAIL /skills: $O13"; exit 1; }
+echo "$O13" | grep -q 'filter me' || { echo "FAIL /skills desc: $O13"; exit 1; }
+rm -rf "$F19"
+
+echo "== 20: skill_patch edits skill file via agent loop"
+F20=$(mktemp -d)
+mkdir -p "$F20/h" "$F20/skills"
+printf -- '---\nname: patchme\ndescription: to patch\n---\nold body text\n' > "$F20/skills/patchme.md"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18103/v1/chat/completions"}' > "$F20/h/config.json"
+python3 - <<'PY20' &
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"patched ok"}}]}
+        else:
+            tc = {"name":"skill_patch","arguments":json.dumps({"name":"patchme","old":"old body text","new":"new body text"})}
+            reply = {"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_p1","type":"function","function":tc}]}}]}
+        b = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18103),H).serve_forever()
+PY20
+M20PID=$!
+MOCK_PIDS="$MOCK_PIDS $M20PID"
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -q 18103 && break
+  sleep 0.3
+done
+O14=$(MOTIRIS_HOME="$F20/h" MOTIRIS_WORKSPACE="$F20" "$ROOT/motiris" -p hi --max-steps 3 --skill-dir "$F20/skills" -k x 2>&1)
+echo "$O14" | grep -q 'patched ok' || { echo "FAIL skill_patch run: $O14"; exit 1; }
+grep -q 'new body text' "$F20/skills/patchme.md" || { echo "FAIL skill_patch file"; cat "$F20/skills/patchme.md"; exit 1; }
+kill $M20PID 2>/dev/null
+wait $M20PID 2>/dev/null || true
+rm -rf "$F20"
+
+echo "== 21: skill_write rewrites skill frontmatter via agent loop"
+F21=$(mktemp -d)
+mkdir -p "$F21/h" "$F21/skills"
+printf -- '---\nname: writeme\ndescription: old desc\n---\nold body\n' > "$F21/skills/writeme.md"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18104/v1/chat/completions"}' > "$F21/h/config.json"
+python3 - <<'PY21' &
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"written ok"}}]}
+        else:
+            content = "---\nname: newname\ndescription: new desc\n---\nnew body\n"
+            tc = {"name":"skill_write","arguments":json.dumps({"name":"writeme","content":content})}
+            reply = {"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_w2","type":"function","function":tc}]}}]}
+        b = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18104),H).serve_forever()
+PY21
+M21PID=$!
+MOCK_PIDS="$MOCK_PIDS $M21PID"
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -q 18104 && break
+  sleep 0.3
+done
+O16=$(MOTIRIS_HOME="$F21/h" MOTIRIS_WORKSPACE="$F21" "$ROOT/motiris" -p hi --max-steps 3 --skill-dir "$F21/skills" -k x 2>&1)
+echo "$O16" | grep -q 'written ok' || { echo "FAIL skill_write run: $O16"; exit 1; }
+grep -q 'name: newname' "$F21/skills/writeme.md" || { echo "FAIL skill_write file"; cat "$F21/skills/writeme.md"; exit 1; }
+kill $M21PID 2>/dev/null
+wait $M21PID 2>/dev/null || true
+rm -rf "$F21"
+
+echo "== 22: repl /sessions lists session logs"
+F22=$(mktemp -d)
+mkdir -p "$F22/.local/share/motiris/sessions"
+printf 'Uhello from a past session\n' > "$F22/.local/share/motiris/sessions/fake-1.log"
+HOME="$F22" sh -c 'printf "/sessions\n/exit\n" | "$0" -i --transport echo --no-plugin 2>&1' "$ROOT/motiris" > "$F22/out.txt"
+grep -q 'fake-1.log' "$F22/out.txt" || { echo "FAIL /sessions: $(cat "$F22/out.txt")"; exit 1; }
+rm -rf "$F22"
+
+echo "== 23: repl /resume loads U rows into context"
+F23=$(mktemp -d)
+printf 'Uresumed turn one\nAold reply\n' > "$F23/old.log"
+O15=$(printf '/resume %s/old.log\n/exit\n' "$F23" | "$ROOT/motiris" -i \
+      --transport echo --no-plugin 2>&1)
+echo "$O15" | grep -q 'loaded 1 turns from' || { echo "FAIL /resume: $O15"; exit 1; }
+rm -rf "$F23"
+
 echo "smoke: all tests passed"
