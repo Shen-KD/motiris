@@ -25,6 +25,7 @@ static void usage(FILE *f) {
 "      --no-tools        do not register built-in tools\n"
 "      --transport NAME  curl (default) | echo (offline test)\n"
 "      --max-steps N     agent loop bound (default 10)\n"
+"      --goal-check      confirm the goal is met (one extra round)\n"
 "  -r, --resume FILE     resume previous session log\n"
 "      --save FILE       persist session log to FILE\n"
 "  -v, --verbose         print step/tool/trace to stderr\n"
@@ -84,7 +85,7 @@ int main(int argc, char **argv) {
   const char *resume = NULL, *save = NULL, *transport = NULL, *plugin_dir = NULL;
   const char *gateway_listen = NULL;
   int no_tools = 0, no_plugin = 0, verbose = 0, max_steps = 0;
-  int interactive = 0, stream = 0, gateway_mode = 0;
+  int interactive = 0, stream = 0, gateway_mode = 0, goal_check = 0;
   int cron_mode = 0, cron_once = 0;
   const char *cron_file = NULL;
 
@@ -123,13 +124,14 @@ int main(int argc, char **argv) {
       case 'a': /* --api-key */
         if (!strcmp(a, "--api-key")) { key = NEED(); break; }
         goto unknown;
-      case 'g': /* --gateway */
+      case 'g': /* --gateway | --goal-check */
         if (!strcmp(a, "--gateway")) {
           gateway_mode = 1;
           if (i + 1 < argc && argv[i + 1][0] != '-')
             gateway_listen = argv[++i];
           break;
         }
+        if (!strcmp(a, "--goal-check")) { goal_check = 1; break; }
         goto unknown;
       case 's': /* --system | --save | --stream | --sessions | --skill-dir */
         if (!strcmp(a, "--system")) { system = NEED(); break; }
@@ -164,8 +166,9 @@ int main(int argc, char **argv) {
           break;
         }
         goto unknown;
-      case 'o': /* --once */
+      case 'o': /* --once | --goal-check */
         if (!strcmp(a, "--once")) { cron_once = 1; break; }
+        if (!strcmp(a, "--goal-check")) { goal_check = 1; break; }
         goto unknown;
       case 'i': /* --init | --interactive */
         if (!strcmp(a, "--init")) { return motiris_init_config() ? 2 : 0; }
@@ -218,6 +221,7 @@ int main(int argc, char **argv) {
   if (system) motiris_set_system(ag, system);
   if (transport) motiris_set_transport(ag, transport);
   if (max_steps > 0) motiris_set_max_steps(ag, max_steps);
+  if (goal_check) motiris_set_goal_check(ag, 1);
   motiris_set_verbose(ag, verbose);
   if (stream) motiris_set_stream(ag, 1);
   if (no_tools) motiris_set_tools_enabled(ag, 0);

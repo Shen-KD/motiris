@@ -26,7 +26,10 @@ agent process stays idle-quiet between requests.
 
 - **Agent loop with tool calling** — OpenAI-compatible chat completions:
   iterates `model -> tool_calls -> execute -> result -> model` until done.
-  Works with any OpenAI-compatible endpoint (cloud or local).
+  Works with any OpenAI-compatible endpoint (cloud or local). With
+  `--goal-check`, after a first answer the model is asked whether the
+  goal (the first user message) is fully met: it replies `DONE` to
+  finish, or keeps working (tools included), bounded by `--max-steps`.
 - **Runtime tool plug/unplug** — tools live in a registry;
   `motiris_unregister_tool()` removes one at runtime, `--no-tools` starts bare.
 - **Runtime plugin system** — plugins are shared objects (`.so`) dropped
@@ -84,6 +87,7 @@ motiris -p "summarize this repo" -m deepseek-chat -k "$DEEPSEEK_API_KEY"
 printf 'what time is it' | motiris                      # prompt from stdin
 motiris -p hi --transport echo                          # offline demo
 motiris -p "review diff" -s "You are a code reviewer" -v
+motiris -p "do X" --goal-check                          # confirm goal met before finishing
 motiris -p "continue" -r last-run.log                   # resume a session
 motiris -p "do X" --skill-dir ./skills                  # skills as context
 motiris --gateway :8899                                 # HTTP gateway

@@ -18,7 +18,10 @@ published by `.github/workflows/release.yml`.
   gateway logs).
 - Skills: `skill_patch` / `skill_write` model tools to edit indexed
   `--skill-dir` files in place (frontmatter re-parsed on write).
-- Offline smoke suite grown to 23 checks.
+- Goal check (`--goal-check` / config `"goal_check"`): after a first
+  answer the model confirms the goal (first user message) with `DONE`
+  or keeps working — one extra round, bounded by `--max-steps`.
+- Offline smoke suite grown to 27 checks.
 
 ## [0.1.0] - 2026-09-20
 

@@ -32,6 +32,7 @@ struct MotirisAgent {
   void (*on_delta)(const char *, void *);
   void *delta_ud;
   int tools_on, plugins_on;
+  int goal_check;
   char *plugin_dir;
   /* tool-call observers (multi-slot; plugins and repl can both watch) */
   struct { MotirisToolHook *cb; void *ud; } tool_hooks[8];
@@ -97,6 +98,8 @@ MotirisAgent *motiris_new(void) {
   a->max_steps = 10;
   a->tools_on = 1;
   a->plugins_on = 1;
+  const char *gc = getenv("MOTIRIS_GOAL_CHECK");
+  if (gc && gc[0] && gc[0] != '0') a->goal_check = 1;
   return a;
 }
 
@@ -152,6 +155,7 @@ long motiris_tokens_in(MotirisAgent *a)  { return a->tok_in; }
 long motiris_tokens_out(MotirisAgent *a) { return a->tok_out; }
 void motiris_set_max_steps(MotirisAgent *a, int n) { a->max_steps = n; }
 void motiris_set_verbose(MotirisAgent *a, int on) { a->verbose = on; }
+void motiris_set_goal_check(MotirisAgent *a, int on) { a->goal_check = !!on; }
 
 const char *motiris_last_error(MotirisAgent *a) {
   static const char none[] = "";
@@ -202,6 +206,32 @@ static const MotirisTool *find_tool(MotirisAgent *a, const char *name) {
   for (int i = 0; i < a->ntools; i++)
     if (!strcmp(a->tools[i].name, name)) return &a->tools[i];
   return NULL;
+}
+
+/* goal-check helpers: the goal is the first user message of the session */
+static const char *first_user_goal(MotirisAgent *a) {
+  for (cJSON *m = a->messages->child; m; m = m->next) {
+    cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role");
+    if (!cJSON_IsString(role) || strcmp(role->valuestring, "user")) continue;
+    cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+    if (cJSON_IsString(c)) return c->valuestring;
+  }
+  return "";
+}
+
+/* true when the model's reply is just the DONE confirmation (trimmed,
+ * case-insensitive, tolerating surrounding dots) */
+static int done_reply(const char *s) {
+  while (*s && strchr(" \t\r\n.", *s)) s++;
+  size_t n = strlen(s);
+  while (n && strchr(" \t\r\n.", s[n - 1])) n--;
+  if (n != 4) return 0;
+  for (size_t i = 0; i < 4; i++) {
+    char c = s[i];
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if (c != "done"[i]) return 0;
+  }
+  return 1;
 }
 
 /* ---------------- request assembly ---------------- */
@@ -263,6 +293,7 @@ int motiris_run(MotirisAgent *a) {
   const char *env_key = getenv("MOTIRIS_API_KEY");
   const char *fallback_key = a->api_key ? a->api_key : (env_key ? env_key : NULL);
   int np = a->nproviders > 0 ? a->nproviders : 1;
+  int confirm_asked = 0;   /* goal-check: one confirmation round, per run */
 
   for (int step = 0; step < a->max_steps; step++) {
     char *last_err = NULL;
@@ -414,9 +445,32 @@ int motiris_run(MotirisAgent *a) {
     /* final answer */
     const char *content = cJSON_GetStringValue(
         cJSON_GetObjectItemCaseSensitive(msg, "content"));
+    /* goal-check: a bare DONE reply to the confirmation ends silently
+     * (the real answer was already printed in the previous round) */
+    if (a->goal_check && confirm_asked && content && done_reply(content)) {
+      cJSON_Delete(j);
+      return 0;
+    }
     if (content && *content) printf("%s\n", content);
     else if (!finish || strcmp(finish, "stop"))
       fprintf(stderr, "[motiris] warning: model stopped without output\n");
+    if (a->goal_check && !confirm_asked) {
+      /* one confirmation round: ask the model whether the goal is met;
+       * it may reply DONE or keep working (tools included), bounded by
+       * max_steps. Appended to THIS agent's messages only. */
+      const char *goal = first_user_goal(a);
+      size_t n = strlen(goal) + 120;
+      char *confirm = malloc(n);
+      snprintf(confirm, n,
+               "Goal check: <%s>. If the goal is fully achieved reply "
+               "exactly DONE; otherwise keep working (you may call tools).",
+               goal);
+      motiris_add_user(a, confirm);
+      free(confirm);
+      confirm_asked = 1;
+      cJSON_Delete(j);
+      continue;
+    }
     cJSON_Delete(j);
     return 0;
   }

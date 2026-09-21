@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-# optional component group: sh tests/smoke.sh [all|core|tools|repl|skills|schema]
+# optional component group: sh tests/smoke.sh [all|core|tools|repl|skills|schema|goal]
 GROUP="${1:-all}"
 FROM=1; TO=999
 case "$GROUP" in
@@ -13,7 +13,8 @@ case "$GROUP" in
   repl)   FROM=15; TO=19 ;;
   skills) FROM=20; TO=23 ;;
   schema) FROM=24; TO=26 ;;
-  *) echo "usage: $0 [all|core|tools|repl|skills|schema]"; exit 2 ;;
+  goal)   FROM=27; TO=27 ;;
+  *) echo "usage: $0 [all|core|tools|repl|skills|schema|goal]"; exit 2 ;;
 esac
 test_in() { [ "$1" -ge "$FROM" ] && [ "$1" -le "$TO" ]; }
 ROOT=$(pwd)   # all tests use $ROOT; define it before any group can skip its origin
@@ -657,6 +658,41 @@ echo "$O26" | grep -q 'PSAW.*who' || { echo "FAIL plugin schema: $O26"; exit 1; 
 kill $M26PID 2>/dev/null
 wait $M26PID 2>/dev/null || true
 rm -rf "$F26"
+
+fi
+if test_in 27; then
+echo "== 27: --goal-check confirms goal met (DONE) before finishing"
+F27=$(mktemp -d)
+mkdir -p "$F27/h"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18107/v1/chat/completions"}' > "$F27/h/config.json"
+python3 - <<'PY27' &
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        msgs = req.get("messages", [])
+        last = str(msgs[-1].get("content","")) if msgs else ""
+        if "Goal check:" in last:
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"DONE"}}]}
+        else:
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"partial answer"}}]}
+        b = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18107),H).serve_forever()
+PY27
+M27PID=$!
+MOCK_PIDS="$MOCK_PIDS $M27PID"
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -q 18107 && break
+  sleep 0.3
+done
+O27=$(MOTIRIS_HOME="$F27/h" "$ROOT/motiris" -p hi --max-steps 4 --goal-check -k x 2>&1)
+echo "$O27" | grep -q 'partial answer' || { echo "FAIL goal-check answer: $O27"; exit 1; }
+echo "$O27" | grep -q 'DONE' && { echo "FAIL goal-check leaked DONE: $O27"; exit 1; }
+kill $M27PID 2>/dev/null
+wait $M27PID 2>/dev/null || true
+rm -rf "$F27"
 
 fi
 echo "smoke: all tests passed"

@@ -154,6 +154,8 @@ void motiris_apply_config(MotirisAgent *a) {
     motiris_set_tools_enabled(a, jbool(j, "tools", 1));
   if (cJSON_GetObjectItemCaseSensitive(j, "plugins"))
     motiris_set_plugins_enabled(a, jbool(j, "plugins", 1));
+  if (cJSON_GetObjectItemCaseSensitive(j, "goal_check") && !env_overrides("MOTIRIS_GOAL_CHECK"))
+    motiris_set_goal_check(a, jbool(j, "goal_check", 0));
 
   /* shell safety policy: "shell_allow": "git,ls", "shell_deny": "rm,sudo" */
   motiris_set_shell_policy(jstr(j, "shell_allow"), jstr(j, "shell_deny"));

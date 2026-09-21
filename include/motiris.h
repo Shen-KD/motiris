@@ -68,6 +68,7 @@ typedef int (*motiris_plugin_init_fn)(MotirisAgent *a, const MotirisPluginApi *a
 int motiris_load_plugins(MotirisAgent *a, const char *dir);  /* 0 on success */
 void motiris_set_transport(MotirisAgent *a, const char *name);  /* "curl"|"echo" */
 void motiris_set_max_steps(MotirisAgent *a, int n);
+void motiris_set_goal_check(MotirisAgent *a, int on);   /* confirm goal met */
 void motiris_set_plugins_enabled(MotirisAgent *a, int on);
 void motiris_set_tools_enabled(MotirisAgent *a, int on);
 void motiris_set_plugin_dir(MotirisAgent *a, const char *dir);

@@ -28,7 +28,7 @@ deps/         linenoise (line editing), libcurl dev headers (curl 8.18 ABI)
 
 ```
 make                  # compiles per-component .o -> .a -> motiris
-make test             # offline smoke suite (26 checks, mock LLM/MCP)
+make test             # offline smoke suite (27 checks, mock LLM/MCP)
 make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
 ```
@@ -134,3 +134,7 @@ lives in plugin.c and is shared with toolscan.
 - Smoke #24-26: per-tool schema files (override / invalid json / plugin
   subdir layout) — if you change the merge logic or dir resolution,
   update these.
+- Smoke #27: goal-check loop (`--goal-check` + DONE confirmation).
+- Goal-check state is per-agent (goal from the agent's own messages,
+  `confirm_asked` is a `motiris_run` local); no new global state — keep
+  it that way when touch agent.c.
