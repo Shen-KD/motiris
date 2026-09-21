@@ -28,16 +28,21 @@ deps/         linenoise (line editing), libcurl dev headers (curl 8.18 ABI)
 
 ```
 make                  # compiles per-component .o -> .a -> motiris
-make test             # offline smoke suite (17 checks, mock LLM/MCP)
+make test             # offline smoke suite (27 checks, mock LLM/MCP)
 make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
 ```
 
-CI (`.github/workflows/ci.yml`) runs: gcc build, smoke, clang -Werror
-build, plugin example compile, binary size (<163840), then `perf` and
-the `compat-matrix` job (ubuntu 22.04 gcc-11 / 24.04 gcc-13 / 26.04
-gcc-15 / centos-stream9 container / clang). `ci` is the required check
-on main, the others are informational.
+CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
+by the aggregate `ci` job (that exact name is the required status check
+on main): `build` (gcc clean compile+link, size guard, artifact),
+`clang` (full -Werror build), `test-core` / `test-tools` / `test-repl` /
+`test-skills` / `test-schema` (component-scoped smoke groups, see
+`tests/smoke.sh <group>`), `plugins` (example .so with gcc + clang
+-Werror), `tools` (component static libs compile independently with
+clang -Werror). `perf` and `compat-matrix` are informational
+(ubuntu 22.04 gcc-11 / 24.04 gcc-13 / 26.04 gcc-15 / centos-stream9
+container / clang).
 
 ## Release & install
 
@@ -100,6 +105,22 @@ config.json spawns a stdio JSON-RPC server; each remote tool registers
 as `<server>:<tool>`. `env` overrides are applied in the child process
 before exec (not yet implemented for arbitrary vars — see mcp.c).
 
+Sessions: `src/harness/sessions.c` owns the shared U/A/T log helpers
+(`motiris_state_dir` / `motiris_session_list` / `motiris_session_append`);
+`--sessions`, the gateway and the repl (/sessions) all go through it.
+
+Skill files: `skill_patch` / `skill_write` in skilltools.c edit the
+indexed `--skill-dir` files in place; paths are built from the index
+(`skill_dir` + `file`), never from user input — no workspace guard
+needed (by construction bounded to the skill dir).
+
+Per-tool schemas: `src/tools/toolscan.c` indexes
+`<plugin_dir>/<name>/<name>.json` and `<tools_dir>/<name>/<name>.json`
+(plugin dir = MOTIRIS_PLUGIN_DIR or ~/.motiris/plugins; tools dir =
+MOTIRIS_TOOLS_DIR or ~/.motiris/tools). `motiris_register_tool` swaps
+in the external schema when one exists. `motiris_plugin_dir_default()`
+lives in plugin.c and is shared with toolscan.
+
 ## Tests that must not regress
 
 - Smoke #4: binary stays < 163840 bytes.
@@ -107,3 +128,13 @@ before exec (not yet implemented for arbitrary vars — see mcp.c).
 - Smoke #16: repl shows tool lines + token stats (streamed tool_calls
   + usage through the mock).
 - Smoke #17: plugin tool hook fires (needs examples/hello_plugin.so).
+- Smoke #20/#21: skill_patch / skill_write edit real skill files via
+  the agent loop (mock model), matching the current schema strings —
+  if you change a tool schema, update these mocks.
+- Smoke #24-26: per-tool schema files (override / invalid json / plugin
+  subdir layout) — if you change the merge logic or dir resolution,
+  update these.
+- Smoke #27: goal-check loop (`--goal-check` + DONE confirmation).
+- Goal-check state is per-agent (goal from the agent's own messages,
+  `confirm_asked` is a `motiris_run` local); no new global state — keep
+  it that way when touch agent.c.

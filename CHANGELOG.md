@@ -4,6 +4,25 @@ All notable changes to motiris. Format keeps it terse: version, date,
 breaking notes, then the highlights. Releases are tagged `vX.Y.Z` and
 published by `.github/workflows/release.yml`.
 
+## [Unreleased]
+
+### Added
+
+- REPL startup banner shows model / skills / tools with aligned
+  colored labels; per-turn status footer (tokens, elapsed ms, model);
+  first-run command hints.
+- REPL commands: `/sessions [TERM]` (review repl + gateway session
+  logs), `/resume FILE` (load a past session into context),
+  `/skills [TERM]`. Interactive sessions auto-log to
+  `~/.local/share/motiris/sessions/` (U/A/T rows, same format as
+  gateway logs).
+- Skills: `skill_patch` / `skill_write` model tools to edit indexed
+  `--skill-dir` files in place (frontmatter re-parsed on write).
+- Goal check (`--goal-check` / config `"goal_check"`): after a first
+  answer the model confirms the goal (first user message) with `DONE`
+  or keeps working — one extra round, bounded by `--max-steps`.
+- Offline smoke suite grown to 27 checks.
+
 ## [0.1.0] - 2026-09-20
 
 First tagged release. A featherweight C11 agent framework: one binary

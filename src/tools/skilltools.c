@@ -18,7 +18,7 @@
 
 #define MAX_SKILLS 128
 
-typedef struct { char name[128]; char desc[512]; char *body; } Skill;
+typedef struct { char name[128]; char desc[512]; char file[512]; char *body; } Skill;
 
 static char *skill_dir = NULL;
 static Skill skills[MAX_SKILLS];
@@ -86,8 +86,10 @@ static const MotirisTool skill_tools[];
 
 static char *skill_list_call(const char *args_json, void *ud);
 static char *skill_load_call(const char *args_json, void *ud);
+static char *skill_patch_call(const char *args_json, void *ud);
+static char *skill_write_call(const char *args_json, void *ud);
 
-/* the two skill tools, defined before use so the registration below can
+/* the skill tools, defined before use so the registration below can
  * count them with sizeof */
 static const MotirisTool skill_tools[] = {
   { "skill_list",
@@ -99,6 +101,21 @@ static const MotirisTool skill_tools[] = {
     "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},"
     "\"required\":[\"name\"]}",
     skill_load_call, NULL },
+  { "skill_patch",
+    "Replace the first occurrence of 'old' with 'new' in the skill file "
+    "named 'name'. Only modifies files inside the configured --skill-dir.",
+    "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},"
+    "\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},"
+    "\"required\":[\"name\",\"old\"]}",
+    skill_patch_call, NULL },
+  { "skill_write",
+    "Overwrite the skill file named 'name' with the full new content "
+    "(frontmatter name/description are re-parsed). Only modifies files "
+    "inside --skill-dir.",
+    "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},"
+    "\"content\":{\"type\":\"string\"}},"
+    "\"required\":[\"name\",\"content\"]}",
+    skill_write_call, NULL },
 };
 
 void motiris_register_skill_tools(MotirisAgent *a, const char *dir) {
@@ -118,6 +135,7 @@ void motiris_register_skill_tools(MotirisAgent *a, const char *dir) {
     char *text = read_file_all(path);
     if (!text) continue;
     Skill *s = &skills[n_skills];
+    snprintf(s->file, sizeof s->file, "%s", e->d_name);
     const char *body;
     parse_frontmatter(text, s->name, sizeof s->name,
                       s->desc, sizeof s->desc, &body);
@@ -171,4 +189,126 @@ static char *skill_load_call(const char *args_json, void *ud) {
   }
   cJSON_Delete(args);
   return err_json("skill not found");
+}
+
+int motiris_skill_count(void) { return n_skills; }
+
+const char *motiris_skill_name(int i) {
+  return (i >= 0 && i < n_skills) ? skills[i].name : NULL;
+}
+
+const char *motiris_skill_desc(int i) {
+  return (i >= 0 && i < n_skills) ? skills[i].desc : NULL;
+}
+
+/* ---------------- skill_patch / skill_write ---------------- */
+static Skill *find_skill(const char *name) {
+  for (int i = 0; i < n_skills; i++)
+    if (!strcmp(skills[i].name, name)) return &skills[i];
+  return NULL;
+}
+
+static char *skill_path(const Skill *s) {
+  size_t n = strlen(skill_dir) + strlen(s->file) + 2;
+  char *p = malloc(n);
+  snprintf(p, n, "%s/%s", skill_dir, s->file);
+  return p;
+}
+
+static char *skill_patch_call(const char *args_json, void *ud) {
+  (void)ud;
+  cJSON *args = cJSON_Parse(args_json);
+  if (!args) return err_json("cannot parse arguments");
+  const char *name = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(args, "name"));
+  const char *old_t = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(args, "old"));
+  const char *new_t = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(args, "new"));
+  if (!name || !*name || !old_t || !*old_t) {
+    cJSON_Delete(args);
+    return err_json("name and old required");
+  }
+  Skill *s = find_skill(name);
+  if (!s) { cJSON_Delete(args); return err_json("skill not found"); }
+
+  char *path = skill_path(s);
+  char *buf = read_file_all(path);
+  if (!buf) { free(path); cJSON_Delete(args); return err_json("cannot open skill file"); }
+  size_t len = strlen(buf);
+  char *hit = strstr(buf, old_t);
+  int replaced = 0;
+  if (hit) {
+    size_t olen = strlen(old_t), nlen = new_t ? strlen(new_t) : 0;
+    size_t off = (size_t)(hit - buf);
+    size_t newlen = len - olen + nlen;
+    char *nb = malloc(newlen + 1);
+    memcpy(nb, buf, off);
+    if (nlen) memcpy(nb + off, new_t, nlen);
+    memcpy(nb + off + nlen, buf + off + olen, len - off - olen + 1);
+    free(buf);
+    buf = nb;
+    len = newlen;
+    replaced = 1;
+  }
+  int wrote = 0;
+  if (replaced) {
+    FILE *f = fopen(path, "w");
+    if (f) { fwrite(buf, 1, len, f); fclose(f); wrote = 1; }
+  }
+  if (wrote) {
+    free(s->body);
+    s->body = strdup(buf);
+  }
+  free(buf);
+  free(path);
+  cJSON_Delete(args);
+
+  cJSON *r = cJSON_CreateObject();
+  cJSON_AddBoolToObject(r, "replaced", replaced);
+  char *sout = cJSON_PrintUnformatted(r);
+  cJSON_Delete(r);
+  return sout;
+}
+
+static char *skill_write_call(const char *args_json, void *ud) {
+  (void)ud;
+  cJSON *args = cJSON_Parse(args_json);
+  if (!args) return err_json("cannot parse arguments");
+  const char *name = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(args, "name"));
+  const char *content = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(args, "content"));
+  if (!name || !*name || !content) {
+    cJSON_Delete(args);
+    return err_json("name and content required");
+  }
+  Skill *s = find_skill(name);
+  if (!s) { cJSON_Delete(args); return err_json("skill not found"); }
+
+  char *path = skill_path(s);
+  FILE *f = fopen(path, "w");
+  if (!f) { free(path); cJSON_Delete(args); return err_json("cannot write skill file"); }
+  fwrite(content, 1, strlen(content), f);
+  fclose(f);
+  free(path);
+
+  /* re-parse frontmatter: name/desc may have changed, body always does */
+  char newname[128] = "", newdesc[512] = "";
+  const char *body;
+  parse_frontmatter(content, newname, sizeof newname, newdesc, sizeof newdesc, &body);
+  if (!*newname) snprintf(newname, sizeof newname, "%s", name);
+  snprintf(s->name, sizeof s->name, "%s", newname);
+  snprintf(s->desc, sizeof s->desc, "%s", newdesc);
+  free(s->body);
+  s->body = strdup(body);
+  cJSON_Delete(args);
+
+  cJSON *r = cJSON_CreateObject();
+  cJSON_AddStringToObject(r, "ok", "written");
+  cJSON_AddStringToObject(r, "name", s->name);
+  cJSON_AddNumberToObject(r, "skills", (double)n_skills);
+  char *sout = cJSON_PrintUnformatted(r);
+  cJSON_Delete(r);
+  return sout;
 }

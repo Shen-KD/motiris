@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <dirent.h>
 
 static void usage(FILE *f) {
   fprintf(f,
@@ -26,6 +25,7 @@ static void usage(FILE *f) {
 "      --no-tools        do not register built-in tools\n"
 "      --transport NAME  curl (default) | echo (offline test)\n"
 "      --max-steps N     agent loop bound (default 10)\n"
+"      --goal-check      confirm the goal is met (one extra round)\n"
 "  -r, --resume FILE     resume previous session log\n"
 "      --save FILE       persist session log to FILE\n"
 "  -v, --verbose         print step/tool/trace to stderr\n"
@@ -79,58 +79,13 @@ static char *load_skill_dir(const char *dir) {
 
 int motiris_repl(MotirisAgent *a);
 
-/* list gateway session logs under $HOME/.local/share/motiris/gateway */
-static int list_sessions(const char *term) {
-  const char *h = getenv("HOME");
-  if (!h) h = ".";
-  char dir[512];
-  snprintf(dir, sizeof dir, "%s/.local/share/motiris/gateway", h);
-  DIR *d = opendir(dir);
-  if (!d) { printf("no sessions yet\n"); return 0; }
-  struct dirent *e;
-  int shown = 0;
-  while ((e = readdir(d)) != NULL) {
-    size_t len = strlen(e->d_name);
-    if (len < 5 || strcmp(e->d_name + len - 4, ".log")) continue;
-    char path[600];
-    snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-    if (term) {
-      FILE *f = fopen(path, "r");
-      if (f) {
-        char line[65536];
-        long ln = 0;
-        while (fgets(line, sizeof line, f)) {
-          ln++;
-          if (strstr(line, term))
-            printf("%s:%ld:%s", e->d_name, ln, line);
-        }
-        fclose(f);
-      }
-      shown = 1;
-    } else {
-      FILE *f = fopen(path, "r");
-      long lines = 0;
-      if (f) {
-        int c;
-        while ((c = fgetc(f)) != EOF) if (c == '\n') lines++;
-        fclose(f);
-      }
-      printf("%-40s %ld lines\n", e->d_name, lines);
-      shown = 1;
-    }
-  }
-  closedir(d);
-  if (!shown && !term) printf("no sessions yet\n");
-  return 0;
-}
-
 int main(int argc, char **argv) {
   const char *model = NULL, *base_url = NULL, *key = NULL;
   const char *system = NULL, *prompt = NULL, *skill_dir = NULL;
   const char *resume = NULL, *save = NULL, *transport = NULL, *plugin_dir = NULL;
   const char *gateway_listen = NULL;
   int no_tools = 0, no_plugin = 0, verbose = 0, max_steps = 0;
-  int interactive = 0, stream = 0, gateway_mode = 0;
+  int interactive = 0, stream = 0, gateway_mode = 0, goal_check = 0;
   int cron_mode = 0, cron_once = 0;
   const char *cron_file = NULL;
 
@@ -169,13 +124,14 @@ int main(int argc, char **argv) {
       case 'a': /* --api-key */
         if (!strcmp(a, "--api-key")) { key = NEED(); break; }
         goto unknown;
-      case 'g': /* --gateway */
+      case 'g': /* --gateway | --goal-check */
         if (!strcmp(a, "--gateway")) {
           gateway_mode = 1;
           if (i + 1 < argc && argv[i + 1][0] != '-')
             gateway_listen = argv[++i];
           break;
         }
+        if (!strcmp(a, "--goal-check")) { goal_check = 1; break; }
         goto unknown;
       case 's': /* --system | --save | --stream | --sessions | --skill-dir */
         if (!strcmp(a, "--system")) { system = NEED(); break; }
@@ -184,7 +140,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--sessions")) {
           const char *term = (i + 1 < argc && argv[i + 1][0] != '-')
               ? argv[++i] : NULL;
-          return list_sessions(term) ? 1 : 0;
+          return motiris_session_list("gateway", term) ? 1 : 0;
         }
         if (!strcmp(a, "--skill-dir")) { skill_dir = NEED(); break; }
         goto unknown;
@@ -210,8 +166,9 @@ int main(int argc, char **argv) {
           break;
         }
         goto unknown;
-      case 'o': /* --once */
+      case 'o': /* --once | --goal-check */
         if (!strcmp(a, "--once")) { cron_once = 1; break; }
+        if (!strcmp(a, "--goal-check")) { goal_check = 1; break; }
         goto unknown;
       case 'i': /* --init | --interactive */
         if (!strcmp(a, "--init")) { return motiris_init_config() ? 2 : 0; }
@@ -264,11 +221,13 @@ int main(int argc, char **argv) {
   if (system) motiris_set_system(ag, system);
   if (transport) motiris_set_transport(ag, transport);
   if (max_steps > 0) motiris_set_max_steps(ag, max_steps);
+  if (goal_check) motiris_set_goal_check(ag, 1);
   motiris_set_verbose(ag, verbose);
   if (stream) motiris_set_stream(ag, 1);
   if (no_tools) motiris_set_tools_enabled(ag, 0);
   if (no_plugin) motiris_set_plugins_enabled(ag, 0);
   if (plugin_dir) motiris_set_plugin_dir(ag, plugin_dir);
+  motiris_tool_scan(plugin_dir);   /* index <dir>/<name>/<name>.json schemas first */
   motiris_register_core_tools(ag);
   if (motiris_tools_enabled(ag)) {
     motiris_register_file_tools(ag);

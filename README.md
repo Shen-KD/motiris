@@ -26,14 +26,20 @@ agent process stays idle-quiet between requests.
 
 - **Agent loop with tool calling** — OpenAI-compatible chat completions:
   iterates `model -> tool_calls -> execute -> result -> model` until done.
-  Works with any OpenAI-compatible endpoint (cloud or local).
+  Works with any OpenAI-compatible endpoint (cloud or local). With
+  `--goal-check`, after a first answer the model is asked whether the
+  goal (the first user message) is fully met: it replies `DONE` to
+  finish, or keeps working (tools included), bounded by `--max-steps`.
 - **Runtime tool plug/unplug** — tools live in a registry;
   `motiris_unregister_tool()` removes one at runtime, `--no-tools` starts bare.
 - **Runtime plugin system** — plugins are shared objects (`.so`) dropped
   into a plugins directory; motiris dlopens them at startup and they
   register tools through a small plugin API. Add a tool without touching
   the core binary.
-- **Sessions** — append-only trace log (`--save`), resume replay (`-r`).
+- **Sessions** — append-only trace log (`--save`), resume replay (`-r`);
+  the repl auto-logs every interactive session to
+  `~/.local/share/motiris/sessions/` (gateway format) with
+  `/sessions`, `/resume` review commands.
 - **Skills** — a directory of `.md` files injected as system context.
 - **Tiny core** — cJSON is the only runtime-embedded vendor; HTTP goes
   through a built-in libcurl C backend (no child process; HTTPS/TLS
@@ -52,7 +58,8 @@ agent process stays idle-quiet between requests.
  Tools     registry with runtime plug/unplug, incl. shell/time built-ins
  Plugins   .so files, dlopen'd, register tools via MotirisPluginApi
  Skills    --skill-dir *.md injected as system prompt
- Sessions  append-only trace + resume replay (no database)
+ Sessions  append-only trace + resume replay (no database);
+          repl auto-logs to ~/.local/share/motiris/sessions/
  Storage   out of the way: only what you ask for (--save)
  Trace     -v step/tool logging to stderr
  Sandbox   none by default: shell runs as your uid (documented risk)
@@ -80,12 +87,15 @@ motiris -p "summarize this repo" -m deepseek-chat -k "$DEEPSEEK_API_KEY"
 printf 'what time is it' | motiris                      # prompt from stdin
 motiris -p hi --transport echo                          # offline demo
 motiris -p "review diff" -s "You are a code reviewer" -v
+motiris -p "do X" --goal-check                          # confirm goal met before finishing
 motiris -p "continue" -r last-run.log                   # resume a session
 motiris -p "do X" --skill-dir ./skills                  # skills as context
 motiris --gateway :8899                                 # HTTP gateway
 curl -X POST localhost:8899/v1/chat -d '{"chat_id":"dev","message":"hi"}'
 motiris --cron jobs.json --once                          # scheduled jobs
 motiris --sessions [TERM]                                # list/search logs
+# repl (-i) commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM]
+# repl sessions auto-log to ~/.local/share/motiris/sessions/ (U/A/T rows)
 # token-protected: MOTIRIS_GATEWAY_TOKEN=sekret motiris --gateway :8899
 ```
 
@@ -95,8 +105,9 @@ restarts under `~/.local/share/motiris/gateway/`), exposes
 and optionally requires `Authorization: Bearer $MOTIRIS_GATEWAY_TOKEN`.
 
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
-`MOTIRIS_PLUGIN_DIR`, `MOTIRIS_CURL`, `MOTIRIS_GATEWAY_TOKEN`. Default
-endpoint: `https://api.openai.com/v1/chat/completions`.
+`MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
+`MOTIRIS_GATEWAY_TOKEN`. Default endpoint:
+`https://api.openai.com/v1/chat/completions`.
 
 Built-in tools (disable with `--no-tools`):
 
@@ -118,6 +129,8 @@ Knowledge & delegation tools:
   (`~/.local/share/motiris/memory.json`)
 - `skill_list()` / `skill_load(name)` — SKILL.md frontmatter index,
   on-demand loading (`--skill-dir DIR`)
+- `skill_patch(name, old, new)` / `skill_write(name, content)` —
+  edit indexed skill files in place (only files inside --skill-dir)
 - `subagent(task)` — run a fresh `motiris` child (no tools, isolated)
 - `browser_fetch(url)` — render via headless chromium (`--dump-dom`),
   needs a chromium binary; `MOTIRIS_BROWSER` overrides
@@ -154,10 +167,20 @@ int motiris_plugin_init(MotirisAgent *a, const MotirisPluginApi *api) {
 
 ```
 make examples/hello_plugin.so
-mkdir -p ~/.local/share/motiris/plugins
-cp examples/hello_plugin.so ~/.local/share/motiris/plugins/
+mkdir -p ~/.motiris/plugins/hello
+cp examples/hello_plugin.so ~/.motiris/plugins/hello/hello.so
 motiris -p "say hello to iris"   # plugin tool appears to the model automatically
 ```
+
+Per-tool directory layout (tools and plugins share it):
+`<dir>/<name>/{<name>.so, <name>.h, <name>.json}` — the `.json` is the
+tool's JSON-Schema (loaded at startup, overrides the embedded one when
+present, invalid files are skipped with a warning), `.h` is the
+compile-time contract, `.a` (optional) for static linking. Legacy flat
+`<name>.so` plugins still load. Built-in tools use the same override
+path via `MOTIRIS_TOOLS_DIR` (default `~/.motiris/tools`): dropping
+`shell/shell.json` there (see `examples/shell/`) changes the shell
+tool's schema without rebuilding.
 
 ## Development
 

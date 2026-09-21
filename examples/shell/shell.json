@@ -1,0 +1,7 @@
+{
+  "type": "object",
+  "properties": {
+    "command": { "type": "string", "description": "shell command line" }
+  },
+  "required": ["command"]
+}
