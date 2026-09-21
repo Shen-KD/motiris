@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <dirent.h>
 
 static void usage(FILE *f) {
   fprintf(f,
@@ -79,51 +78,6 @@ static char *load_skill_dir(const char *dir) {
 
 int motiris_repl(MotirisAgent *a);
 
-/* list gateway session logs under $HOME/.local/share/motiris/gateway */
-static int list_sessions(const char *term) {
-  const char *h = getenv("HOME");
-  if (!h) h = ".";
-  char dir[512];
-  snprintf(dir, sizeof dir, "%s/.local/share/motiris/gateway", h);
-  DIR *d = opendir(dir);
-  if (!d) { printf("no sessions yet\n"); return 0; }
-  struct dirent *e;
-  int shown = 0;
-  while ((e = readdir(d)) != NULL) {
-    size_t len = strlen(e->d_name);
-    if (len < 5 || strcmp(e->d_name + len - 4, ".log")) continue;
-    char path[600];
-    snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-    if (term) {
-      FILE *f = fopen(path, "r");
-      if (f) {
-        char line[65536];
-        long ln = 0;
-        while (fgets(line, sizeof line, f)) {
-          ln++;
-          if (strstr(line, term))
-            printf("%s:%ld:%s", e->d_name, ln, line);
-        }
-        fclose(f);
-      }
-      shown = 1;
-    } else {
-      FILE *f = fopen(path, "r");
-      long lines = 0;
-      if (f) {
-        int c;
-        while ((c = fgetc(f)) != EOF) if (c == '\n') lines++;
-        fclose(f);
-      }
-      printf("%-40s %ld lines\n", e->d_name, lines);
-      shown = 1;
-    }
-  }
-  closedir(d);
-  if (!shown && !term) printf("no sessions yet\n");
-  return 0;
-}
-
 int main(int argc, char **argv) {
   const char *model = NULL, *base_url = NULL, *key = NULL;
   const char *system = NULL, *prompt = NULL, *skill_dir = NULL;
@@ -184,7 +138,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--sessions")) {
           const char *term = (i + 1 < argc && argv[i + 1][0] != '-')
               ? argv[++i] : NULL;
-          return list_sessions(term) ? 1 : 0;
+          return motiris_session_list("gateway", term) ? 1 : 0;
         }
         if (!strcmp(a, "--skill-dir")) { skill_dir = NEED(); break; }
         goto unknown;

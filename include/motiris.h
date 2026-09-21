@@ -24,6 +24,9 @@ typedef struct MotirisTool {
 MotirisAgent *motiris_new(void);
 void motiris_free(MotirisAgent *a);
 void motiris_set_model(MotirisAgent *a, const char *m);
+const char *motiris_model(MotirisAgent *a);         /* current model id */
+int  motiris_tool_count(MotirisAgent *a);           /* registered tools */
+const char *motiris_tool_name(MotirisAgent *a, int i); /* or NULL */
 void motiris_set_base_url(MotirisAgent *a, const char *u);
 void motiris_set_api_key(MotirisAgent *a, const char *k);
 void motiris_set_system(MotirisAgent *a, const char *sys);
@@ -91,6 +94,8 @@ void motiris_register_file_tools(MotirisAgent *a);  /* read/write/patch/search *
 void motiris_register_web_tools(MotirisAgent *a);   /* web_fetch/search */
 void motiris_register_memory_tools(MotirisAgent *a); /* memory get/set/list */
 void motiris_register_skill_tools(MotirisAgent *a, const char *dir);
+int  motiris_skill_count(void);                      /* indexed skills */
+const char *motiris_skill_name(int i);               /* or NULL */
 void motiris_register_subagent_tools(MotirisAgent *a);  /* subagent */
 void motiris_register_browser_tools(MotirisAgent *a);  /* browser_fetch */
 int  motiris_tools_enabled(MotirisAgent *a);
@@ -108,6 +113,12 @@ char *motiris_shell_policy_check(const char *command);
 /* ---- gateway: embedded HTTP service, session-per-chat_id ---- */
 int motiris_gateway_run(const char *listen_addr, const char *token,
                         int tools_on, int verbose);  /* blocks; 0 on clean exit */
+
+/* ---- sessions: shared U/A/T session-log helpers (--sessions, repl) ---- */
+char *motiris_state_dir(const char *sub);  /* mkdir -p, strdup'd; NULL no HOME */
+int  motiris_session_list(const char *sub, const char *term);   /* prints */
+int  motiris_session_append(const char *sub, const char *id, char tag,
+                            const char *line);  /* 0 on success */
 
 /* ---- cron: scheduled agent runs ---- */
 int motiris_cron_run(const char *jobs_file, int once, int verbose);
