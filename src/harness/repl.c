@@ -33,13 +33,14 @@
 #define C_YELLOW "\033[33m"
 
 static const char *const CMDS[] = { "/help", "/new", "/tools", "/sessions",
-                                    "/resume", "/exit", "/quit" };
+                                    "/resume", "/skills", "/exit", "/quit" };
 static const char *const CMDS_DESC[] = {
   "this help",
   "reset session context",
   "list tool information",
   "review past session logs [TERM]",
   "load a session log into context FILE",
+  "list available skills [TERM]",
   "leave the repl",
   "leave the repl",
 };
@@ -193,6 +194,28 @@ static int handle_command(MotirisAgent *a, const char *line) {
     printf(C_DIM "[loaded %ld turns from %s]\n" C_RESET, n, file);
     return 0;
   }
+  if (!strcmp(line, "/skills") || !strncmp(line, "/skills ", 8)) {
+    const char *term = strchr(line, ' ');
+    if (term) term++;
+    int n = motiris_skill_count();
+    if (n <= 0) {
+      printf(C_DIM "no skills (use --skill-dir DIR)\n" C_RESET);
+      return 0;
+    }
+    size_t tlen = term ? strlen(term) : 0;
+    int shown = 0;
+    for (int i = 0; i < n; i++) {
+      const char *nm = motiris_skill_name(i);
+      const char *ds = motiris_skill_desc(i);
+      if (tlen && !strcasestr(nm, term) && !strcasestr(ds ? ds : "", term))
+        continue;
+      printf("  " C_GREEN "%-24s" C_RESET C_DIM "%s" C_RESET "\n",
+             nm, ds ? ds : "");
+      shown = 1;
+    }
+    if (!shown) printf(C_DIM "no skills match\n" C_RESET);
+    return 0;
+  }
   return -1; /* not a command */
 }
 
@@ -278,7 +301,7 @@ int motiris_repl(MotirisAgent *a) {
   print_banner(a);
   if (first_run)
     printf(C_DIM "  try: /help (commands) · /sessions (review past) · "
-           "/tools (tool info)\n" C_RESET);
+           "/skills (list skills)\n" C_RESET);
 
   char *line;
   while ((line = linenoise("motiris> ")) != NULL) {

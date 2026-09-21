@@ -96,6 +96,7 @@ void motiris_register_memory_tools(MotirisAgent *a); /* memory get/set/list */
 void motiris_register_skill_tools(MotirisAgent *a, const char *dir);
 int  motiris_skill_count(void);                      /* indexed skills */
 const char *motiris_skill_name(int i);               /* or NULL */
+const char *motiris_skill_desc(int i);               /* or NULL */
 void motiris_register_subagent_tools(MotirisAgent *a);  /* subagent */
 void motiris_register_browser_tools(MotirisAgent *a);  /* browser_fetch */
 int  motiris_tools_enabled(MotirisAgent *a);
