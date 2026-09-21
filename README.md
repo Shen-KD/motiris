@@ -33,7 +33,10 @@ agent process stays idle-quiet between requests.
   into a plugins directory; motiris dlopens them at startup and they
   register tools through a small plugin API. Add a tool without touching
   the core binary.
-- **Sessions** — append-only trace log (`--save`), resume replay (`-r`).
+- **Sessions** — append-only trace log (`--save`), resume replay (`-r`);
+  the repl auto-logs every interactive session to
+  `~/.local/share/motiris/sessions/` (gateway format) with
+  `/sessions`, `/resume` review commands.
 - **Skills** — a directory of `.md` files injected as system context.
 - **Tiny core** — cJSON is the only runtime-embedded vendor; HTTP goes
   through a built-in libcurl C backend (no child process; HTTPS/TLS
@@ -52,7 +55,8 @@ agent process stays idle-quiet between requests.
  Tools     registry with runtime plug/unplug, incl. shell/time built-ins
  Plugins   .so files, dlopen'd, register tools via MotirisPluginApi
  Skills    --skill-dir *.md injected as system prompt
- Sessions  append-only trace + resume replay (no database)
+ Sessions  append-only trace + resume replay (no database);
+          repl auto-logs to ~/.local/share/motiris/sessions/
  Storage   out of the way: only what you ask for (--save)
  Trace     -v step/tool logging to stderr
  Sandbox   none by default: shell runs as your uid (documented risk)
@@ -86,6 +90,8 @@ motiris --gateway :8899                                 # HTTP gateway
 curl -X POST localhost:8899/v1/chat -d '{"chat_id":"dev","message":"hi"}'
 motiris --cron jobs.json --once                          # scheduled jobs
 motiris --sessions [TERM]                                # list/search logs
+# repl (-i) commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM]
+# repl sessions auto-log to ~/.local/share/motiris/sessions/ (U/A/T rows)
 # token-protected: MOTIRIS_GATEWAY_TOKEN=sekret motiris --gateway :8899
 ```
 
@@ -118,6 +124,8 @@ Knowledge & delegation tools:
   (`~/.local/share/motiris/memory.json`)
 - `skill_list()` / `skill_load(name)` — SKILL.md frontmatter index,
   on-demand loading (`--skill-dir DIR`)
+- `skill_patch(name, old, new)` / `skill_write(name, content)` —
+  edit indexed skill files in place (only files inside --skill-dir)
 - `subagent(task)` — run a fresh `motiris` child (no tools, isolated)
 - `browser_fetch(url)` — render via headless chromium (`--dump-dom`),
   needs a chromium binary; `MOTIRIS_BROWSER` overrides

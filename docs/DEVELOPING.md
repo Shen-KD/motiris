@@ -28,7 +28,7 @@ deps/         linenoise (line editing), libcurl dev headers (curl 8.18 ABI)
 
 ```
 make                  # compiles per-component .o -> .a -> motiris
-make test             # offline smoke suite (17 checks, mock LLM/MCP)
+make test             # offline smoke suite (23 checks, mock LLM/MCP)
 make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
 ```
@@ -100,6 +100,15 @@ config.json spawns a stdio JSON-RPC server; each remote tool registers
 as `<server>:<tool>`. `env` overrides are applied in the child process
 before exec (not yet implemented for arbitrary vars — see mcp.c).
 
+Sessions: `src/harness/sessions.c` owns the shared U/A/T log helpers
+(`motiris_state_dir` / `motiris_session_list` / `motiris_session_append`);
+`--sessions`, the gateway and the repl (/sessions) all go through it.
+
+Skill files: `skill_patch` / `skill_write` in skilltools.c edit the
+indexed `--skill-dir` files in place; paths are built from the index
+(`skill_dir` + `file`), never from user input — no workspace guard
+needed (by construction bounded to the skill dir).
+
 ## Tests that must not regress
 
 - Smoke #4: binary stays < 163840 bytes.
@@ -107,3 +116,6 @@ before exec (not yet implemented for arbitrary vars — see mcp.c).
 - Smoke #16: repl shows tool lines + token stats (streamed tool_calls
   + usage through the mock).
 - Smoke #17: plugin tool hook fires (needs examples/hello_plugin.so).
+- Smoke #20/#21: skill_patch / skill_write edit real skill files via
+  the agent loop (mock model), matching the current schema strings —
+  if you change a tool schema, update these mocks.
