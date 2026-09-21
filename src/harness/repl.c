@@ -16,7 +16,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include <linenoise.h>
 
@@ -148,6 +150,58 @@ static int handle_command(MotirisAgent *a, const char *line) {
   return -1; /* not a command */
 }
 
+/* startup banner: model / skills / tools at a glance */
+static void print_banner(MotirisAgent *a) {
+  printf(C_DIM "─────────────────────────────────────────────────────────"
+         "──────────\n" C_RESET);
+  printf(C_CYAN "motiris" C_RESET " — " C_BOLD "iris as a mote" C_RESET
+         ", one tiny binary\n");
+
+  const char *m = motiris_model(a);
+  printf("  " C_BOLD C_GREEN "%-7s" C_RESET " " C_CYAN "%s" C_RESET "\n",
+         "model", m && *m ? m : "(none)");
+
+  int nsk = motiris_skill_count();
+  if (nsk > 0) {
+    printf("  " C_BOLD C_GREEN "%-7s" C_RESET " " C_GREEN "%d" C_RESET ": ",
+           "skills", nsk);
+    for (int i = 0; i < nsk; i++)
+      printf("%s%s", i ? ", " : "", motiris_skill_name(i));
+    printf("\n");
+  } else {
+    printf("  " C_BOLD C_GREEN "%-7s" C_RESET " none " C_DIM
+           "(use --skill-dir DIR)" C_RESET "\n", "skills");
+  }
+
+  if (!motiris_tools_enabled(a)) {
+    printf("  " C_BOLD C_GREEN "%-7s" C_RESET " none " C_DIM
+           "(--no-tools)" C_RESET "\n", "tools");
+  } else {
+    int nt = motiris_tool_count(a);
+    if (nt <= 0) {
+      printf("  " C_BOLD C_GREEN "%-7s" C_RESET " none\n", "tools");
+    } else {
+      printf("  " C_BOLD C_GREEN "%-7s" C_RESET " " C_YELLOW "%d" C_RESET
+             ": ", "tools", nt);
+      int col = 11;
+      for (int i = 0; i < nt; i++) {
+        const char *nm = motiris_tool_name(a, i);
+        int ln = (int)strlen(nm) + (i ? 2 : 0);
+        if (col + ln > 78) { printf("\n             "); col = 13; }
+        printf("%s%s", i ? ", " : "", nm);
+        col += ln;
+      }
+      printf("\n");
+    }
+  }
+
+  printf(C_DIM "─────────────────────────────────────────────────────────"
+         "──────────\n" C_RESET);
+  printf("type " C_GREEN "/help" C_RESET " for commands, tab completes "
+         C_DIM "/-commands" C_RESET ", ctrl-d to quit\n");
+  fflush(stdout);
+}
+
 int motiris_repl(MotirisAgent *a) {
   motiris_set_stream(a, 1);
   motiris_set_stream_cb(a, delta_print, NULL);
@@ -160,12 +214,13 @@ int motiris_repl(MotirisAgent *a) {
   char hist[1024];
   expand_home(hist, sizeof hist, hist_path());
   linenoiseHistoryLoad(hist);
+  struct stat hst;
+  int first_run = stat(hist, &hst) || hst.st_size == 0;
 
-  printf(C_CYAN "motiris" C_RESET " — " C_BOLD "iris as a mote" C_RESET
-         ", one tiny binary\n");
-  printf("type " C_GREEN "/help" C_RESET " for commands, tab completes "
-         C_DIM "//-commands" C_RESET ", ctrl-d to quit\n");
-  fflush(stdout);
+  print_banner(a);
+  if (first_run)
+    printf(C_DIM "  try: /help (commands) · /new (reset context) · "
+           "/tools (tool info)\n" C_RESET);
 
   char *line;
   while ((line = linenoise("motiris> ")) != NULL) {
@@ -183,7 +238,12 @@ int motiris_repl(MotirisAgent *a) {
     printf(C_DIM "→ you" C_RESET "\n");
     if (color) printf(C_CYAN);
     long ti0 = motiris_tokens_in(a), to0 = motiris_tokens_out(a);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     int rc = motiris_run(a);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000L
+            + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
     long di = motiris_tokens_in(a) - ti0;
     long dout = motiris_tokens_out(a) - to0;
     if (color) printf(C_RESET "\n");
@@ -192,8 +252,9 @@ int motiris_repl(MotirisAgent *a) {
     if (di || dout)
       printf(C_DIM "[tokens " C_RESET C_CYAN "↑%ld" C_RESET C_DIM
              " " C_RESET C_GREEN "↓%ld" C_RESET C_DIM
-             " · total %ld]" C_RESET "\n",
-             di, dout, motiris_tokens_in(a) + motiris_tokens_out(a));
+             " · total %ld · %ldms · %s]" C_RESET "\n",
+             di, dout, motiris_tokens_in(a) + motiris_tokens_out(a),
+             ms, motiris_model(a));
     printf("\n");
   }
   printf(C_DIM "bye" C_RESET "\n");
