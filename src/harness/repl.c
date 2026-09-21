@@ -32,20 +32,35 @@
 #define C_BOLD  "\033[1m"
 #define C_YELLOW "\033[33m"
 
-static const char *const CMDS[] = { "/help", "/new", "/tools", "/exit", "/quit" };
+static const char *const CMDS[] = { "/help", "/new", "/tools", "/sessions",
+                                    "/resume", "/exit", "/quit" };
 static const char *const CMDS_DESC[] = {
   "this help",
   "reset session context",
   "list tool information",
+  "review past session logs [TERM]",
+  "load a session log into context FILE",
   "leave the repl",
   "leave the repl",
 };
 #define NCMDS (sizeof CMDS / sizeof CMDS[0])
 
+/* session logging (tty only): log id, accumulating assistant reply */
+static char *sess_id = NULL;
+static char *reply_buf = NULL;
+static size_t reply_len = 0;
+
 static void delta_print(const char *text, void *ud) {
   (void)ud;
   fputs(text, stdout);
   fflush(stdout);
+  if (sess_id) {
+    size_t n = strlen(text);
+    reply_buf = realloc(reply_buf, reply_len + n + 1);
+    memcpy(reply_buf + reply_len, text, n);
+    reply_len += n;
+    reply_buf[reply_len] = '\0';
+  }
 }
 
 /* copy at most n-1 chars, whitespace collapsed */
@@ -65,7 +80,7 @@ static void clip(char *dst, size_t n, const char *src, size_t maxlen) {
   dst[o] = '\0';
 }
 
-/* tool-call observer: yellow ⚙ line with a short result digest */
+/* tool-call observer: yellow ⚙ line + session T row */
 static void repl_tool_hook(const char *name, const char *args,
                            const char *result, void *ud) {
   (void)ud;
@@ -80,6 +95,12 @@ static void repl_tool_hook(const char *name, const char *args,
     clip(rbuf, sizeof rbuf, result, 72);
     printf("  " C_YELLOW "⚙ %s" C_RESET "(%s) " C_DIM "→ %s" C_RESET "\n",
            name, abuf, rbuf);
+  }
+  if (sess_id) {
+    char row[320];
+    snprintf(row, sizeof row, "%s(%s) -> %s%s", name, abuf,
+             is_err ? "err:" : "", rbuf);
+    motiris_session_append("sessions", sess_id, 'T', row);
   }
 }
 
@@ -145,6 +166,31 @@ static int handle_command(MotirisAgent *a, const char *line) {
     printf("the tool list (shell, time, file/web/memory/skills/subagent,\n");
     printf("browser, MCP <server>:<tool>) is provided to the model each turn;\n");
     printf("disable with --no-tools, or per-tool allow/deny in config.json\n");
+    return 0;
+  }
+  if (!strcmp(line, "/sessions") || !strncmp(line, "/sessions ", 10)) {
+    const char *term = strchr(line, ' ');
+    if (term) term++;
+    printf(C_DIM "== repl sessions ==" C_RESET "\n");
+    motiris_session_list("sessions", term);
+    printf(C_DIM "== gateway sessions ==" C_RESET "\n");
+    motiris_session_list("gateway", term);
+    return 0;
+  }
+  if (!strcmp(line, "/resume") || !strncmp(line, "/resume ", 8)) {
+    const char *file = strchr(line, ' ');
+    if (!file || !*++file) {
+      printf(C_RED "usage: /resume FILE\n" C_RESET);
+      return 0;
+    }
+    FILE *f = fopen(file, "r");
+    if (!f) { printf(C_RED "cannot open %s\n" C_RESET, file); return 0; }
+    char buf[65536];
+    long n = 0;
+    while (fgets(buf, sizeof buf, f))
+      if (buf[0] == 'U') { motiris_add_user(a, buf + 1); n++; }
+    fclose(f);
+    printf(C_DIM "[loaded %ld turns from %s]\n" C_RESET, n, file);
     return 0;
   }
   return -1; /* not a command */
@@ -217,9 +263,21 @@ int motiris_repl(MotirisAgent *a) {
   struct stat hst;
   int first_run = stat(hist, &hst) || hst.st_size == 0;
 
+  /* interactive sessions log to ~/.local/share/motiris/sessions/ */
+  if (isatty(0)) {
+    char id[64];
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char ts[32];
+    strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", &tmv);
+    snprintf(id, sizeof id, "repl-%s-%ld", ts, (long)getpid());
+    sess_id = strdup(id);
+  }
+
   print_banner(a);
   if (first_run)
-    printf(C_DIM "  try: /help (commands) · /new (reset context) · "
+    printf(C_DIM "  try: /help (commands) · /sessions (review past) · "
            "/tools (tool info)\n" C_RESET);
 
   char *line;
@@ -233,6 +291,7 @@ int motiris_repl(MotirisAgent *a) {
     if (cmd == 0) { free(line); continue; }
 
     motiris_add_user(a, line);
+    if (sess_id) motiris_session_append("sessions", sess_id, 'U', line);
     free(line);
 
     printf(C_DIM "→ you" C_RESET "\n");
@@ -249,6 +308,11 @@ int motiris_repl(MotirisAgent *a) {
     if (color) printf(C_RESET "\n");
     if (rc) fprintf(stderr, C_RED "motiris: %s" C_RESET "\n",
                     motiris_last_error(a));
+    if (sess_id && reply_len > 0) {
+      motiris_session_append("sessions", sess_id, 'A', reply_buf);
+      reply_len = 0;
+      if (reply_buf) reply_buf[0] = '\0';
+    }
     if (di || dout)
       printf(C_DIM "[tokens " C_RESET C_CYAN "↑%ld" C_RESET C_DIM
              " " C_RESET C_GREEN "↓%ld" C_RESET C_DIM
