@@ -121,6 +121,11 @@ void motiris_free(MotirisAgent *a) {
 void motiris_set_model(MotirisAgent *a, const char *m) {
   free(a->model); a->model = sdup(m);
 }
+const char *motiris_model(MotirisAgent *a) { return a->model; }
+int motiris_tool_count(MotirisAgent *a) { return a->ntools; }
+const char *motiris_tool_name(MotirisAgent *a, int i) {
+  return (i >= 0 && i < a->ntools) ? a->tools[i].name : NULL;
+}
 void motiris_set_base_url(MotirisAgent *a, const char *u) {
   free(a->base_url); a->base_url = sdup(u);
 }
