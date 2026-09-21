@@ -28,7 +28,7 @@ deps/         linenoise (line editing), libcurl dev headers (curl 8.18 ABI)
 
 ```
 make                  # compiles per-component .o -> .a -> motiris
-make test             # offline smoke suite (23 checks, mock LLM/MCP)
+make test             # offline smoke suite (26 checks, mock LLM/MCP)
 make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
 ```
@@ -109,6 +109,13 @@ indexed `--skill-dir` files in place; paths are built from the index
 (`skill_dir` + `file`), never from user input — no workspace guard
 needed (by construction bounded to the skill dir).
 
+Per-tool schemas: `src/tools/toolscan.c` indexes
+`<plugin_dir>/<name>/<name>.json` and `<tools_dir>/<name>/<name>.json`
+(plugin dir = MOTIRIS_PLUGIN_DIR or ~/.motiris/plugins; tools dir =
+MOTIRIS_TOOLS_DIR or ~/.motiris/tools). `motiris_register_tool` swaps
+in the external schema when one exists. `motiris_plugin_dir_default()`
+lives in plugin.c and is shared with toolscan.
+
 ## Tests that must not regress
 
 - Smoke #4: binary stays < 163840 bytes.
@@ -119,3 +126,6 @@ needed (by construction bounded to the skill dir).
 - Smoke #20/#21: skill_patch / skill_write edit real skill files via
   the agent loop (mock model), matching the current schema strings —
   if you change a tool schema, update these mocks.
+- Smoke #24-26: per-tool schema files (override / invalid json / plugin
+  subdir layout) — if you change the merge logic or dir resolution,
+  update these.

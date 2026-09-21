@@ -101,8 +101,9 @@ restarts under `~/.local/share/motiris/gateway/`), exposes
 and optionally requires `Authorization: Bearer $MOTIRIS_GATEWAY_TOKEN`.
 
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
-`MOTIRIS_PLUGIN_DIR`, `MOTIRIS_CURL`, `MOTIRIS_GATEWAY_TOKEN`. Default
-endpoint: `https://api.openai.com/v1/chat/completions`.
+`MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
+`MOTIRIS_GATEWAY_TOKEN`. Default endpoint:
+`https://api.openai.com/v1/chat/completions`.
 
 Built-in tools (disable with `--no-tools`):
 
@@ -162,10 +163,20 @@ int motiris_plugin_init(MotirisAgent *a, const MotirisPluginApi *api) {
 
 ```
 make examples/hello_plugin.so
-mkdir -p ~/.local/share/motiris/plugins
-cp examples/hello_plugin.so ~/.local/share/motiris/plugins/
+mkdir -p ~/.motiris/plugins/hello
+cp examples/hello_plugin.so ~/.motiris/plugins/hello/hello.so
 motiris -p "say hello to iris"   # plugin tool appears to the model automatically
 ```
+
+Per-tool directory layout (tools and plugins share it):
+`<dir>/<name>/{<name>.so, <name>.h, <name>.json}` — the `.json` is the
+tool's JSON-Schema (loaded at startup, overrides the embedded one when
+present, invalid files are skipped with a warning), `.h` is the
+compile-time contract, `.a` (optional) for static linking. Legacy flat
+`<name>.so` plugins still load. Built-in tools use the same override
+path via `MOTIRIS_TOOLS_DIR` (default `~/.motiris/tools`): dropping
+`shell/shell.json` there (see `examples/shell/`) changes the shell
+tool's schema without rebuilding.
 
 ## Development
 

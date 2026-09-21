@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>motiris 架构图</title>
+<style>
+  body { background:#020617; color:#e2e8f0; font-family:"JetBrains Mono",monospace;
+         margin:0; padding:24px; }
+  h1 { font-size:18px; margin:0 0 4px; display:flex; align-items:center; gap:10px; }
+  h1 .dot { width:9px; height:9px; border-radius:50%; background:#22d3ee;
+            box-shadow:0 0 8px #22d3ee; animation:pulse 2s infinite; }
+  @keyframes pulse { 50% { opacity:.35; } }
+  .sub { color:#64748b; font-size:11px; margin:0 0 16px; }
+  svg { background:#020617; border:1px solid #1e293b; border-radius:12px;
+        display:block; margin:0 auto; }
+  text { font-family:"JetBrains Mono",monospace; }
+  .cards { display:flex; gap:16px; max-width:1000px; margin:16px auto 0; }
+  .card { flex:1; background:#0f172a; border:1px solid #1e293b; border-radius:10px;
+          padding:12px 14px; }
+  .card h3 { margin:0 0 8px; font-size:12px; display:flex; align-items:center; gap:8px; }
+  .card ul { margin:0; padding-left:16px; font-size:10.5px; color:#94a3b8; line-height:1.7; }
+  .card-dot { width:7px; height:7px; border-radius:50%; display:inline-block; }
+  footer { text-align:center; color:#475569; font-size:9.5px; margin-top:14px; }
+</style>
+</head>
+<body>
+<h1><span class="dot"></span>motiris — Iris as a mote 架构图</h1>
+<p class="sub">150KB 单二进制 · C11 · libcurl.so.4 唯一运行时依赖 · 本轮改造:REPL 增强 / 会话回顾 / Skill 编辑</p>
+
+<svg viewBox="0 0 1000 780" width="1000" height="780" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+    </pattern>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+            orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+            orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#22d3ee"/>
+    </marker>
+  </defs>
+  <rect width="1000" height="780" fill="url(#grid)"/>
+
+  <g stroke="#64748b" stroke-width="1.3" fill="none" marker-end="url(#arr)">
+    <!-- 入口 → agent 循环 -->
+    <path d="M135 98 L135 158"/>
+    <path d="M375 98 L375 158"/>
+    <path d="M615 98 L615 128 L560 128 L560 158"/>
+    <path d="M860 98 L860 136 L520 136 L520 158"/>
+    <!-- REPL → sessions.c -->
+    <path d="M930 98 L930 158"/>
+    <!-- agent → transport → LLM API -->
+    <path d="M520 195 L578 195"/>
+    <path d="M660 230 L660 243"/>
+    <!-- agent → tools 注册表 -->
+    <path d="M290 230 L290 278"/>
+    <!-- sessions.c → sessions/ 存储 -->
+    <path d="M970 195 L980 195 L980 470 L120 470 L120 518"/>
+    <!-- 技能工具 → skill 目录 -->
+    <path d="M792 374 L792 460 L830 460 L830 518"/>
+  </g>
+
+  <g font-size="10" text-anchor="middle">
+    <rect x="580" y="245" width="210" height="30" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.2"/>
+    <text x="685" y="264" fill="#cbd5e1">LLM API · OpenAI 兼容端点</text>
+  </g>
+
+  <g font-size="11" text-anchor="middle">
+    <!-- 入口层 -->
+    <rect x="30" y="40" width="210" height="58" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="135" y="62" fill="#e2e8f0">CLI · main.c</text>
+    <text x="135" y="78" fill="#7dd3fc" font-size="9">-p / --sessions / --gateway / --cron</text>
+    <rect x="270" y="40" width="210" height="58" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="375" y="62" fill="#e2e8f0">HTTP Gateway · gateway.c</text>
+    <text x="375" y="78" fill="#7dd3fc" font-size="9">session-per-chat_id · token 鉴权</text>
+    <rect x="510" y="40" width="210" height="58" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="615" y="62" fill="#e2e8f0">Cron · cron.c</text>
+    <text x="615" y="78" fill="#7dd3fc" font-size="9">定时任务 · --once</text>
+    <rect x="750" y="40" width="220" height="58" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="860" y="62" fill="#e2e8f0">REPL · repl.c ✳新增</text>
+    <text x="860" y="78" fill="#7dd3fc" font-size="9">banner /sessions /resume /skills</text>
+
+    <!-- 核心层 -->
+    <rect x="30" y="160" width="520" height="70" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="290" y="184" fill="#e2e8f0" font-size="12">Agent 循环 · agent.c</text>
+    <text x="290" y="202" fill="#6ee7b7" font-size="9">装配请求(cJSON) → 多 provider 故障转移 → 工具分发 → 结果回注</text>
+    <text x="290" y="218" fill="#6ee7b7" font-size="9">token 计数(usage) · 工具观察钩子</text>
+
+    <rect x="580" y="160" width="160" height="70" rx="6" fill="rgba(251,146,60,0.3)" stroke="#fb923c" stroke-width="1.5"/>
+    <text x="660" y="182" fill="#e2e8f0">transport.c</text>
+    <text x="660" y="198" fill="#fdba74" font-size="9">libcurl(默认)</text>
+    <text x="660" y="212" fill="#fdba74" font-size="9">spawn-curl / echo</text>
+
+    <rect x="780" y="160" width="190" height="70" rx="6" fill="rgba(251,146,60,0.3)" stroke="#fb923c" stroke-width="1.5"/>
+    <text x="875" y="182" fill="#e2e8f0">sessions.c ✳新增</text>
+    <text x="875" y="198" fill="#fdba74" font-size="9">共享 U/A/T 会话日志</text>
+    <text x="875" y="212" fill="#fdba74" font-size="9">list / append / state_dir</text>
+  </g>
+  <g font-size="10" text-anchor="middle">
+    <rect x="30" y="280" width="940" height="170" rx="10" fill="none" stroke="#34d399" stroke-width="1" stroke-dasharray="4,4"/>
+    <text x="500" y="298" fill="#34d399" font-size="10">Tools 注册表 · ≤128 个(agent.c / tools 各模块)</text>
+
+    <rect x="45" y="310" width="180" height="64" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="135" y="330" fill="#e2e8f0">核心 · tools.c</text>
+    <text x="135" y="346" fill="#a7f3d0" font-size="9">shell(allow/deny 策略)</text>
+    <text x="135" y="360" fill="#a7f3d0" font-size="9">time</text>
+
+    <rect x="240" y="310" width="180" height="64" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="330" y="330" fill="#e2e8f0">文件 · filetools.c</text>
+    <text x="330" y="346" fill="#a7f3d0" font-size="9">read / write / patch / search</text>
+    <text x="330" y="360" fill="#a7f3d0" font-size="9">workspace 守卫</text>
+
+    <rect x="435" y="310" width="180" height="64" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="525" y="330" fill="#e2e8f0">网络/记忆/子代理</text>
+    <text x="525" y="346" fill="#a7f3d0" font-size="9">web_fetch / web_search</text>
+    <text x="525" y="360" fill="#a7f3d0" font-size="9">memory · subagent · browser</text>
+
+    <rect x="630" y="310" width="325" height="64" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+    <text x="792" y="330" fill="#e2e8f0">技能 · skilltools.c ✳新增</text>
+    <text x="792" y="346" fill="#fde68a" font-size="9">skill_list / skill_load</text>
+    <text x="792" y="360" fill="#fde68a" font-size="9">skill_patch / skill_write(同输出入 --skill-dir)</text>
+
+    <rect x="45" y="388" width="400" height="48" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="245" y="408" fill="#e2e8f0">MCP · mcp.c</text>
+    <text x="245" y="424" fill="#a7f3d0" font-size="9">stdio JSON-RPC · 远程工具注册为 &lt;server&gt;:&lt;tool&gt;</text>
+
+    <rect x="460" y="388" width="495" height="48" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="707" y="408" fill="#e2e8f0">插件 · plugin.c</text>
+    <text x="707" y="424" fill="#a7f3d0" font-size="9">.so dlopen · motiris_plugin_init · 工具/钩子注册 · 0 运行时依赖</text>
+  </g>
+  <g font-size="10" text-anchor="middle">
+    <rect x="30" y="490" width="940" height="140" rx="10" fill="none" stroke="#a78bfa" stroke-width="1" stroke-dasharray="4,4"/>
+    <text x="500" y="508" fill="#a78bfa" font-size="10">存储 · ~/.local/share/motiris/(状态目录 · 配置走 ~/.motiris 或 MOTIRIS_HOME)</text>
+
+    <rect x="45" y="520" width="150" height="64" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="120" y="540" fill="#e2e8f0">sessions/ ✳新增</text>
+    <text x="120" y="556" fill="#c4b5fd" font-size="9">REPL 会话日志</text>
+    <text x="120" y="570" fill="#c4b5fd" font-size="9">U/A/T 行</text>
+
+    <rect x="210" y="520" width="150" height="64" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="285" y="540" fill="#e2e8f0">gateway/</text>
+    <text x="285" y="556" fill="#c4b5fd" font-size="9">&lt;chat_id&gt;.log</text>
+    <text x="285" y="570" fill="#c4b5fd" font-size="9">重启重放历史</text>
+
+    <rect x="375" y="520" width="150" height="64" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="450" y="540" fill="#e2e8f0">cron/</text>
+    <text x="450" y="556" fill="#c4b5fd" font-size="9">job 日志</text>
+    <text x="450" y="570" fill="#c4b5fd" font-size="9">rc 记录</text>
+
+    <rect x="540" y="520" width="150" height="64" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="615" y="540" fill="#e2e8f0">memory.json</text>
+    <text x="615" y="556" fill="#c4b5fd" font-size="9">持久记忆</text>
+    <text x="615" y="570" fill="#c4b5fd" font-size="9">memory_set/get</text>
+
+    <rect x="705" y="520" width="250" height="64" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="830" y="540" fill="#e2e8f0">skill 目录 · --skill-dir ✳新增</text>
+    <text x="830" y="556" fill="#c4b5fd" font-size="9">*.md(frontmatter: name/description)</text>
+    <text x="830" y="570" fill="#c4b5fd" font-size="9">skill_patch / skill_write 只改这里</text>
+
+    <rect x="45" y="596" width="250" height="30" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1"/>
+    <text x="170" y="615" fill="#cbd5e1" font-size="9">plugins/ · 插件 .so 目录</text>
+    <rect x="315" y="596" width="340" height="30" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1"/>
+    <text x="485" y="615" fill="#cbd5e1" font-size="9">历史文件 ~/.motiris_history · --save 会话跟踪日志</text>
+  </g>
+
+  <g font-size="10">
+    <rect x="60" y="655" width="20" height="12" rx="3" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.2"/>
+    <text x="88" y="666" fill="#94a3b8">入口层</text>
+    <rect x="155" y="655" width="20" height="12" rx="3" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.2"/>
+    <text x="183" y="666" fill="#94a3b8">核心 / 工具</text>
+    <rect x="255" y="655" width="20" height="12" rx="3" fill="rgba(251,146,60,0.3)" stroke="#fb923c" stroke-width="1.2"/>
+    <text x="283" y="666" fill="#94a3b8">传输 / 会话总线</text>
+    <rect x="380" y="655" width="20" height="12" rx="3" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.2"/>
+    <text x="408" y="666" fill="#94a3b8">存储层</text>
+    <rect x="475" y="655" width="20" height="12" rx="3" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.2"/>
+    <text x="503" y="666" fill="#94a3b8">技能(可编辑)</text>
+    <rect x="610" y="655" width="20" height="12" rx="3" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.2"/>
+    <text x="638" y="666" fill="#94a3b8">外部 / 历史文件</text>
+    <text x="60" y="692" fill="#64748b">✳ 新增 = 本轮改造落地(REPL 增强 / sessions.c / skill 编辑)</text>
+    <text x="60" y="708" fill="#64748b">虚线容器 = 逻辑分组 · 箭头 = 调用/数据流向(默认 slate)</text>
+  </g>
+</svg>
+
+<div class="cards">
+  <div class="card"><div class="card-header"><h3><span class="card-dot" style="background:#22d3ee"></span>入口层</h3></div>
+    <ul><li>CLI / REPL / HTTP 网关 / cron 四个入口共用同一 agent 循环</li>
+        <li>REPL 新增:/sessions /resume /skills + 自动会话日志</li></ul>
+  </div>
+  <div class="card"><div class="card-header"><h3><span class="card-dot" style="background:#34d399"></span>核心 + 工具层</h3></div>
+    <ul><li>agent 循环:model → tool_calls → execute → result</li>
+        <li>tools 注册表 ≤128:内置/文件/网络/记忆/技能/子代理/浏览器/MCP/插件</li></ul>
+  </div>
+  <div class="card"><div class="card-header"><h3><span class="card-dot" style="background:#a78bfa"></span>存储层</h3></div>
+    <ul><li>会话日志统一走 sessions.c(U/A/T 行,网关与 REPL 同格式)</li>
+        <li>skill 编辑工具仅作用于 --skill-dir 索引内文件</li></ul>
+  </div>
+</div>
+
+<footer>motiris · docs/ARCHITECTURE.md · 2026-09-21</footer>
+</body>
+</html>

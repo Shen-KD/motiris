@@ -507,4 +507,89 @@ O15=$(printf '/resume %s/old.log\n/exit\n' "$F23" | "$ROOT/motiris" -i \
 echo "$O15" | grep -q 'loaded 1 turns from' || { echo "FAIL /resume: $O15"; exit 1; }
 rm -rf "$F23"
 
+echo "== 24: per-tool schema file overrides embedded schema"
+F24=$(mktemp -d)
+mkdir -p "$F24/h" "$F24/tools/shell"
+printf '{"type":"object","properties":{"myparam":{"type":"string"}},"required":["myparam"]}' > "$F24/tools/shell/shell.json"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18105/v1/chat/completions"}' > "$F24/h/config.json"
+python3 - <<'PY24' &
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        tools = req.get("tools", [])
+        p = tools[0].get("function",{}).get("parameters",{}) if tools else {}
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"SAW:"+json.dumps(p)}}]}
+        else:
+            tc = {"name":"shell","arguments":json.dumps({"command":"echo hi"})}
+            reply = {"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_24","type":"function","function":tc}]}}]}
+        b = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18105),H).serve_forever()
+PY24
+M24PID=$!
+MOCK_PIDS="$MOCK_PIDS $M24PID"
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -q 18105 && break
+  sleep 0.3
+done
+O24=$(MOTIRIS_HOME="$F24/h" MOTIRIS_TOOLS_DIR="$F24/tools" MOTIRIS_WORKSPACE="$F24" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+echo "$O24" | grep -q 'myparam' || { echo "FAIL schema override: $O24"; exit 1; }
+kill $M24PID 2>/dev/null
+wait $M24PID 2>/dev/null || true
+rm -rf "$F24"
+
+echo "== 25: invalid schema json skipped with warning, run unaffected"
+F25=$(mktemp -d)
+mkdir -p "$F25/tools/bad"
+printf '{this is not json' > "$F25/tools/bad/bad.json"
+O25=$(MOTIRIS_TOOLS_DIR="$F25/tools" "$ROOT/motiris" -p hi --transport echo 2>&1)
+echo "$O25" | grep -q 'invalid JSON' || { echo "FAIL invalid json warn: $O25"; exit 1; }
+echo "$O25" | grep -q 'echo round complete' || { echo "FAIL run after bad schema: $O25"; exit 1; }
+rm -rf "$F25"
+
+echo "== 26: plugin per-tool dir layout (.so + .json schema)"
+F26=$(mktemp -d)
+mkdir -p "$F26/h" "$F26/plugins/hello"
+cp "$ROOT/examples/hello_plugin.so" "$F26/plugins/hello/hello.so"
+printf '{"type":"object","properties":{"who":{"type":"string"}},"required":["who"]}' > "$F26/plugins/hello/hello.json"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18106/v1/chat/completions"}' > "$F26/h/config.json"
+python3 - <<'PY26' &
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        tools = req.get("tools", [])
+        p = {}
+        for t in req.get("tools", []):
+            fn = t.get("function", {})
+            if fn.get("name") == "hello":
+                p = fn.get("parameters", {})
+        msgs = req.get("messages", [])
+        if msgs and msgs[-1].get("role") == "tool":
+            reply = {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"PSAW:"+json.dumps(p)}}]}
+        else:
+            tc = {"name":"hello","arguments":json.dumps({"name":"iris"})}
+            reply = {"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_26","type":"function","function":tc}]}}]}
+        b = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.HTTPServer(("127.0.0.1",18106),H).serve_forever()
+PY26
+M26PID=$!
+MOCK_PIDS="$MOCK_PIDS $M26PID"
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -q 18106 && break
+  sleep 0.3
+done
+O26=$(MOTIRIS_HOME="$F26/h" MOTIRIS_PLUGIN_DIR="$F26/plugins" MOTIRIS_WORKSPACE="$F26" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+echo "$O26" | grep -q "tool 'hello' registered" || { echo "FAIL plugin subdir load: $O26"; exit 1; }
+echo "$O26" | grep -q 'PSAW.*who' || { echo "FAIL plugin schema: $O26"; exit 1; }
+kill $M26PID 2>/dev/null
+wait $M26PID 2>/dev/null || true
+rm -rf "$F26"
+
 echo "smoke: all tests passed"

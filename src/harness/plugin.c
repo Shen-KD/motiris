@@ -14,6 +14,9 @@
  *   1. MOTIRIS_PLUGIN_DIR env
  *   2. $HOME/.motiris/plugins
  *   3. ./plugins (cwd)
+ * Each plugin can live as <dir>/<name>.so (legacy flat layout) or as a
+ * per-tool directory <dir>/<name>/<name>.so with an optional
+ * <name>.json schema and <name>.h / <name>.a for compile-time use.
  * A missing directory is not an error; a broken .so inside is skipped
  * with a warning to stderr.
  */
