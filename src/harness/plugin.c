@@ -12,7 +12,7 @@
  *
  * Directory resolution order (first existing one wins):
  *   1. MOTIRIS_PLUGIN_DIR env
- *   2. $HOME/.local/share/motiris/plugins
+ *   2. $HOME/.motiris/plugins
  *   3. ./plugins (cwd)
  * A missing directory is not an error; a broken .so inside is skipped
  * with a warning to stderr.
@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <dirent.h>
 #include <dlfcn.h>
 
@@ -32,18 +33,23 @@ static const MotirisPluginApi api = {
   .add_tool_hook = motiris_add_tool_hook,
 };
 
-static char *resolve_dir(const char *dir) {
-  if (dir && *dir) return strdup(dir);
+/* shared with toolscan.c: resolved default plugin dir (strdup'd) */
+char *motiris_plugin_dir_default(void) {
   const char *env = getenv("MOTIRIS_PLUGIN_DIR");
   if (env && *env) return strdup(env);
   const char *home = getenv("HOME");
   if (home) {
-    size_t n = strlen(home) + 40;
+    size_t n = strlen(home) + 32;
     char *p = malloc(n);
-    snprintf(p, n, "%s/.local/share/motiris/plugins", home);
+    snprintf(p, n, "%s/.motiris/plugins", home);
     return p;
   }
   return strdup("./plugins");
+}
+
+static char *resolve_dir(const char *dir) {
+  if (dir && *dir) return strdup(dir);
+  return motiris_plugin_dir_default();
 }
 
 static void load_one(MotirisAgent *a, const char *path) {
@@ -66,6 +72,11 @@ static void load_one(MotirisAgent *a, const char *path) {
     fprintf(stderr, "motiris: plugin %s: init returned error\n", path);
 }
 
+/* Load .so plugins. Both layouts work:
+ *   <dir>/<name>.so            legacy flat layout
+ *   <dir>/<name>/<name>.so     per-tool directory layout
+ * Directories are tried first; a subdir without a matching .so is
+ * skipped silently (its .json schema may still have been indexed). */
 int motiris_load_plugins(MotirisAgent *a, const char *dir) {
   if (motiris_plugin_dir(a) && *motiris_plugin_dir(a)) dir = motiris_plugin_dir(a);
   char *d = resolve_dir(dir);
@@ -75,11 +86,21 @@ int motiris_load_plugins(MotirisAgent *a, const char *dir) {
 
   struct dirent *e;
   while ((e = readdir(dh)) != NULL) {
+    if (e->d_name[0] == '.') continue;
     size_t len = strlen(e->d_name);
-    if (len < 4 || strcmp(e->d_name + len - 3, ".so")) continue;
-    size_t n = strlen(d) + len + 2;
-    char *path = malloc(n);
-    snprintf(path, n, "%s/%s", d, e->d_name);
+    char *path = NULL;
+    if (e->d_type == DT_DIR) {
+      size_t n = strlen(d) + len * 2 + 8;
+      path = malloc(n);
+      snprintf(path, n, "%s/%s/%s.so", d, e->d_name, e->d_name);
+      if (access(path, F_OK)) { free(path); continue; } /* no .so here */
+    } else if (len > 3 && !strcmp(e->d_name + len - 3, ".so")) {
+      size_t n = strlen(d) + len + 2;
+      path = malloc(n);
+      snprintf(path, n, "%s/%s", d, e->d_name);
+    } else {
+      continue;
+    }
     load_one(a, path);
     dlerror(); /* clear any pending error before next dlsym */
     free(path);

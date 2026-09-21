@@ -180,6 +180,9 @@ void motiris_add_user(MotirisAgent *a, const char *msg) {
 void motiris_register_tool(MotirisAgent *a, const MotirisTool *t) {
   if (!t || !t->name || a->ntools >= MAX_TOOLS) return;
   a->tools[a->ntools++] = *t;
+  /* external per-tool schema (toolscan.c) replaces the embedded one */
+  const char *ext = motiris_tool_schema(t->name);
+  if (ext) a->tools[a->ntools - 1].parameters = ext;
 }
 
 void motiris_unregister_tool(MotirisAgent *a, const char *name) {

@@ -223,7 +223,7 @@ int motiris_init_config(void) {
                "MOTIRIS_MODEL=glm-5.1\n"
                "MOTIRIS_BASE_URL="
                "https://token.moi.matrixorigin.cn/v1/chat/completions\n"
-               "MOTIRIS_PLUGIN_DIR=%s/.local/share/motiris/plugins\n",
+               "MOTIRIS_PLUGIN_DIR=%s/.motiris/plugins\n",
                home ? home : "");
     fclose(f);
   } else rc = 1;

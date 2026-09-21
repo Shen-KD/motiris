@@ -115,6 +115,12 @@ char *motiris_shell_policy_check(const char *command);
 int motiris_gateway_run(const char *listen_addr, const char *token,
                         int tools_on, int verbose);  /* blocks; 0 on clean exit */
 
+/* ---- plugin tools: per-tool directory layout (schema files) ---- */
+char *motiris_plugin_dir_default(void);  /* strdup'd; env > ~/.motiris/plugins > ./plugins */
+char *motiris_tools_dir_default(void);   /* strdup'd; env > ~/.motiris/tools */
+void  motiris_tool_scan(const char *plugin_dir);    /* index <dir>/<name>/<name>.json schemas */
+const char *motiris_tool_schema(const char *name);  /* external schema or NULL */
+
 /* ---- sessions: shared U/A/T session-log helpers (--sessions, repl) ---- */
 char *motiris_state_dir(const char *sub);  /* mkdir -p, strdup'd; NULL no HOME */
 int  motiris_session_list(const char *sub, const char *term);   /* prints */

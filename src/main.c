@@ -223,6 +223,7 @@ int main(int argc, char **argv) {
   if (no_tools) motiris_set_tools_enabled(ag, 0);
   if (no_plugin) motiris_set_plugins_enabled(ag, 0);
   if (plugin_dir) motiris_set_plugin_dir(ag, plugin_dir);
+  motiris_tool_scan(plugin_dir);   /* index <dir>/<name>/<name>.json schemas first */
   motiris_register_core_tools(ag);
   if (motiris_tools_enabled(ag)) {
     motiris_register_file_tools(ag);
