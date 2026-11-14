@@ -23,6 +23,13 @@ published by `.github/workflows/release.yml`.
   or keeps working — one extra round, bounded by `--max-steps`.
 - Offline smoke suite grown to 27 checks.
 
+### Fixed
+
+- Gateway request parsing no longer scans unterminated partial headers;
+  malformed input gets `400`, headers over 16 KiB or bodies over 1 MiB
+  get `413`, and receive-buffer allocation is bounded. Added segmented
+  request regressions and an ASAN/UBSAN CI job.
+
 ## [0.1.0] - 2026-09-20
 
 First tagged release. A featherweight C11 agent framework: one binary

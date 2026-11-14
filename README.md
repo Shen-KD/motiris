@@ -103,6 +103,9 @@ The gateway keeps one context per `chat_id` (session logs survive
 restarts under `~/.local/share/motiris/gateway/`), exposes
 `GET /health` and `POST /v1/chat` (`{"chat_id","message","reset"?}`),
 and optionally requires `Authorization: Bearer $MOTIRIS_GATEWAY_TOKEN`.
+Requests are limited to 16 KiB of headers and a 1 MiB body; malformed or
+incomplete requests get `400`, while oversized requests get `413` and the
+connection is closed.
 
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,

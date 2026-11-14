@@ -106,17 +106,93 @@ echo "$OUT" | grep -q 'provider dead failed' || { echo "FAIL: dead not attempted
 
 fi
 if test_in 9; then
-echo "== 9: gateway HTTP service + auth"
+echo "== 9: gateway HTTP service + auth + bounded request parser"
 GW=$(mktemp -d)
 printf '{"transport":"echo","tools":false}' > "$GW/config.json"
-MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18089 --no-tools >/dev/null 2>&1 &
+MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18089 --no-tools >"$GW/gateway.log" 2>&1 &
 GWPID=$!
 MOCK_PIDS="$MOCK_PIDS $GWPID"
-sleep 0.3
+for _i in 1 2 3 4 5 6 7 8; do
+  ss -ltn 2>/dev/null | grep -q 18089 && break
+  sleep 0.3
+done
 H=$(curl -s http://127.0.0.1:18089/health)
 echo "$H" | grep -q '"status":"ok"' || { echo "FAIL health: $H"; kill $GWPID 2>/dev/null; exit 1; }
 R=$(curl -s -X POST http://127.0.0.1:18089/v1/chat -d '{"chat_id":"g1","message":"hi"}')
 echo "$R" | grep -q 'echo round complete' || { echo "FAIL chat: $R"; kill $GWPID 2>/dev/null; exit 1; }
+if ! python3 - <<'PY9'; then
+import socket
+
+PORT = 18089
+
+def request(chunks):
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=3)
+    s.settimeout(3)
+    try:
+        try:
+            for chunk in chunks:
+                s.sendall(chunk)
+            s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        data = b""
+        while True:
+            try:
+                block = s.recv(4096)
+            except ConnectionResetError:
+                break
+            if not block:
+                break
+            data += block
+    finally:
+        s.close()
+    if not data.startswith(b"HTTP/1.1 ") or len(data) < 12:
+        raise AssertionError("invalid/no response: %r" % data[:200])
+    return int(data[9:12])
+
+def expect(chunks, status, label):
+    got = request(chunks)
+    if got != status:
+        raise AssertionError("%s: expected %d, got %d" % (label, status, got))
+
+partial = b"POST /v1/chat HTTP/1.1\r\nHost: localhost"
+expect([partial], 400, "partial header + EOF")
+
+health = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"
+expect([health[i:i + 1] for i in range(len(health))], 200,
+       "byte-segmented header")
+
+body = b'{"chat_id":"segmented","message":"hi"}'
+post = (b"POST /v1/chat HTTP/1.1\r\nHost: localhost\r\n"
+        b"content-length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+expect([post[i:i + 1] for i in range(len(post))], 200,
+       "byte-segmented request body")
+expect([b"POST /v1/chat HTTP/1.1\r\nContent-Length: " +
+        str(len(body) + 5).encode() + b"\r\n\r\n" + body],
+       400, "body EOF before Content-Length")
+expect([b"POST /v1/chat HTTP/1.1\r\nHost: localhost\r\n\r\n" + body],
+       400, "missing Content-Length")
+for value in (b"abc", b"-1", b"12junk", b"1, 1"):
+    expect([b"POST /v1/chat HTTP/1.1\r\nContent-Length: " + value +
+            b"\r\n\r\n"], 400, "invalid Content-Length " + repr(value))
+expect([b"POST /v1/chat HTTP/1.1\r\nContent-Length: 1\r\n"
+        b"Content-Length: 1\r\n\r\n"], 400, "duplicate Content-Length")
+max_body = b" " * 1048576
+expect([b"POST /v1/chat HTTP/1.1\r\nContent-Length: 1048576\r\n\r\n" +
+        max_body], 400, "maximum bounded body reaches JSON validation")
+for value in (b"1048577", b"999999999999999999999999999999"):
+    expect([b"POST /v1/chat HTTP/1.1\r\nContent-Length: " + value +
+            b"\r\n\r\n"], 413, "oversized Content-Length " + repr(value))
+header_prefix = b"GET /health HTTP/1.1\r\nX-Fill: "
+max_header = (header_prefix + b"x" * (16384 - len(header_prefix) - 4) +
+              b"\r\n\r\n")
+expect([max_header], 200, "maximum bounded header")
+expect([max_header[:-4] + b"x" + max_header[-4:]], 413, "oversized header")
+expect([health], 200, "gateway alive after malformed requests")
+PY9
+  cat "$GW/gateway.log" >&2
+  exit 1
+fi
 kill $GWPID 2>/dev/null
 wait $GWPID 2>/dev/null || true
 MOTIRIS_GATEWAY_TOKEN=sekret MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18090 --no-tools >/dev/null 2>&1 &
