@@ -128,6 +128,9 @@ lives in plugin.c and is shared with toolscan.
 - Smoke #9: gateway health/auth plus partial, byte-segmented, malformed
   and oversized requests. Headers are capped at 16 KiB and bodies at
   1 MiB; the receive allocation is capped at their sum plus one NUL byte.
+  Gateway session regressions cover colliding punctuation, case, Unicode,
+  120-byte IDs, restart and 64-session eviction replay, fail-closed identity
+  headers, and exact-ID reset without cross-session deletion.
 - Smoke #14: SSE delta aggregation (first-delta termination).
 - Smoke #16: repl shows tool lines + token stats (streamed tool_calls
   + usage through the mock).

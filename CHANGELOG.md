@@ -29,6 +29,10 @@ published by `.github/workflows/release.yml`.
   malformed input gets `400`, headers over 16 KiB or bodies over 1 MiB
   get `413`, and receive-buffer allocation is bounded. Added segmented
   request regressions and an ASAN/UBSAN CI job.
+- Gateway session logs now use injective hex filenames plus canonical
+  identity headers, preventing cross-chat history leaks after restart or
+  eviction. Legacy sanitized logs are not guessed or merged; invalid
+  ownership fails closed and exact-ID reset does not affect other chats.
 
 ## [0.1.0] - 2026-09-20
 

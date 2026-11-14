@@ -12,8 +12,8 @@
  *        auth: Authorization: Bearer <token> (when token set)
  *
  * Sessions are append-only logged under ~/.local/share/motiris/
- * gateway/<chat_id>.log (U/A/T rows, same format as --save) and user
- * history is replayed when a session file exists.
+ * gateway/<hex(chat_id)>.log (I identity header + U/A/T rows) and user
+ * history is replayed only after the identity header has been verified.
  */
 #include "motiris.h"
 
@@ -29,6 +29,8 @@
 #include <unistd.h>
 
 #define MAX_SESSIONS 64
+#define MAX_CHAT_ID_BYTES 120
+#define MAX_CHAT_ID_ENCODED (MAX_CHAT_ID_BYTES * 2)
 #define MAX_HEADER (16 * 1024)
 #define MAX_BODY (1 << 20)
 
@@ -63,18 +65,28 @@ static void evict_oldest(void) {
   n_sessions--;
 }
 
-/* sanitize chat_id into a safe file name (keep [A-Za-z0-9._-]) */
-static void safe_name(char *out, size_t n, const char *id) {
+/* Lowercase hex is injective over the complete chat_id byte string and
+ * stays within NAME_MAX: 120 input bytes -> 240 chars + ".log". */
+static void encode_chat_id(char out[MAX_CHAT_ID_ENCODED + 1], const char *id) {
+  static const char hex[] = "0123456789abcdef";
   size_t j = 0;
-  for (const char *c = id; *c && j + 1 < n; c++) {
-    char ch = *c;
-    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-        (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-')
-      out[j++] = ch;
-    else
-      out[j++] = '_';
+  for (const unsigned char *p = (const unsigned char *)id; *p; p++) {
+    out[j++] = hex[*p >> 4];
+    out[j++] = hex[*p & 15];
   }
   out[j] = '\0';
+}
+
+static char *session_log_path(const char *chat_id) {
+  const char *h = getenv("HOME");
+  if (!h) return NULL;
+  char encoded[MAX_CHAT_ID_ENCODED + 1];
+  encode_chat_id(encoded, chat_id);
+  size_t n = strlen(h) + strlen(encoded) + 48;
+  char *path = malloc(n);
+  if (path)
+    snprintf(path, n, "%s/.local/share/motiris/gateway/%s.log", h, encoded);
+  return path;
 }
 
 static void mkdir_p(const char *path) {
@@ -85,49 +97,99 @@ static void mkdir_p(const char *path) {
   mkdir(tmp, 0755);
 }
 
-static Session *get_session(const char *chat_id, int tools_on) {
+/* The I row binds the log to its canonical, reversible chat_id encoding.
+ * Legacy U/A/T-only files have no proof of ownership and are rejected. */
+static int write_log_header(FILE *f, const char *chat_id) {
+  char encoded[MAX_CHAT_ID_ENCODED + 1];
+  encode_chat_id(encoded, chat_id);
+  return fprintf(f, "I%s\n", encoded) < 0 || fflush(f) ? -1 : 0;
+}
+
+static int check_log_header(FILE *f, const char *chat_id) {
+  char encoded[MAX_CHAT_ID_ENCODED + 1];
+  char expected[MAX_CHAT_ID_ENCODED + 3];
+  char actual[MAX_CHAT_ID_ENCODED + 3];
+  encode_chat_id(encoded, chat_id);
+  snprintf(expected, sizeof expected, "I%s\n", encoded);
+  return !fgets(actual, sizeof actual, f) || strcmp(actual, expected) ? -1 : 0;
+}
+
+static int load_session_log(Session *s, const char **error) {
+  FILE *f = fopen(s->log_path, "r");
+  if (!f) {
+    if (errno != ENOENT) { *error = "cannot open session log"; return -1; }
+    f = fopen(s->log_path, "w");
+    if (!f) { *error = "cannot create session log"; return -1; }
+    int rc = write_log_header(f, s->chat_id);
+    if (fclose(f)) rc = -1;
+    if (rc) *error = "cannot initialize session log";
+    return rc;
+  }
+  if (check_log_header(f, s->chat_id)) {
+    fclose(f);
+    *error = "session log ownership mismatch";
+    return -1;
+  }
+  /* Replay only rows following the verified identity header. */
+  char line[65536];
+  while (fgets(line, sizeof line, f))
+    if (line[0] == 'U') motiris_add_user(s->agent, line + 1);
+  int rc = ferror(f);
+  fclose(f);
+  if (rc) { *error = "cannot read session log"; return -1; }
+  return 0;
+}
+
+static Session *get_session(const char *chat_id, int tools_on,
+                            const char **error) {
   Session *s = find_session(chat_id);
   if (s) return s;
-  if (n_sessions >= MAX_SESSIONS) evict_oldest();
+  *error = "could not create session";
 
   s = calloc(1, sizeof *s);
+  if (!s) return NULL;
   s->chat_id = strdup(chat_id);
   s->agent = motiris_new();
+  if (!s->chat_id || !s->agent) goto fail;
   motiris_apply_config(s->agent);   /* model/base_url/transport from config */
   if (tools_on) motiris_register_core_tools(s->agent);
 
-  /* per-chat session log: $HOME/.local/share/motiris/gateway/<chat>.log */
-  const char *h = getenv("HOME");
-  if (h) {
-    char ch[128];
-    safe_name(ch, sizeof ch, chat_id);
-    size_t n = strlen(h) + 64;
-    char *dir = malloc(n);
-    snprintf(dir, n, "%s/.local/share/motiris/gateway", h);
+  /* Per-chat log: gateway/<lowercase-hex(chat_id)>.log. */
+  if (getenv("HOME")) {
+    s->log_path = session_log_path(chat_id);
+    if (!s->log_path) goto fail;
+    char *dir = strdup(s->log_path);
+    if (!dir) goto fail;
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = '\0';
     mkdir_p(dir);
-    s->log_path = malloc(n);
-    snprintf(s->log_path, n, "%s/%s.log", dir, ch);
     free(dir);
-    /* replay user history so context survives restarts */
-    FILE *f = fopen(s->log_path, "r");
-    if (f) {
-      char line[65536];
-      while (fgets(line, sizeof line, f))
-        if (line[0] == 'U') motiris_add_user(s->agent, line + 1);
-      fclose(f);
-    }
+    if (load_session_log(s, error)) goto fail;
   }
+  if (n_sessions >= MAX_SESSIONS) evict_oldest();
   s->next = sessions;
   sessions = s;
   n_sessions++;
   return s;
+
+fail:
+  motiris_free(s->agent);
+  free(s->chat_id);
+  free(s->log_path);
+  free(s);
+  return NULL;
 }
 
 /* append messages added since the given index to the session log */
 static void log_new_messages(Session *s, int from_index) {
   if (!s->log_path) return;
-  FILE *f = fopen(s->log_path, "a");
+  FILE *f = fopen(s->log_path, "r+");
   if (!f) return;
+  if (check_log_header(f, s->chat_id) || fseek(f, 0, SEEK_END)) {
+    fprintf(stderr, "motiris gateway: refusing unverified session log append\n");
+    fclose(f);
+    return;
+  }
   cJSON *msgs = motiris_messages(s->agent);
   int i = 0;
   for (cJSON *m = msgs->child; m; m = m->next, i++) {
@@ -370,11 +432,22 @@ static void handle_connection(int fd, int tools_on) {
     goto out;
   }
 
-  if (cJSON_IsTrue(jrst)) { /* reset: drop remembered context */
+  if (strlen(chat_id) > MAX_CHAT_ID_BYTES) {
+    send_err(fd, 400, "chat_id exceeds 120-byte limit");
+    goto out;
+  }
+
+  if (cJSON_IsTrue(jrst)) { /* reset: drop only this exact chat_id's log */
+    char *path = session_log_path(chat_id);
+    if (path && unlink(path) && errno != ENOENT) {
+      free(path);
+      send_err(fd, 500, "cannot reset session log");
+      goto out;
+    }
+    free(path);
     Session *s = find_session(chat_id);
     if (s) {
       motiris_free(s->agent);
-      if (s->log_path) unlink(s->log_path);
       /* unlink from list */
       Session **pp = &sessions;
       while (*pp && *pp != s) pp = &(*pp)->next;
@@ -384,7 +457,12 @@ static void handle_connection(int fd, int tools_on) {
     }
   }
 
-  Session *s = get_session(chat_id, tools_on);
+  const char *session_error = NULL;
+  Session *s = get_session(chat_id, tools_on, &session_error);
+  if (!s) {
+    send_err(fd, 500, session_error ? session_error : "could not create session");
+    goto out;
+  }
   int before = (int)cJSON_GetArraySize(motiris_messages(s->agent));
   motiris_add_user(s->agent, message);
 

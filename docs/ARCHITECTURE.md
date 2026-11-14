@@ -76,7 +76,8 @@ skill_write 工具。
 **会话日志(U/A/T 行)**:所有入口统一走 `sessions.c`。
 - REPL(tty 下):每轮写 `U<用户行>`,`T<工具名>(<参数摘要>) -> <结果摘要>`
   (工具钩子),回合结束写 `A<完整回复>`
-- 网关:`gateway/<chat_id>.log`,启动时按 U 行重放历史
+- 网关:`gateway/<hex(chat_id)>.log`,首行 I 记录完整 ID 的 hex 归属;
+  校验后按 U 行重放历史,旧 sanitize 文件名不迁移、不归并重放
 - `--sessions` / `/sessions [TERM]`:`motiris_session_list("gateway"|"sessions", term)`
 - `/resume FILE`:读取日志的 U 行注入当前上下文
 
@@ -90,7 +91,7 @@ skill_write 按索引构造路径(`skill_dir` + `file`,不经用户输入,天然
 ```
 ~/.local/share/motiris/
 ├── sessions/        repl 会话日志 repl-YYYYMMDD-HHMMSS-<pid>.log
-├── gateway/         <chat_id>.log(网关会话,可被 /resume 复用)
+├── gateway/         <hex(chat_id)>.log(网关会话,I 归属头 + U/A/T 行)
 ├── cron/            <job_id>.log
 ├── memory.json      持久记忆
 └── plugins/         插件 .so
