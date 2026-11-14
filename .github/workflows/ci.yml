@@ -11,7 +11,7 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     needs: [build, clang, test-core, test-tools, test-repl, test-skills,
-            test-schema, test-goal, plugins, tools]
+            test-schema, test-goal, plugins, tools, sanitizers]
     steps:
       - run: echo "all gating jobs passed"
 
@@ -114,6 +114,24 @@ jobs:
           make clean
           make libmotiris_core.a libmotiris_tools.a libmotiris_harness.a \
             CC=clang CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE"
+
+  # memory/undefined-behavior guard for gateway framing and tool paths
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build with ASAN/UBSAN
+        run: |
+          make clean
+          make CFLAGS="-O1 -g -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -fsanitize=address,undefined -fno-omit-frame-pointer" \
+            LDFLAGS="-fsanitize=address,undefined -Wl,-l:libcurl.so.4"
+
+      - name: tools smoke under ASAN/UBSAN
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: sh tests/smoke.sh tools
 
   # performance & resource guard: cold-start latency, peak RSS, agent-loop
   # overhead. Informational check (not required for merge).

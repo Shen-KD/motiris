@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #define MAX_SESSIONS 64
+#define MAX_HEADER (16 * 1024)
 #define MAX_BODY (1 << 20)
 
 /* ---------------- session table ---------------- */
@@ -153,11 +154,15 @@ static void send_json(int fd, int code, cJSON *body) {
   char *s = cJSON_PrintUnformatted(body);
   cJSON_Delete(body);
   char hdr[256];
+  const char *reason = code == 200 ? "OK" :
+                       code == 401 ? "Unauthorized" :
+                       code == 404 ? "Not Found" :
+                       code == 413 ? "Payload Too Large" :
+                       code == 500 ? "Internal Server Error" : "Bad Request";
   snprintf(hdr, sizeof hdr,
            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
            "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-           code, code == 200 ? "OK" : (code == 404 ? "Not Found"
-                            : "Bad Request"), strlen(s));
+           code, reason, strlen(s));
   ssize_t w1 = write(fd, hdr, strlen(hdr));
   ssize_t w2 = write(fd, s, strlen(s));
   (void)w1; (void)w2;
@@ -170,27 +175,107 @@ static void send_err(int fd, int code, const char *msg) {
   send_json(fd, code, e);
 }
 
-/* read full request (headers + body); returns malloc'd request, or NULL */
-static char *read_request(int fd) {
-  size_t cap = 8192, len = 0;
-  char *buf = malloc(cap);
+/* Find the end of the header block without reading past received bytes. */
+static size_t find_header_end(const char *buf, size_t len, size_t start) {
+  if (len < 4) return 0;
+  for (size_t i = start; i <= len - 4; i++)
+    if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+        buf[i + 2] == '\r' && buf[i + 3] == '\n')
+      return i + 4;
+  return 0;
+}
+
+static int is_content_length(const char *line, size_t len) {
+  static const char name[] = "content-length:";
+  if (len < sizeof name - 1) return 0;
+  for (size_t i = 0; i < sizeof name - 1; i++) {
+    char c = line[i];
+    if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+    if (c != name[i]) return 0;
+  }
+  return 1;
+}
+
+/* 0 = valid, -1 = malformed, 1 = body exceeds MAX_BODY. */
+static int parse_content_length(const char *req, size_t header_len,
+                                size_t *body_len) {
+  size_t pos = 0;
+  int seen = 0;
+  *body_len = 0;
+  while (pos < header_len) {
+    size_t end = pos;
+    while (end + 1 < header_len &&
+           !(req[end] == '\r' && req[end + 1] == '\n')) end++;
+    if (end + 1 >= header_len) return -1;
+    if (is_content_length(req + pos, end - pos)) {
+      size_t i = pos + 15, value = 0;
+      if (seen) return -1;
+      seen = 1;
+      while (i < end && (req[i] == ' ' || req[i] == '\t')) i++;
+      if (i == end || req[i] < '0' || req[i] > '9') return -1;
+      for (; i < end && req[i] >= '0' && req[i] <= '9'; i++) {
+        unsigned int digit = (unsigned int)(req[i] - '0');
+        if (value > (MAX_BODY - digit) / 10) return 1;
+        value = value * 10 + digit;
+      }
+      while (i < end && (req[i] == ' ' || req[i] == '\t')) i++;
+      if (i != end) return -1;
+      *body_len = value;
+    }
+    pos = end + 2;
+  }
+  return 0;
+}
+
+/* Read one bounded request. The allocation is at most
+ * MAX_HEADER + MAX_BODY + 1 bytes, including the trailing NUL. */
+static char *read_request(int fd, int *status) {
+  size_t cap = 8192, len = 0, header_len = 0, body_len = 0, searched = 0;
+  char *buf = malloc(cap + 1);
+  *status = 500;
+  if (!buf) return NULL;
   for (;;) {
-    ssize_t n = read(fd, buf + len, cap - len - 1);
-    if (n <= 0) break;
+    if (len == cap) {
+      size_t limit = header_len ? header_len + body_len : MAX_HEADER;
+      if (cap >= limit) { *status = 413; goto fail; }
+      size_t next = cap > limit / 2 ? limit : cap * 2;
+      char *tmp = realloc(buf, next + 1);
+      if (!tmp) { *status = 500; goto fail; }
+      buf = tmp;
+      cap = next;
+    }
+    ssize_t n = read(fd, buf + len, cap - len);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      *status = 400;
+      goto fail;
+    }
+    if (n == 0) { *status = 400; goto fail; }
     len += (size_t)n;
-    if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
-    /* parse Content-Length to know when the body is complete */
-    if (strstr(buf, "\r\n\r\n")) {
-      char *cl = strstr(buf, "Content-Length:");
-      long body = 0;
-      if (cl) body = atol(cl + 15);
-      char *head_end = strstr(buf, "\r\n\r\n");
-      long have = (long)(len - (size_t)(head_end - buf) - 4);
-      if (have >= body) break;
+    if (!header_len) {
+      /* Recheck only the three-byte overlap and newly received bytes. */
+      size_t start = searched > 3 ? searched - 3 : 0;
+      header_len = find_header_end(buf, len, start);
+      searched = len;
+      if (header_len) {
+        int cl = parse_content_length(buf, header_len, &body_len);
+        if (cl < 0) { *status = 400; goto fail; }
+        if (cl > 0) { *status = 413; goto fail; }
+      } else if (len == MAX_HEADER) {
+        *status = 413;
+        goto fail;
+      }
+    }
+    if (header_len && len - header_len >= body_len) {
+      len = header_len + body_len; /* ignore pipelined/extra bytes */
+      buf[len] = '\0';
+      *status = 0;
+      return buf;
     }
   }
-  buf[len] = '\0';
-  return buf;
+fail:
+  free(buf);
+  return NULL;
 }
 
 static const char *header_of(const char *req, const char *name) {
@@ -240,8 +325,15 @@ static char *last_reply(MotirisAgent *a) {
 }
 
 static void handle_connection(int fd, int tools_on) {
-  char *req = read_request(fd);
-  if (!req) { close(fd); return; }
+  int read_status = 0;
+  char *req = read_request(fd, &read_status);
+  if (!req) {
+    const char *msg = read_status == 413 ? "request too large" :
+                      read_status == 500 ? "out of memory" : "malformed request";
+    send_err(fd, read_status, msg);
+    close(fd);
+    return;
+  }
 
   int bad_token = 0;
   cJSON *body = NULL;

@@ -37,10 +37,11 @@ CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
 on main): `build` (gcc clean compile+link, size guard, artifact),
 `clang` (full -Werror build), `test-core` / `test-tools` / `test-repl` /
-`test-skills` / `test-schema` (component-scoped smoke groups, see
-`tests/smoke.sh <group>`), `plugins` (example .so with gcc + clang
--Werror), `tools` (component static libs compile independently with
-clang -Werror). `perf` and `compat-matrix` are informational
+`test-skills` / `test-schema` / `test-goal` (component-scoped smoke
+groups, see `tests/smoke.sh <group>`), `plugins` (example .so with gcc +
+clang -Werror), `tools` (component static libs compile independently
+with clang -Werror), and `sanitizers` (ASAN/UBSAN tools smoke).
+`perf` and `compat-matrix` are informational
 (ubuntu 22.04 gcc-11 / 24.04 gcc-13 / 26.04 gcc-15 / centos-stream9
 container / clang).
 
@@ -124,6 +125,9 @@ lives in plugin.c and is shared with toolscan.
 ## Tests that must not regress
 
 - Smoke #4: binary stays < 163840 bytes.
+- Smoke #9: gateway health/auth plus partial, byte-segmented, malformed
+  and oversized requests. Headers are capped at 16 KiB and bodies at
+  1 MiB; the receive allocation is capped at their sum plus one NUL byte.
 - Smoke #14: SSE delta aggregation (first-delta termination).
 - Smoke #16: repl shows tool lines + token stats (streamed tool_calls
   + usage through the mock).
