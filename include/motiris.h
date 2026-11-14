@@ -102,6 +102,14 @@ void motiris_register_subagent_tools(MotirisAgent *a);  /* subagent */
 void motiris_register_browser_tools(MotirisAgent *a);  /* browser_fetch */
 int  motiris_tools_enabled(MotirisAgent *a);
 
+/* Optional host-backed vision tool (Makefile VISION_TOOLS=1). */
+#ifdef MOTIRIS_VISION_TOOLS
+void motiris_register_vision_tools(MotirisAgent *a);
+const char *motiris_base_url(MotirisAgent *a);
+const char *motiris_api_key(MotirisAgent *a);
+const char *motiris_transport_name(MotirisAgent *a);
+#endif
+
 /* ---- centralized config: $HOME/.motiris/{env,config.json} ---- */
 void motiris_load_env(void);                  /* call before new() */
 void motiris_apply_config(MotirisAgent *a);   /* defaults, CLI wins */

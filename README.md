@@ -36,6 +36,9 @@ agent process stays idle-quiet between requests.
   into a plugins directory; motiris dlopens them at startup and they
   register tools through a small plugin API. Add a tool without touching
   the core binary.
+- **Optional vision tool** — `VISION_TOOLS=1` adds workspace-bounded image
+  input to a configured remote vision provider and returns bounded text.
+  The default build contains no vision code and no image inference runtime.
 - **Sessions** — append-only trace log (`--save`), resume replay (`-r`);
   the repl auto-logs every interactive session to
   `~/.local/share/motiris/sessions/` (gateway format) with
@@ -76,13 +79,18 @@ make                  # cc -O2, single binary ./motiris (stripped)
 make test             # offline smoke tests, no API key required
 make FILE_TOOLS=0     # cut the POSIX file backend; bounded stubs remain
 make test-nofs        # strict-C11 core probe + file-backend cut test
+make test-vision      # clean optional-vision build + local mock integration
+make VISION_TOOLS=1   # opt in to the host-backed vision_analyze tool
 ```
 
 Requires: a C11 compiler and the libcurl shared library at runtime
 (libcurl dev headers are vendored in `deps/libcurl/`, pinned to the
 curl 8.18 ABI). No other dependencies. `FILE_TOOLS=0` replaces only the
 optional file tools with fixed-error stubs; other host tools and the CLI still
-use their documented OS facilities. `make test-core-nofs` separately builds
+use their documented OS facilities. `VISION_TOOLS=1` is a separate opt-in with
+its own POSIX file and libcurl network backend; it remains excluded when
+`FILE_TOOLS=0` unless both switches are explicitly enabled. Run `make clean`
+when changing either compile-time switch. `make test-core-nofs` separately builds
 the core loop/config/echo transport as strict C11 without POSIX file I/O or
 libcurl. That core-only probe is not a claim of MCU/RTOS support; see
 [docs/DEVELOPING.md](docs/DEVELOPING.md) for the platform matrix and bounds.
@@ -122,7 +130,9 @@ provider; `"reset":true` removes only that exact ID's log and starts fresh.
 
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
-`MOTIRIS_GATEWAY_TOKEN`. Default endpoint:
+`MOTIRIS_GATEWAY_TOKEN`, `MOTIRIS_VISION_MODEL`,
+`MOTIRIS_VISION_BASE_URL`, `MOTIRIS_VISION_API_KEY`,
+`MOTIRIS_VISION_MAX_BYTES`, `MOTIRIS_VISION_TIMEOUT_S`. Default endpoint:
 `https://api.openai.com/v1/chat/completions`.
 
 Built-in tools (disable with `--no-tools`):
@@ -155,6 +165,21 @@ Knowledge & delegation tools:
 - `subagent(task)` — run a fresh `motiris` child (no tools, isolated)
 - `browser_fetch(url)` — render via headless chromium (`--dump-dom`),
   needs a chromium binary; `MOTIRIS_BROWSER` overrides
+
+Optional host-backed tool (only with `VISION_TOOLS=1`):
+
+- `vision_analyze(path, mime, question?)` — read one non-empty regular image
+  inside `MOTIRIS_WORKSPACE` (or cwd), encode it as a data URL, and send one
+  text + `image_url` request to an OpenAI-compatible provider. JPEG, PNG, GIF
+  and WebP MIME labels are accepted. Input defaults to 256 KiB and is hard-
+  capped at 1 MiB (`MOTIRIS_VISION_MAX_BYTES`); total request timeout defaults
+  to 30 s and is capped at 120 s (`MOTIRIS_VISION_TIMEOUT_S`). Provider
+  responses are capped at 64 KiB and returned descriptions at 16 KiB.
+  `MOTIRIS_VISION_MODEL`, `MOTIRIS_VISION_BASE_URL` and
+  `MOTIRIS_VISION_API_KEY` override the agent's model/endpoint/key. Images
+  leave the device: configure only a trusted provider. Redirects are not
+  followed; errors return bounded JSON and the outer agent can continue in
+  text. This is not local inference, video, generation, or MCU support.
 
 MCP servers (`"mcp_servers": [{"name","cmd","args":[]}]` in config.json)
 register each remote tool as `<server>:<tool>`; `tools/call` is bridged
@@ -222,6 +247,7 @@ src/memorytools.c      persistent memory tools
 src/skilltools.c       SKILL.md index + on-demand load
 src/subagent.c         child-agent delegation tool
 src/browser.c          headless chromium fetch
+src/tools/visiontools.c optional bounded vision provider tool
 src/mcp.c              MCP stdio client (JSON-RPC)
 src/gateway.c          embedded HTTP gateway (session-per-chat_id)
 src/cron.c             scheduled agent runs
@@ -237,8 +263,9 @@ Dockerfile.test        isolated test image (make test-docker)
 ## Testing
 
 ```
-make test          # offline smoke suite (13 checks, no network/key needed)
-make test-docker   # same suite inside a throwaway debian container
+make test          # 27 default offline smoke checks, no network/key needed
+make test-vision   # optional vision build + 10 local-mock integration cases
+make test-docker   # default suite inside a throwaway debian container
                    # (clean HOME/ports/processes, mirrors CI)
 ```
 
