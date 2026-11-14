@@ -59,6 +59,9 @@ void motiris_register_core_tools(MotirisAgent *a) {
   if (!a->tools_on) return;
   for (int i = 0; i < motiris_register_core_tools_count(); i++)
     motiris_register_tool(a, &motiris_core_tools()[i]);
+#ifdef MOTIRIS_VISION_TOOLS
+  motiris_register_vision_tools(a);
+#endif
 }
 
 static char *sdup(const char *s) {
@@ -144,6 +147,11 @@ void motiris_set_api_key(MotirisAgent *a, const char *k) {
 void motiris_set_transport(MotirisAgent *a, const char *n) {
   snprintf(a->transport, sizeof a->transport, "%s", n ? n : "auto");
 }
+#ifdef MOTIRIS_VISION_TOOLS
+const char *motiris_base_url(MotirisAgent *a) { return a->base_url; }
+const char *motiris_api_key(MotirisAgent *a) { return a->api_key; }
+const char *motiris_transport_name(MotirisAgent *a) { return a->transport; }
+#endif
 void motiris_set_stream(MotirisAgent *a, int on) { a->stream = !!on; }
 void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                            void *ud) { a->on_delta = cb; a->delta_ud = ud; }

@@ -33,6 +33,8 @@ make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
 make FILE_TOOLS=0     # optional POSIX file backend -> bounded stubs
 make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
+make VISION_TOOLS=1   # opt in to host-backed vision_analyze
+make test-vision      # clean optional build + bounded local-provider tests
 ```
 
 ### Platform matrix and file-search resource bounds
@@ -41,6 +43,7 @@ make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
 | --- | --- | --- |
 | Linux gcc / clang | `make`, `make test`, CI `-Werror` and ASAN/UBSAN | Full host CLI; libcurl and POSIX tools enabled |
 | Host CLI without file backend | `make test-nofs` (`FILE_TOOLS=0`) | Excludes `filetools.c`; `filetools_nofs.c` returns a fixed bounded error for all four file tools. Other host tools/harness are unchanged |
+| Optional host vision | `make test-vision` (`VISION_TOOLS=1`) | One workspace-local image to a configured remote provider; separate POSIX file + libcurl backend, excluded by default and not local inference |
 | Portable core-only probe | `make test-core-nofs` | Strict C11 `-Werror`; core loop/config/echo transport + cJSON, no POSIX feature macros, filesystem I/O or libcurl. A small test adapter supplies tool/schema registries; this is not the full CLI |
 | MCU / RTOS | **待定 / 未验证** | Chip, RTOS, cross-toolchain, RAM/Flash and hardware test matrix have not been supplied; host results are not MCU support claims |
 
@@ -84,6 +87,42 @@ The no-filesystem switch does not make unrelated host tools, HTTP transports,
 plugins, sessions or gateway MCU-portable. A real target port still needs its
 own HAL/RTOS backends and measured RAM/Flash budget.
 
+### Optional vision bounds and measurements
+
+`VISION_TOOLS=1` compiles `src/tools/visiontools.c` and three agent getters;
+`VISION_TOOLS=0` filters out the source and all conditional core references.
+The tool has only per-call state and a per-agent context pointer. It does not
+retain image bytes, start threads, run inference, spawn processes or add a
+runtime dependency beyond the existing host libcurl/POSIX backend. Its file
+backend is independent of `FILE_TOOLS`; no RTOS/HAL input adapter is claimed.
+
+For an input of `n` bytes, configuration enforces `1 <= n <= 1,048,576`
+(default limit 262,144). Base64 length is `b = 4 * ceil(n / 3)`. The encoding
+phase owns at most `n + b` image bytes. The raw input is then freed; the data
+URL is referenced (not duplicated) by cJSON, so request serialization owns
+about `2 * b` plus a question capped at 4 KiB and a fixed set of JSON nodes.
+Network receive storage is capped at 64 KiB. Parsed provider text is bounded
+by that response, the returned copy is capped at 16 KiB, and worst-case JSON
+escaping of that copy is below 96 KiB. These are phase-wise application-owned
+bounds, not a claim about libcurl/libc internals or the outer agent history.
+The total timeout is configurable from 1 to 120 s (default 30 s); redirects
+are disabled and there is no background/idle network activity.
+
+Reference host measurements on 2026-11-15 (Linux x86_64, gcc `-O2`, stripped;
+baseline `0cfb043`) are:
+
+| Build / measurement | Bytes / RSS | Relative result |
+| --- | ---: | ---: |
+| Default full CLI | 157,944 bytes; text 144,405; data 2,648; BSS 167,960 | baseline; vision source/references compiled out |
+| `VISION_TOOLS=1` full CLI | 166,136 bytes; text 153,541; data 2,656; BSS 167,960 | +8,192 total; +9,136 text; +8 data; BSS unchanged |
+| Maximum 1 MiB image through local mock | 14,320 KiB peak process RSS | Includes outer agent, libcurl, mock round-trip and serialization; not an MCU RAM budget |
+
+`tests/vision.sh` verifies the exact data URL bytes/MIME and content blocks,
+invalid MIME, configurable and hard input caps, workspace escape refusal,
+disconnected/HTTP providers, response/description caps and the exact 1 MiB
+round-trip. No MCU cross-toolchain, target Flash/RAM or hardware validation
+is available; all numbers above are host-only.
+
 CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
 on main): `build` (gcc clean compile+link, size guard, artifact),
@@ -92,7 +131,8 @@ on main): `build` (gcc clean compile+link, size guard, artifact),
 groups, see `tests/smoke.sh <group>`), `plugins` (example .so with gcc +
 clang -Werror), `tools` (component static libs compile independently
 with clang -Werror), `no-filesystem` (strict-C11 core and optional file
-backend cut), and `sanitizers` (ASAN/UBSAN tools smoke).
+backend cut), `vision` (optional local-mock integration and clang `-Werror`),
+and `sanitizers` (ASAN/UBSAN tools smoke).
 `perf` and `compat-matrix` are informational
 (ubuntu 22.04 gcc-11 / 24.04 gcc-13 / 26.04 gcc-15 / centos-stream9
 container / clang).
@@ -143,6 +183,12 @@ const MotirisPluginApi*)`. The api currently offers
 `register_tool` / `unregister_tool` / `add_tool_hook`
 (tool-call observers; multi-slot, appended — the repl's hook and
 plugin hooks coexist).
+
+Optional vision: `VISION_TOOLS=1` registers `vision_analyze` through the same
+per-agent registry in CLI, REPL, gateway and cron builds. The optional getters
+`motiris_base_url` / `motiris_api_key` / `motiris_transport_name` expose the
+selected default provider without making the agent struct public. Vision-specific
+`MOTIRIS_VISION_*` overrides are read per call; no global session state is added.
 
 Agent callbacks:
 

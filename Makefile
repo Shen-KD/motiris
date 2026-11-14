@@ -22,12 +22,19 @@ LDFLAGS ?= -Wl,-l:libcurl.so.4
 PREFIX  ?= /usr/local
 
 FILE_TOOLS ?= 1
+VISION_TOOLS ?= 0
 CORE_SRC    = $(wildcard src/core/*.c)
 TOOLS_ALL   = $(wildcard src/tools/*.c)
-ifeq ($(FILE_TOOLS),0)
-TOOLS_SRC   = $(filter-out src/tools/filetools.c,$(TOOLS_ALL))
+ifeq ($(VISION_TOOLS),0)
+TOOLS_AVAILABLE = $(filter-out src/tools/visiontools.c,$(TOOLS_ALL))
 else
-TOOLS_SRC   = $(filter-out src/tools/filetools_nofs.c,$(TOOLS_ALL))
+TOOLS_AVAILABLE = $(TOOLS_ALL)
+CPPFLAGS += -DMOTIRIS_VISION_TOOLS=1
+endif
+ifeq ($(FILE_TOOLS),0)
+TOOLS_SRC   = $(filter-out src/tools/filetools.c,$(TOOLS_AVAILABLE))
+else
+TOOLS_SRC   = $(filter-out src/tools/filetools_nofs.c,$(TOOLS_AVAILABLE))
 endif
 HARNESS_SRC = $(wildcard src/harness/*.c)
 CORE_OBJ    = $(CORE_SRC:.c=.o)
@@ -61,6 +68,12 @@ examples/hello_plugin.so: examples/hello_plugin.c include/motiris.h
 
 test: motiris
 	sh tests/smoke.sh
+
+# Optional host-backed vision tool; clean rebuild isolates its compile flag.
+test-vision:
+	$(MAKE) clean
+	$(MAKE) VISION_TOOLS=1 motiris
+	sh tests/vision.sh
 
 # Core-only portability probe: strict C11, no POSIX/file I/O/libcurl.
 # The small test adapter supplies only tool/schema registries and invokes echo.
@@ -110,4 +123,4 @@ clean:
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test test-core-nofs test-nofs test-docker clean install
+.PHONY: test test-vision test-core-nofs test-nofs test-docker clean install

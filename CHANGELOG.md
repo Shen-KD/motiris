@@ -25,6 +25,10 @@ published by `.github/workflows/release.yml`.
 - Optional file-backend cut (`FILE_TOOLS=0`) with bounded unavailable-tool
   stubs, plus a strict-C11 no-POSIX-file-I/O core/echo portability probe and
   documented host/MCU validation boundary.
+- Optional host-backed `vision_analyze` (`VISION_TOOLS=1`): one bounded,
+  workspace-local image to a trusted OpenAI-compatible vision provider, with
+  explicit MIME, configurable input/timeout limits, bounded responses/text,
+  local-mock integration tests and no default-core dependency or image runtime.
 
 ### Fixed
 
