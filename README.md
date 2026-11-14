@@ -105,7 +105,13 @@ restarts under `~/.local/share/motiris/gateway/`), exposes
 and optionally requires `Authorization: Bearer $MOTIRIS_GATEWAY_TOKEN`.
 Requests are limited to 16 KiB of headers and a 1 MiB body; malformed or
 incomplete requests get `400`, while oversized requests get `413` and the
-connection is closed.
+connection is closed. `chat_id` is limited to 120 UTF-8 bytes. Its log filename
+is the lowercase hex encoding of the complete ID (at most 244 bytes including
+`.log`), with an identity header of at most 242 bytes; punctuation, case,
+Unicode and long IDs therefore cannot alias. Logs from the former sanitized
+filename format are not migrated or replayed. A canonical log with a missing
+or mismatched identity header is rejected before any history reaches the
+provider; `"reset":true` removes only that exact ID's log and starts fresh.
 
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,

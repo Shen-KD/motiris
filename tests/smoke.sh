@@ -108,8 +108,9 @@ fi
 if test_in 9; then
 echo "== 9: gateway HTTP service + auth + bounded request parser"
 GW=$(mktemp -d)
+mkdir -p "$GW/home"
 printf '{"transport":"echo","tools":false}' > "$GW/config.json"
-MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18089 --no-tools >"$GW/gateway.log" 2>&1 &
+HOME="$GW/home" MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18089 --no-tools >"$GW/gateway.log" 2>&1 &
 GWPID=$!
 MOCK_PIDS="$MOCK_PIDS $GWPID"
 for _i in 1 2 3 4 5 6 7 8; do
@@ -195,7 +196,7 @@ PY9
 fi
 kill $GWPID 2>/dev/null
 wait $GWPID 2>/dev/null || true
-MOTIRIS_GATEWAY_TOKEN=sekret MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18090 --no-tools >/dev/null 2>&1 &
+HOME="$GW/home" MOTIRIS_GATEWAY_TOKEN=sekret MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18090 --no-tools >/dev/null 2>&1 &
 GWPID2=$!
 MOCK_PIDS="$MOCK_PIDS $GWPID2"
 sleep 0.3
@@ -203,6 +204,204 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18090/health || t
 [ "$CODE" = "401" ] || { echo "FAIL auth: got $CODE"; kill $GWPID2 2>/dev/null; exit 1; }
 kill $GWPID2 2>/dev/null
 wait $GWPID2 2>/dev/null || true
+
+# Distinct raw IDs must never share replayed history or on-disk logs.
+ROOT="$ROOT" GW9="$GW" python3 - <<'PY9B'
+import http.client
+import http.server
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import threading
+import time
+
+root = Path(os.environ["GW9"]) / "isolation"
+home = root / "home"
+home.mkdir(parents=True)
+legacy_dir = home / ".local/share/motiris/gateway"
+legacy_dir.mkdir(parents=True)
+(legacy_dir / "tenant_a.log").write_text("UOLD-SANITIZED-PRIVATE\n")
+binary = Path(os.environ["ROOT"]) / "motiris"
+captures = []
+
+class Provider(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        captures.append(request)
+        body = json.dumps({"choices": [{"finish_reason": "stop", "message": {
+            "role": "assistant", "content": "ok"}}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+provider = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+provider_port = provider.server_address[1]
+provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+provider_thread.start()
+(root / "config.json").write_text(json.dumps({
+    "transport": "libcurl",
+    "base_url": "http://127.0.0.1:%d/v1/chat/completions" % provider_port,
+}))
+
+env = os.environ.copy()
+env["HOME"] = str(home)
+env["MOTIRIS_HOME"] = str(root)
+proc = None
+log = None
+port = None
+
+
+def start_gateway():
+    global proc, log, port
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    log = open(root / "gateway.log", "ab", buffering=0)
+    proc = subprocess.Popen(
+        [str(binary), "--gateway", "127.0.0.1:%d" % port, "--no-tools"],
+        env=env, stdout=log, stderr=subprocess.STDOUT)
+    for _ in range(50):
+        if proc.poll() is not None:
+            raise AssertionError("gateway exited with %s" % proc.returncode)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+            conn.request("GET", "/health")
+            response = conn.getresponse()
+            response.read()
+            conn.close()
+            if response.status == 200:
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise AssertionError("gateway readiness timeout")
+
+
+def stop_gateway():
+    global proc, log
+    if proc is not None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        proc = None
+    if log is not None:
+        log.close()
+        log = None
+
+
+def restart_gateway():
+    stop_gateway()
+    start_gateway()
+
+
+def chat(chat_id, message, reset=False, expected=200):
+    payload = {"chat_id": chat_id, "message": message}
+    if reset:
+        payload["reset"] = True
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("POST", "/v1/chat", json.dumps(payload),
+                 {"Content-Type": "application/json"})
+    response = conn.getresponse()
+    raw = response.read()
+    status = response.status
+    conn.close()
+    if status != expected:
+        raise AssertionError("%r: expected HTTP %d, got %d: %s" %
+                             (chat_id, expected, status, raw[:300]))
+    return json.loads(raw)
+
+
+def users(index=-1):
+    return [m.get("content", "").rstrip("\n")
+            for m in captures[index].get("messages", [])
+            if m.get("role") == "user"]
+
+
+try:
+    start_gateway()
+    chat("tenant/a", "PRIVATE-ALPHA")
+    chat("tenant?a", "PUBLIC-BETA")
+    assert users(-2) == ["PRIVATE-ALPHA"], users(-2)
+    assert users(-1) == ["PUBLIC-BETA"], users(-1)
+
+    restart_gateway()
+    chat("tenant?a", "PUBLIC-BETA-2")
+    assert users() == ["PUBLIC-BETA", "PUBLIC-BETA-2"], users()
+    chat("tenant/a", "PRIVATE-ALPHA-2")
+    assert users() == ["PRIVATE-ALPHA", "PRIVATE-ALPHA-2"], users()
+
+    # Case, Unicode and maximum-length names use the same injective encoding.
+    chat("Tenant/A", "CASE-UPPER")
+    chat("租户/甲", "UNICODE-SLASH")
+    chat("租户?甲", "UNICODE-QUESTION")
+    long_a = "x" * 119 + "1"
+    long_b = "x" * 119 + "2"
+    chat(long_a, "LONG-A")
+    chat(long_b, "LONG-B")
+    before = len(captures)
+    chat("z" * 121, "TOO-LONG", expected=400)
+    assert len(captures) == before
+
+    restart_gateway()
+    chat("Tenant/A", "CASE-UPPER-2")
+    assert users() == ["CASE-UPPER", "CASE-UPPER-2"], users()
+    chat("租户/甲", "UNICODE-SLASH-2")
+    assert users() == ["UNICODE-SLASH", "UNICODE-SLASH-2"], users()
+    chat("租户?甲", "UNICODE-QUESTION-2")
+    assert users() == ["UNICODE-QUESTION", "UNICODE-QUESTION-2"], users()
+    chat(long_a, "LONG-A-2")
+    assert users() == ["LONG-A", "LONG-A-2"], users()
+    chat(long_b, "LONG-B-2")
+    assert users() == ["LONG-B", "LONG-B-2"], users()
+
+    # Force eviction of the first session, then exercise replay-on-recreate.
+    chat("evict/a", "EVICT-ALPHA")
+    for i in range(64):
+        chat("fill-%d" % i, "FILL-%d" % i)
+    chat("evict?a", "EVICT-BETA")
+    chat("evict/a", "EVICT-ALPHA-2")
+    assert users() == ["EVICT-ALPHA", "EVICT-ALPHA-2"], users()
+    chat("evict?a", "EVICT-BETA-2")
+    assert users() == ["EVICT-BETA", "EVICT-BETA-2"], users()
+
+    logdir = home / ".local/share/motiris/gateway"
+    assert (logdir / ("tenant/a".encode().hex() + ".log")).is_file()
+    assert (logdir / ("tenant?a".encode().hex() + ".log")).is_file()
+    assert (logdir / "tenant_a.log").read_text() == "UOLD-SANITIZED-PRIVATE\n"
+    assert all(len(p.name) <= 244 for p in logdir.glob("*.log"))
+
+    # Headerless legacy content and a mismatched identity both fail closed.
+    for chat_id, header in (("legacy", ""), ("mismatch", "I" + "other".encode().hex() + "\n")):
+        path = logdir / (chat_id.encode().hex() + ".log")
+        path.write_text(header + "UOLD-PRIVATE\n")
+        before = len(captures)
+        error = chat(chat_id, "MUST-NOT-REPLAY", expected=500)
+        assert "ownership mismatch" in error["error"], error
+        assert len(captures) == before
+
+    # Reset can recover a rejected log and removes only the exact raw ID's file.
+    chat("legacy", "LEGACY-RESET", reset=True)
+    assert users() == ["LEGACY-RESET"], users()
+    restart_gateway()
+    chat("tenant/a", "ALPHA-RESET", reset=True)
+    assert users() == ["ALPHA-RESET"], users()
+    restart_gateway()
+    chat("tenant?a", "PUBLIC-BETA-3")
+    assert users() == ["PUBLIC-BETA", "PUBLIC-BETA-2", "PUBLIC-BETA-3"], users()
+finally:
+    stop_gateway()
+    provider.shutdown()
+    provider.server_close()
+    provider_thread.join(timeout=5)
+PY9B
 rm -rf "$GW"
 
 fi
