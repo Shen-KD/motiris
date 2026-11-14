@@ -61,7 +61,13 @@ void motiris_register_core_tools(MotirisAgent *a) {
     motiris_register_tool(a, &motiris_core_tools()[i]);
 }
 
-static char *sdup(const char *s) { return s ? strdup(s) : NULL; }
+static char *sdup(const char *s) {
+  if (!s) return NULL;
+  size_t n = strlen(s) + 1;
+  char *copy = malloc(n);
+  if (copy) memcpy(copy, s, n);
+  return copy;
+}
 
 void motiris_set_plugin_dir(MotirisAgent *a, const char *d) {
   free(a->plugin_dir);
@@ -76,10 +82,10 @@ const char *motiris_plugin_dir(MotirisAgent *a) { return a->plugin_dir; }
 void motiris_add_provider(MotirisAgent *a, const MotirisProvider *p) {
   if (!p || !p->model || !p->base_url || a->nproviders >= 8) return;
   MotirisProvider *d = &a->providers[a->nproviders++];
-  d->name = p->name ? strdup(p->name) : NULL;
-  d->model = strdup(p->model);
-  d->base_url = strdup(p->base_url);
-  d->api_key = p->api_key ? strdup(p->api_key) : NULL;
+  d->name = sdup(p->name);
+  d->model = sdup(p->model);
+  d->base_url = sdup(p->base_url);
+  d->api_key = sdup(p->api_key);
 }
 int motiris_provider_count(MotirisAgent *a) { return a->nproviders; }
 
@@ -352,7 +358,7 @@ int motiris_run(MotirisAgent *a) {
       free(resp);
       if (!j) {
         free(last_err);
-        last_err = strdup("cannot parse model response");
+        last_err = sdup("cannot parse model response");
         continue;
       }
       cJSON *errj = cJSON_GetObjectItemCaseSensitive(j, "error");

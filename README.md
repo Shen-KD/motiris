@@ -72,13 +72,20 @@ stays out of the core — the plugin API is the seam where it plugs back in.
 ## Build
 
 ```
-make            # cc -O2, single binary ./motiris (stripped)
-make test       # offline smoke tests, no API key required
+make                  # cc -O2, single binary ./motiris (stripped)
+make test             # offline smoke tests, no API key required
+make FILE_TOOLS=0     # cut the POSIX file backend; bounded stubs remain
+make test-nofs        # strict-C11 core probe + file-backend cut test
 ```
 
 Requires: a C11 compiler and the libcurl shared library at runtime
 (libcurl dev headers are vendored in `deps/libcurl/`, pinned to the
-curl 8.18 ABI). No other dependencies.
+curl 8.18 ABI). No other dependencies. `FILE_TOOLS=0` replaces only the
+optional file tools with fixed-error stubs; other host tools and the CLI still
+use their documented OS facilities. `make test-core-nofs` separately builds
+the core loop/config/echo transport as strict C11 without POSIX file I/O or
+libcurl. That core-only probe is not a claim of MCU/RTOS support; see
+[docs/DEVELOPING.md](docs/DEVELOPING.md) for the platform matrix and bounds.
 
 ## Usage
 
@@ -128,7 +135,12 @@ File tools (workspace = `MOTIRIS_WORKSPACE` or cwd; paths outside it are
 rejected):
 
 - `read_file(path)` / `write_file(path, content)` / `patch(path, old, new)`
-- `search_files(pattern, path?)` — recursive regex grep, returns matches.
+- `search_files(pattern, path?)` — bounded recursive regex grep. Recursive
+  symlinks are skipped; every component is opened relative to the workspace
+  with `O_NOFOLLOW`. Limits: 32 directory levels, 4096 entries, 1 MiB per
+  file / 16 MiB total, 4096-byte line buffer and 200 matches. Results include
+  skip/truncation diagnostics. Explicit start paths must still canonicalize
+  inside the workspace.
 
 Knowledge & delegation tools:
 
