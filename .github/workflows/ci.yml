@@ -11,7 +11,7 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     needs: [build, clang, test-core, test-tools, test-repl, test-skills,
-            test-schema, test-goal, vision, plugins, tools, sanitizers, no-filesystem]
+            test-schema, test-goal, vision, tts, plugins, tools, sanitizers, no-filesystem]
     steps:
       - run: echo "all gating jobs passed"
 
@@ -99,6 +99,19 @@ jobs:
         run: |
           make clean
           make VISION_TOOLS=1 CC=clang \
+            CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE"
+
+  # Optional host-only TTS adapter: fake engine + strict compilation.
+  tts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: optional TTS integration (no audio device)
+        run: make test-tts
+      - name: optional TTS build with clang -Werror
+        run: |
+          make clean
+          make TTS_TOOLS=1 CC=clang \
             CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE"
 
   # plugin artifacts compile standalone (flat + per-tool dir layout)

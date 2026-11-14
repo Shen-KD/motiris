@@ -28,7 +28,8 @@ trap 'for p in $MOCK_PIDS; do kill "$p" 2>/dev/null || true; done; true' EXIT
 # isolate from any developer MOTIRIS_* env that would leak into tests
 # (shell-exported values intentionally override config.json)
 unset MOTIRIS_API_KEY MOTIRIS_MODEL MOTIRIS_BASE_URL MOTIRIS_PLUGIN_DIR \
-      MOTIRIS_GATEWAY_TOKEN MOTIRIS_WORKSPACE 2>/dev/null || true
+      MOTIRIS_GATEWAY_TOKEN MOTIRIS_WORKSPACE MOTIRIS_TTS_CMD \
+      MOTIRIS_TTS_TIMEOUT_S 2>/dev/null || true
 
 make motiris examples/hello_plugin.so >/dev/null 2>&1
 

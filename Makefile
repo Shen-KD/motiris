@@ -3,7 +3,7 @@
 # Component layout (each compiles into a static archive, then linked):
 #   src/core/    agent loop, config, transports      -> libmotiris_core.a
 #   src/tools/   built-in tool bundles               -> libmotiris_tools.a
-#   src/harness/ repl, gateway, cron, plugins, mcp   -> libmotiris_harness.a
+#   src/harness/ repl, gateway, cron, plugins, mcp, optional TTS -> harness.a
 #   src/vendor/  vendored cJSON (MIT)                - linked directly
 #   deps/        linenoise (line editing), libcurl headers
 CC      ?= cc
@@ -23,6 +23,7 @@ PREFIX  ?= /usr/local
 
 FILE_TOOLS ?= 1
 VISION_TOOLS ?= 0
+TTS_TOOLS ?= 0
 CORE_SRC    = $(wildcard src/core/*.c)
 TOOLS_ALL   = $(wildcard src/tools/*.c)
 ifeq ($(VISION_TOOLS),0)
@@ -36,7 +37,13 @@ TOOLS_SRC   = $(filter-out src/tools/filetools.c,$(TOOLS_AVAILABLE))
 else
 TOOLS_SRC   = $(filter-out src/tools/filetools_nofs.c,$(TOOLS_AVAILABLE))
 endif
-HARNESS_SRC = $(wildcard src/harness/*.c)
+HARNESS_ALL = $(wildcard src/harness/*.c)
+ifeq ($(TTS_TOOLS),0)
+HARNESS_SRC = $(filter-out src/harness/tts.c,$(HARNESS_ALL))
+else
+HARNESS_SRC = $(HARNESS_ALL)
+CPPFLAGS += -DMOTIRIS_TTS_TOOLS=1
+endif
 CORE_OBJ    = $(CORE_SRC:.c=.o)
 TOOLS_OBJ   = $(TOOLS_SRC:.c=.o)
 HARNESS_OBJ = $(HARNESS_SRC:.c=.o)
@@ -44,6 +51,8 @@ HDR = include/motiris.h
 
 %.o: %.c $(HDR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+src/harness/repl.o src/harness/tts.o: src/harness/tts.h
 
 libmotiris_core.a: $(CORE_OBJ)
 	rm -f $@ && ar rcs $@ $^
@@ -74,6 +83,12 @@ test-vision:
 	$(MAKE) clean
 	$(MAKE) VISION_TOOLS=1 motiris
 	sh tests/vision.sh
+
+# Optional host-only external TTS adapter; fake engine, no audio device.
+test-tts:
+	$(MAKE) clean
+	$(MAKE) TTS_TOOLS=1 motiris
+	sh tests/tts.sh
 
 # Core-only portability probe: strict C11, no POSIX/file I/O/libcurl.
 # The small test adapter supplies only tool/schema registries and invokes echo.
@@ -123,4 +138,4 @@ clean:
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test test-vision test-core-nofs test-nofs test-docker clean install
+.PHONY: test test-vision test-tts test-core-nofs test-nofs test-docker clean install

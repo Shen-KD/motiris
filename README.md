@@ -39,6 +39,9 @@ agent process stays idle-quiet between requests.
 - **Optional vision tool** — `VISION_TOOLS=1` adds workspace-bounded image
   input to a configured remote vision provider and returns bounded text.
   The default build contains no vision code and no image inference runtime.
+- **Optional host TTS** — `TTS_TOOLS=1` lets the REPL pass each final reply
+  to one trusted external speech engine, with bounded input and timeout.
+  Text remains available on engine failure; the default build has no TTS code.
 - **Sessions** — append-only trace log (`--save`), resume replay (`-r`);
   the repl auto-logs every interactive session to
   `~/.local/share/motiris/sessions/` (gateway format) with
@@ -81,6 +84,8 @@ make FILE_TOOLS=0     # cut the POSIX file backend; bounded stubs remain
 make test-nofs        # strict-C11 core probe + file-backend cut test
 make test-vision      # clean optional-vision build + local mock integration
 make VISION_TOOLS=1   # opt in to the host-backed vision_analyze tool
+make TTS_TOOLS=1      # opt in to host-only REPL speech output
+make test-tts         # optional TTS tests with a fake engine, no audio device
 ```
 
 Requires: a C11 compiler and the libcurl shared library at runtime
@@ -132,7 +137,8 @@ Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
 `MOTIRIS_GATEWAY_TOKEN`, `MOTIRIS_VISION_MODEL`,
 `MOTIRIS_VISION_BASE_URL`, `MOTIRIS_VISION_API_KEY`,
-`MOTIRIS_VISION_MAX_BYTES`, `MOTIRIS_VISION_TIMEOUT_S`. Default endpoint:
+`MOTIRIS_VISION_MAX_BYTES`, `MOTIRIS_VISION_TIMEOUT_S`,
+`MOTIRIS_TTS_CMD`, `MOTIRIS_TTS_TIMEOUT_S`. Default endpoint:
 `https://api.openai.com/v1/chat/completions`.
 
 Built-in tools (disable with `--no-tools`):
@@ -180,6 +186,25 @@ Optional host-backed tool (only with `VISION_TOOLS=1`):
   leave the device: configure only a trusted provider. Redirects are not
   followed; errors return bounded JSON and the outer agent can continue in
   text. This is not local inference, video, generation, or MCU support.
+
+Optional host-only REPL speech output (only with `TTS_TOOLS=1`):
+
+- Set `MOTIRIS_TTS_CMD` to a trusted executable. After each successful REPL
+  turn, motiris writes the final assistant text to that program's stdin and
+  closes it. The program can synthesize, play, or save audio; it receives no
+  shell command line and its stdout/stderr are discarded. For example, a small
+  wrapper script can add the options required by a locally installed engine.
+- Input is limited to 16,384 bytes per turn. Longer replies remain fully
+  visible as text, but only that prefix reaches the engine. The adapter owns
+  no audio buffer and retains no text between turns. The external engine is
+  responsible for its own audio storage and resource limits.
+- `MOTIRIS_TTS_TIMEOUT_S` bounds each invocation (default 10, range 1..120).
+  Timeout, missing/failing engines, and invalid settings produce a bounded
+  diagnostic without hiding the reply or failing the REPL turn. Goal-check's
+  synthetic `DONE` acknowledgement is not spoken.
+- With no `MOTIRIS_TTS_CMD`, the optional runtime path is idle and starts no
+  processes. This is REPL-only, not STT, streaming/full-duplex audio, local
+  neural inference, gateway audio, or MCU/RTOS support.
 
 MCP servers (`"mcp_servers": [{"name","cmd","args":[]}]` in config.json)
 register each remote tool as `<server>:<tool>`; `tools/call` is bridged
@@ -265,6 +290,7 @@ Dockerfile.test        isolated test image (make test-docker)
 ```
 make test          # 27 default offline smoke checks, no network/key needed
 make test-vision   # optional vision build + 10 local-mock integration cases
+make test-tts      # optional TTS build + 8 fake-engine integration cases
 make test-docker   # default suite inside a throwaway debian container
                    # (clean HOME/ports/processes, mirrors CI)
 ```

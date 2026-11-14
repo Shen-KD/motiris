@@ -22,6 +22,10 @@
 
 #include <linenoise.h>
 
+#ifdef MOTIRIS_TTS_TOOLS
+#include "tts.h"
+#endif
+
 #define HIST_ENV "MOTIRIS_HISTFILE"
 
 #define C_RESET "\033[0m"
@@ -271,6 +275,59 @@ static void print_banner(MotirisAgent *a) {
   fflush(stdout);
 }
 
+#ifdef MOTIRIS_TTS_TOOLS
+/* Match goal-check's synthetic acknowledgement so it is not spoken. */
+static int tts_done_reply(const char *s) {
+  while (*s && strchr(" \t\r\n.", *s)) s++;
+  size_t n = strlen(s);
+  while (n && strchr(" \t\r\n.", s[n - 1])) n--;
+  if (n != 4) return 0;
+  for (size_t i = 0; i < 4; i++) {
+    char c = s[i];
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if (c != "done"[i]) return 0;
+  }
+  return 1;
+}
+
+static int tts_goal_ack(cJSON *message, const char *content) {
+  if (!tts_done_reply(content)) return 0;
+  cJSON *previous = message ? message->prev : NULL;
+  const char *role = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(previous, "role"));
+  const char *prompt = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(previous, "content"));
+  return role && !strcmp(role, "user") && prompt
+      && !strncmp(prompt, "Goal check: <", 13);
+}
+
+static void tts_new_reply(MotirisAgent *a, cJSON *before) {
+  if (!motiris_tts_enabled()) return;
+  cJSON *messages = motiris_messages(a);
+  cJSON *m = before ? before->next : (messages ? messages->child : NULL);
+  const char *speech = NULL;
+  for (; m; m = m->next) {
+    const char *role = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(m, "role"));
+    const char *content = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(m, "content"));
+    if (!role || strcmp(role, "assistant") || !content || !*content) continue;
+    /* With goal-check, retain the real answer instead of the later DONE. */
+    if (tts_goal_ack(m, content)) continue;
+    speech = content;
+  }
+  if (!speech) return;
+
+  char diag[160];
+  int rc = motiris_tts_speak(speech, diag, sizeof diag);
+  if (rc < 0)
+    printf(C_YELLOW "[tts: %s; text output preserved]" C_RESET "\n",
+           diag[0] ? diag : "engine unavailable");
+  else if (rc > 0)
+    printf(C_DIM "[tts: %s]" C_RESET "\n", diag);
+}
+#endif
+
 int motiris_repl(MotirisAgent *a) {
   motiris_set_stream(a, 1);
   motiris_set_stream_cb(a, delta_print, NULL);
@@ -313,6 +370,10 @@ int motiris_repl(MotirisAgent *a) {
     if (cmd == 1) { free(line); break; }
     if (cmd == 0) { free(line); continue; }
 
+#ifdef MOTIRIS_TTS_TOOLS
+    cJSON *tts_before = motiris_messages(a)->child;
+    while (tts_before && tts_before->next) tts_before = tts_before->next;
+#endif
     motiris_add_user(a, line);
     if (sess_id) motiris_session_append("sessions", sess_id, 'U', line);
     free(line);
@@ -331,6 +392,9 @@ int motiris_repl(MotirisAgent *a) {
     if (color) printf(C_RESET "\n");
     if (rc) fprintf(stderr, C_RED "motiris: %s" C_RESET "\n",
                     motiris_last_error(a));
+#ifdef MOTIRIS_TTS_TOOLS
+    if (!rc) tts_new_reply(a, tts_before);
+#endif
     if (sess_id && reply_len > 0) {
       motiris_session_append("sessions", sess_id, 'A', reply_buf);
       reply_len = 0;

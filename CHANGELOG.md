@@ -29,6 +29,10 @@ published by `.github/workflows/release.yml`.
   workspace-local image to a trusted OpenAI-compatible vision provider, with
   explicit MIME, configurable input/timeout limits, bounded responses/text,
   local-mock integration tests and no default-core dependency or image runtime.
+- Optional host-only REPL TTS adapter (`TTS_TOOLS=1`): final replies go to a
+  trusted external engine over stdin, capped at 16 KiB with a monotonic
+  timeout and process cleanup. Fake-engine tests cover fallback and bounds;
+  default/core builds contain no adapter or audio dependency.
 
 ### Fixed
 
