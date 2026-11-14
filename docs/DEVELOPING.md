@@ -35,6 +35,8 @@ make FILE_TOOLS=0     # optional POSIX file backend -> bounded stubs
 make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
 make VISION_TOOLS=1   # opt in to host-backed vision_analyze
 make test-vision      # clean optional build + bounded local-provider tests
+make TTS_TOOLS=1      # opt in to host-only REPL external TTS adapter
+make test-tts         # clean optional build + fake-engine integration tests
 ```
 
 ### Platform matrix and file-search resource bounds
@@ -44,6 +46,7 @@ make test-vision      # clean optional build + bounded local-provider tests
 | Linux gcc / clang | `make`, `make test`, CI `-Werror` and ASAN/UBSAN | Full host CLI; libcurl and POSIX tools enabled |
 | Host CLI without file backend | `make test-nofs` (`FILE_TOOLS=0`) | Excludes `filetools.c`; `filetools_nofs.c` returns a fixed bounded error for all four file tools. Other host tools/harness are unchanged |
 | Optional host vision | `make test-vision` (`VISION_TOOLS=1`) | One workspace-local image to a configured remote provider; separate POSIX file + libcurl backend, excluded by default and not local inference |
+| Optional host TTS | `make test-tts` (`TTS_TOOLS=1`) | Final REPL text to one trusted external executable over a bounded pipe; fake-engine tests only, no audio device or MCU claim |
 | Portable core-only probe | `make test-core-nofs` | Strict C11 `-Werror`; core loop/config/echo transport + cJSON, no POSIX feature macros, filesystem I/O or libcurl. A small test adapter supplies tool/schema registries; this is not the full CLI |
 | MCU / RTOS | **待定 / 未验证** | Chip, RTOS, cross-toolchain, RAM/Flash and hardware test matrix have not been supplied; host results are not MCU support claims |
 
@@ -123,6 +126,43 @@ disconnected/HTTP providers, response/description caps and the exact 1 MiB
 round-trip. No MCU cross-toolchain, target Flash/RAM or hardware validation
 is available; all numbers above are host-only.
 
+### Optional host-only TTS bounds and measurements
+
+`TTS_TOOLS=1` compiles `src/harness/tts.c` and the conditional REPL call site.
+It adds no public core API and no agent/session state. After a successful turn,
+the REPL selects the new final assistant message (skipping goal-check's
+synthetic `DONE`) and passes it to `MOTIRIS_TTS_CMD` with `exec`, not a shell.
+The executable owns synthesis, playback and audio storage; motiris never
+receives audio and discards engine stdout/stderr.
+
+Each call reads at most 16,384 bytes from the existing reply string. The parent
+adds no heap text copy or audio buffer, retains nothing between turns, and owns
+only one nonblocking pipe plus one child process. Writes and exit waiting share
+one monotonic deadline (`MOTIRIS_TTS_TIMEOUT_S`, default 10 s, hard range
+1..120 s). Expiry kills the child process group and reaps the direct child.
+Early EOF, `SIGPIPE`, nonzero exit, missing executables and invalid settings
+all leave the already printed text intact with a bounded diagnostic. Unset
+`MOTIRIS_TTS_CMD` means no process or idle background activity. Real engine
+CPU/RSS/audio limits remain backend responsibilities and are not MCU budgets.
+
+Reference host measurements on 2026-11-15 (Linux x86_64, gcc `-O2`, stripped;
+baseline `65f6584`) are:
+
+| Build / measurement | Bytes / sections | Relative result |
+| --- | ---: | ---: |
+| Default full CLI | 157,944 bytes; text 144,405; data 2,648; BSS 167,960 | baseline; TTS source and REPL references compiled out |
+| `TTS_TOOLS=1` full CLI | 162,040 bytes; text 148,801; data 2,680; BSS 167,960 | +4,096 file; +4,396 text; +32 data; BSS unchanged |
+| Optional REPL + `/bin/sh` fake sink | 9,112 KiB peak process RSS | One echo reply through the bounded pipe; no real audio engine/device |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 8,924 / 8,984 KiB | baseline 8,992 / 9,008 KiB; both below 64 MiB guard |
+
+Default file/text/data/BSS deltas are all zero; default and optional direct
+ELF dependencies remain only `libcurl.so.4` and `libc.so.6`. The core source and public header
+are untouched. These are host binary/RSS measurements, not target Flash/RAM
+headroom. `tests/tts.sh` covers eight fake-engine cases: exact text, backend
+failure, timeout/reaping, truncation, goal-check filtering, missing engine,
+invalid timeout and runtime-disabled behavior. No real speech engine, audio
+device, MCU cross-toolchain or hardware validation is claimed.
+
 CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
 on main): `build` (gcc clean compile+link, size guard, artifact),
@@ -132,6 +172,7 @@ groups, see `tests/smoke.sh <group>`), `plugins` (example .so with gcc +
 clang -Werror), `tools` (component static libs compile independently
 with clang -Werror), `no-filesystem` (strict-C11 core and optional file
 backend cut), `vision` (optional local-mock integration and clang `-Werror`),
+`tts` (optional fake-engine integration and clang `-Werror`),
 and `sanitizers` (ASAN/UBSAN tools smoke).
 `perf` and `compat-matrix` are informational
 (ubuntu 22.04 gcc-11 / 24.04 gcc-13 / 26.04 gcc-15 / centos-stream9
