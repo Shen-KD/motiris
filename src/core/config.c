@@ -15,10 +15,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef MOTIRIS_NO_FILESYSTEM
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
+#ifndef MOTIRIS_NO_FILESYSTEM
 static char *config_dir(void) {
   const char *h = getenv("MOTIRIS_HOME");
   if (h && *h) return strdup(h);
@@ -251,6 +254,12 @@ int motiris_init_config(void) {
   free(d);
   return rc;
 }
+
+#else
+void motiris_load_env(void) {}
+void motiris_apply_config(MotirisAgent *a) { (void)a; }
+int motiris_init_config(void) { return 1; }
+#endif
 
 /* ---------------- shell safety policy (issue #10) ---------------- */
 static char shell_allow[16][128];

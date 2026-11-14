@@ -13,16 +13,18 @@
  */
 #include "motiris.h"
 
-#include <curl/curl.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef MOTIRIS_NO_FILESYSTEM
+#include <curl/curl.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#endif
 
 typedef struct { char *data; size_t len; } Buf;
 
+#ifndef MOTIRIS_NO_FILESYSTEM
 /* incremental stream sink: called with each SSE chunk while streaming */
 typedef struct {
   void (*on_delta)(const char *text, void *ud);
@@ -348,6 +350,8 @@ static char *spawn_curl(const char *url, const char *auth,
   return out;
 }
 
+#endif  /* MOTIRIS_NO_FILESYSTEM */
+
 /* ---------------- echo backend ---------------- */
 static char *echo_response(const char *body) {
   /* Round 1 (no tool result yet): ask for a shell tool call so the whole
@@ -398,28 +402,49 @@ char *motiris_transport_send_stream(const char *backend, const char *url,
                                     void (*on_delta)(const char *, void *),
                                     void *ud, char **err) {
   if (err) *err = NULL;
+#ifndef MOTIRIS_NO_FILESYSTEM
   if (!backend || !strcmp(backend, "auto") || !strcmp(backend, "libcurl"))
     return libcurl_send_stream(url, auth, body, on_delta, ud, err);
+#else
+  (void)on_delta;
+  (void)ud;
+#endif
   /* other backends: fall back to buffered send (aggregation identical) */
   return motiris_transport_send(backend, url, auth, body, err);
+}
+
+static char *transport_error(const char *msg) {
+  size_t n = strlen(msg) + 1;
+  char *copy = malloc(n);
+  if (copy) memcpy(copy, msg, n);
+  return copy;
 }
 
 char *motiris_transport_send(const char *backend, const char *url,
                              const char *auth, const char *body, char **err) {
   if (err) *err = NULL;
+#ifndef MOTIRIS_NO_FILESYSTEM
   if (!backend || !strcmp(backend, "auto") || !strcmp(backend, "libcurl"))
     return libcurl_send(url, auth, body, err);
   if (!strcmp(backend, "curl"))
     return spawn_curl(url, auth, body, err);
-  if (!strcmp(backend, "echo")) {
+#else
+  (void)url;
+  (void)auth;
+#endif
+  if (backend && !strcmp(backend, "echo")) {
     cJSON *j = cJSON_Parse(body);
-    if (!j) { if (err) *err = strdup("bad request json"); return NULL; }
+    if (!j) { if (err) *err = transport_error("bad request json"); return NULL; }
     char *pretty = cJSON_PrintUnformatted(j);
     cJSON_Delete(j);
     char *r = echo_response(pretty);
     free(pretty);
     return r;
   }
-  if (err) *err = strdup("unknown transport backend");
+#ifdef MOTIRIS_NO_FILESYSTEM
+  if (err) *err = transport_error("transport unavailable without host I/O");
+#else
+  if (err) *err = transport_error("unknown transport backend");
+#endif
   return NULL;
 }

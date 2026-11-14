@@ -406,7 +406,7 @@ rm -rf "$GW"
 
 fi
 if test_in 10; then
-echo "== 10: file tools via agent loop (read ok + workspace guard)"
+echo "== 10: file tools + bounded symlink-safe recursive search"
 F10=$(mktemp -d)
 mkdir -p "$F10/ws" "$F10/h1" "$F10/h2"
 printf 'hello content\n' > "$F10/ws/hello.txt"
@@ -443,6 +443,7 @@ echo "$O2" | grep -q 'outside workspace' || { echo "FAIL guard: $O2"; exit 1; }
 kill $MOCKPID 2>/dev/null
 wait $MOCKPID 2>/dev/null || true
 cd "$ROOT"
+sh tests/search_files.sh
 rm -rf "$F10"
 
 fi

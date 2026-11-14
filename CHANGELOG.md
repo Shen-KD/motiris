@@ -22,6 +22,9 @@ published by `.github/workflows/release.yml`.
   answer the model confirms the goal (first user message) with `DONE`
   or keeps working — one extra round, bounded by `--max-steps`.
 - Offline smoke suite grown to 27 checks.
+- Optional file-backend cut (`FILE_TOOLS=0`) with bounded unavailable-tool
+  stubs, plus a strict-C11 no-POSIX-file-I/O core/echo portability probe and
+  documented host/MCU validation boundary.
 
 ### Fixed
 
@@ -33,6 +36,10 @@ published by `.github/workflows/release.yml`.
   identity headers, preventing cross-chat history leaks after restart or
   eviction. Legacy sanitized logs are not guessed or merged; invalid
   ownership fails closed and exact-ID reset does not affect other chats.
+- `search_files` no longer follows recursive symlinks outside the workspace
+  or around directory loops. fd-relative no-follow opens, iterative traversal,
+  depth/node/byte/line/result bounds and provider-round privacy regressions
+  close the escape and unbounded-recursion paths.
 
 ## [0.1.0] - 2026-09-20
 

@@ -7,6 +7,8 @@
 #include "motiris.h"
 
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <regex.h>
 #include <stdio.h>
@@ -17,6 +19,11 @@
 
 #define MAX_FILE (1 << 20)      /* 1 MB cap per read */
 #define MAX_RESULTS 200
+#define MAX_SEARCH_DEPTH 32
+#define MAX_SEARCH_NODES 4096
+#define MAX_SEARCH_LINE 4096
+#define MAX_SEARCH_FILE_BYTES (1 << 20)
+#define MAX_SEARCH_BYTES (16 << 20)
 
 static const char *workspace(void) {
   static char wd[PATH_MAX];
@@ -100,47 +107,211 @@ static char *read_file_call(const char *args_json, void *ud) {
   return s;
 }
 
-/* ---------------- search_files (recursive grep) ---------------- */
-typedef struct { char pat[256]; regex_t re; cJSON *out; int count; } SearchCtx;
+/* ---------------- search_files (bounded recursive grep) ---------------- */
+typedef struct {
+  regex_t re;
+  cJSON *out;
+  size_t count, nodes, bytes;
+  size_t skipped_symlinks, overlong_lines, unreadable;
+  int truncated;
+  char error[160];
+} SearchCtx;
 
-static void search_file(const char *path, SearchCtx *sc) {
-  FILE *f = fopen(path, "r");
-  if (!f) return;
-  char *line = NULL;
-  size_t cap = 0;
+typedef struct { DIR *dir; char *path; } SearchFrame;
+
+static void search_limit(SearchCtx *sc, const char *msg) {
+  if (sc->truncated) return;
+  sc->truncated = 1;
+  snprintf(sc->error, sizeof sc->error, "%s", msg);
+}
+
+static char *search_join(const char *dir, const char *name, SearchCtx *sc) {
+  size_t dl = strlen(dir), nl = strlen(name);
+  if (dl >= PATH_MAX || nl >= PATH_MAX || dl + nl + 2 > PATH_MAX) {
+    search_limit(sc, "search path exceeds PATH_MAX");
+    return NULL;
+  }
+  char *p = malloc(dl + nl + 2);
+  if (!p) { search_limit(sc, "search path allocation failed"); return NULL; }
+  memcpy(p, dir, dl);
+  p[dl] = '/';
+  memcpy(p + dl + 1, name, nl + 1);
+  return p;
+}
+
+/* Open a canonical path below a verified fd (or from / for an absolute
+ * workspace path). Every component uses O_NOFOLLOW, closing the check/open
+ * symlink race instead of merely checking realpath before fopen. */
+static int open_relative_nofollow(int wsfd, const char *rel, int flags) {
+  int fd;
+  if (*rel == '/') {
+    fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    while (*rel == '/') rel++;
+  } else {
+    fd = fcntl(wsfd, F_DUPFD_CLOEXEC, 0);
+  }
+  if (fd < 0) return -1;
+  if (!*rel || !strcmp(rel, ".")) return fd;
+
+  const char *p = rel;
+  while (*p) {
+    const char *slash = strchr(p, '/');
+    size_t n = slash ? (size_t)(slash - p) : strlen(p);
+    if (!n || n > NAME_MAX) { close(fd); errno = ENAMETOOLONG; return -1; }
+    char part[NAME_MAX + 1];
+    memcpy(part, p, n);
+    part[n] = '\0';
+    int next = openat(fd, part,
+                      slash ? O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                            : flags);
+    close(fd);
+    if (next < 0) return -1;
+    fd = next;
+    p = slash ? slash + 1 : p + n;
+  }
+  return fd;
+}
+
+static int search_account_bytes(SearchCtx *sc, size_t n, size_t *file_bytes) {
+  if (n > MAX_SEARCH_FILE_BYTES - *file_bytes) {
+    search_limit(sc, "search per-file byte limit reached");
+    return -1;
+  }
+  if (n > MAX_SEARCH_BYTES - sc->bytes) {
+    search_limit(sc, "search total byte limit reached");
+    return -1;
+  }
+  *file_bytes += n;
+  sc->bytes += n;
+  return 0;
+}
+
+/* Takes ownership of fd. Fixed-size line storage and explicit byte budgets
+ * keep both getline-style allocations and result growth bounded. */
+static void search_file_fd(int fd, const char *path, SearchCtx *sc) {
+  FILE *f = fdopen(fd, "r");
+  if (!f) { close(fd); sc->unreadable++; return; }
+  char line[MAX_SEARCH_LINE];
+  size_t file_bytes = 0;
   long lineno = 0;
-  while (getline(&line, &cap, f) >= 0) {
+
+  while (sc->count < MAX_RESULTS && !sc->truncated &&
+         fgets(line, sizeof line, f)) {
+    size_t n = strlen(line);
+    if (search_account_bytes(sc, n, &file_bytes)) break;
     lineno++;
-    size_t llen = strlen(line);
-    while (llen && (line[llen-1] == '\n' || line[llen-1] == '\r'))
-      line[--llen] = '\0';
+    int complete = n > 0 && line[n - 1] == '\n';
+    if (!complete && !feof(f)) {
+      int c;
+      while ((c = fgetc(f)) != '\n' && c != EOF) {
+        if (search_account_bytes(sc, 1, &file_bytes)) break;
+      }
+      sc->overlong_lines++;
+      continue;
+    }
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+      line[--n] = '\0';
     if (!regexec(&sc->re, line, 0, NULL, 0)) {
       cJSON *m = cJSON_CreateObject();
       cJSON_AddStringToObject(m, "file", path);
       cJSON_AddNumberToObject(m, "line", (double)lineno);
       cJSON_AddStringToObject(m, "text", line);
       cJSON_AddItemToArray(sc->out, m);
-      if (++sc->count >= MAX_RESULTS) { free(line); fclose(f); return; }
+      if (++sc->count >= MAX_RESULTS)
+        search_limit(sc, "search result limit reached (200)");
     }
   }
-  free(line);
+  if (ferror(f)) sc->unreadable++;
   fclose(f);
 }
 
-static void walk_dir(const char *dir, SearchCtx *sc) {
-  DIR *d = opendir(dir);
-  if (!d) return;
-  struct dirent *e;
-  while ((e = readdir(d)) != NULL && sc->count < MAX_RESULTS) {
-    if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-    char p[PATH_MAX];
-    snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
-    struct stat st;
-    if (stat(p, &st)) continue;
-    if (S_ISDIR(st.st_mode)) walk_dir(p, sc);
-    else if (S_ISREG(st.st_mode)) search_file(p, sc);
+static void walk_dir_fd(int startfd, const char *startpath, SearchCtx *sc) {
+  DIR *start = fdopendir(startfd);
+  if (!start) { close(startfd); sc->unreadable++; return; }
+  SearchFrame stack[MAX_SEARCH_DEPTH];
+  size_t depth = 1;
+  stack[0].dir = start;
+  stack[0].path = strdup(startpath);
+  if (!stack[0].path) {
+    closedir(start);
+    search_limit(sc, "search path allocation failed");
+    return;
   }
-  closedir(d);
+
+  while (depth && sc->count < MAX_RESULTS && !sc->truncated) {
+    SearchFrame *frame = &stack[depth - 1];
+    errno = 0;
+    struct dirent *e = readdir(frame->dir);
+    if (!e) {
+      if (errno) sc->unreadable++;
+      closedir(frame->dir);
+      free(frame->path);
+      depth--;
+      continue;
+    }
+    if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+    if (sc->nodes >= MAX_SEARCH_NODES) {
+      search_limit(sc, "search node limit reached (4096)");
+      break;
+    }
+    sc->nodes++;
+
+    struct stat st;
+    int parentfd = dirfd(frame->dir);
+    if (fstatat(parentfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW)) {
+      sc->unreadable++;
+      continue;
+    }
+    if (S_ISLNK(st.st_mode)) { sc->skipped_symlinks++; continue; }
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) continue;
+
+    char *p = search_join(frame->path, e->d_name, sc);
+    if (!p) break;
+    int fd = openat(parentfd, e->d_name,
+                    O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+      if (errno == ELOOP) sc->skipped_symlinks++;
+      else sc->unreadable++;
+      free(p);
+      continue;
+    }
+    if (fstat(fd, &st)) {
+      close(fd);
+      free(p);
+      sc->unreadable++;
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      if (depth >= MAX_SEARCH_DEPTH) {
+        close(fd);
+        free(p);
+        search_limit(sc, "search depth limit reached (32)");
+        break;
+      }
+      DIR *child = fdopendir(fd);
+      if (!child) {
+        close(fd);
+        free(p);
+        sc->unreadable++;
+        continue;
+      }
+      stack[depth].dir = child;
+      stack[depth].path = p;
+      depth++;
+    } else if (S_ISREG(st.st_mode)) {
+      search_file_fd(fd, p, sc);  /* owns fd */
+      free(p);
+    } else {
+      close(fd);
+      free(p);
+    }
+  }
+
+  while (depth) {
+    depth--;
+    closedir(stack[depth].dir);
+    free(stack[depth].path);
+  }
 }
 
 static char *search_call(const char *args_json, void *ud) {
@@ -157,25 +328,51 @@ static char *search_call(const char *args_json, void *ud) {
   }
 
   char errb[256];
-  char *abs = path ? resolve(path, errb, sizeof errb)
-                   : strdup(workspace());
+  char *abs = resolve(path ? path : ".", errb, sizeof errb);
   if (!abs) { cJSON_Delete(args); return err_json(errb); }
+  char *wsr = realpath(workspace(), NULL);
+  if (!wsr) {
+    free(abs);
+    cJSON_Delete(args);
+    return err_json("workspace not resolvable");
+  }
+  size_t wl = strlen(wsr);
+  if (strncmp(abs, wsr, wl) || (abs[wl] && abs[wl] != '/')) {
+    free(wsr);
+    free(abs);
+    cJSON_Delete(args);
+    return err_json("path outside workspace");
+  }
+  const char *rel = abs[wl] ? abs + wl + 1 : ".";
 
   SearchCtx sc = {0};
-  snprintf(sc.pat, sizeof sc.pat, "%s", pattern);
   sc.out = cJSON_CreateArray();
-  if (regcomp(&sc.re, sc.pat, REG_EXTENDED | REG_NOSUB) != 0) {
+  if (regcomp(&sc.re, pattern, REG_EXTENDED | REG_NOSUB) != 0) {
     cJSON_Delete(sc.out);
+    free(wsr);
     free(abs);
     cJSON_Delete(args);
     return err_json("invalid regex");
   }
 
+  int wsfd = open_relative_nofollow(
+      AT_FDCWD, wsr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  int startfd = wsfd < 0 ? -1 : open_relative_nofollow(
+      wsfd, rel, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (wsfd >= 0) close(wsfd);
+  free(wsr);
   struct stat st;
-  if (stat(abs, &st) == 0) {
-    if (S_ISDIR(st.st_mode)) walk_dir(abs, &sc);
-    else search_file(abs, &sc);
+  if (startfd < 0 || fstat(startfd, &st)) {
+    if (startfd >= 0) close(startfd);
+    regfree(&sc.re);
+    cJSON_Delete(sc.out);
+    free(abs);
+    cJSON_Delete(args);
+    return err_json("cannot open search path without following symlinks");
   }
+  if (S_ISDIR(st.st_mode)) walk_dir_fd(startfd, abs, &sc);
+  else if (S_ISREG(st.st_mode)) search_file_fd(startfd, abs, &sc);
+  else { close(startfd); sc.unreadable++; }
   regfree(&sc.re);
   free(abs);
   cJSON_Delete(args);
@@ -183,6 +380,14 @@ static char *search_call(const char *args_json, void *ud) {
   cJSON *r = cJSON_CreateObject();
   cJSON_AddItemToObject(r, "matches", sc.out);
   cJSON_AddNumberToObject(r, "count", (double)sc.count);
+  cJSON_AddNumberToObject(r, "nodes", (double)sc.nodes);
+  cJSON_AddNumberToObject(r, "bytes", (double)sc.bytes);
+  cJSON_AddNumberToObject(r, "skipped_symlinks", (double)sc.skipped_symlinks);
+  cJSON_AddNumberToObject(r, "overlong_lines", (double)sc.overlong_lines);
+  cJSON_AddNumberToObject(r, "unreadable", (double)sc.unreadable);
+  cJSON_AddBoolToObject(r, "truncated", sc.truncated);
+  cJSON_AddStringToObject(r, "symlink_policy", "skip");
+  if (sc.error[0]) cJSON_AddStringToObject(r, "error", sc.error);
   char *s = cJSON_PrintUnformatted(r);
   cJSON_Delete(r);
   return s;

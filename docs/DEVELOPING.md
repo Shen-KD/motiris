@@ -31,7 +31,58 @@ make                  # compiles per-component .o -> .a -> motiris
 make test             # offline smoke suite (27 checks, mock LLM/MCP)
 make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
+make FILE_TOOLS=0     # optional POSIX file backend -> bounded stubs
+make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
 ```
+
+### Platform matrix and file-search resource bounds
+
+| Target | Build/test evidence | Boundary |
+| --- | --- | --- |
+| Linux gcc / clang | `make`, `make test`, CI `-Werror` and ASAN/UBSAN | Full host CLI; libcurl and POSIX tools enabled |
+| Host CLI without file backend | `make test-nofs` (`FILE_TOOLS=0`) | Excludes `filetools.c`; `filetools_nofs.c` returns a fixed bounded error for all four file tools. Other host tools/harness are unchanged |
+| Portable core-only probe | `make test-core-nofs` | Strict C11 `-Werror`; core loop/config/echo transport + cJSON, no POSIX feature macros, filesystem I/O or libcurl. A small test adapter supplies tool/schema registries; this is not the full CLI |
+| MCU / RTOS | **待定 / 未验证** | Chip, RTOS, cross-toolchain, RAM/Flash and hardware test matrix have not been supplied; host results are not MCU support claims |
+
+`search_files` keeps directory enumeration inside the optional POSIX file
+backend. An explicitly named start path is canonicalized and checked against
+the workspace, then reopened relative to a workspace directory fd. Every
+component and recursive entry uses `openat(..., O_NOFOLLOW)`; recursive
+symlinks (including loops) are skipped. This closes symlink replacement
+between a pathname check and open without adding any dependency to core.
+Read/write/patch keep their existing canonical-path behavior.
+
+Traversal is iterative, not recursive in C. Its hard limits are 32 open
+directory levels, 4096 visited entries (excluding `.`/`..`), 1 MiB read per
+file, 16 MiB read per call, `PATH_MAX` bytes per path, a 4096-byte line buffer
+and 200 matches. Overlong lines are drained and skipped. With
+`PATH_MAX=4096`, active/transient path strings (including the canonical start
+path) occupy at most 34 * 4096 = 136 KiB; the fixed line buffer is 4 KiB and
+the fixed 32-frame stack is below 1 KiB
+(on the current 64-bit host). Raw match path+text storage is below
+`200 * (4095 + 4095)` = 1,638,000 bytes, excluding bounded cJSON node
+overhead. Worst-case JSON escaping keeps the printed result below roughly
+10 MiB on that host. libc regex/DIR allocation is implementation-dependent,
+but directory recursion and application-owned storage have the bounds above.
+Diagnostics report node/byte counts, skipped links, overlong lines,
+unreadable entries and truncation reasons.
+
+Reference host measurements on 2026-11-15 (Linux x86_64, gcc `-O2`, stripped
+unless noted; baseline `e315297`) are:
+
+| Build / measurement | Bytes / RSS | Relative result |
+| --- | ---: | ---: |
+| Baseline full CLI | 153,848 bytes; text 140,594; data 2,584; BSS 167,960 | baseline |
+| Bounded-search full CLI | 157,944 bytes; text 144,405; data 2,648; BSS 167,960 | +4,096 total; +3,811 text; +64 data; BSS unchanged |
+| `FILE_TOOLS=0` host CLI | 145,656 bytes; text 134,899; data 2,536; BSS 163,864 | optional backend/stub delta visible; no new core dependency |
+| Core-only nofs probe | 52,264 bytes unstripped; text 34,991; data 800; BSS 4,224 | links libc only, no libcurl |
+| `tests/perf.sh` cold / 5-step loop peak RSS | 9,004 / 8,856 KiB | baseline 8,940 / 8,872 KiB; both below 64 MiB guard |
+| Search stress max child peak RSS | 29,424 KiB | Linux `ru_maxrss`; includes long-path + 200-result provider round |
+
+These are relative host measurements, not absolute MCU RAM/Flash headroom.
+The no-filesystem switch does not make unrelated host tools, HTTP transports,
+plugins, sessions or gateway MCU-portable. A real target port still needs its
+own HAL/RTOS backends and measured RAM/Flash budget.
 
 CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
@@ -40,7 +91,8 @@ on main): `build` (gcc clean compile+link, size guard, artifact),
 `test-skills` / `test-schema` / `test-goal` (component-scoped smoke
 groups, see `tests/smoke.sh <group>`), `plugins` (example .so with gcc +
 clang -Werror), `tools` (component static libs compile independently
-with clang -Werror), and `sanitizers` (ASAN/UBSAN tools smoke).
+with clang -Werror), `no-filesystem` (strict-C11 core and optional file
+backend cut), and `sanitizers` (ASAN/UBSAN tools smoke).
 `perf` and `compat-matrix` are informational
 (ubuntu 22.04 gcc-11 / 24.04 gcc-13 / 26.04 gcc-15 / centos-stream9
 container / clang).

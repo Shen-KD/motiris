@@ -2,4 +2,5 @@ motiris
 examples/*.so
 *.o
 *.a
+/build/
 src/*.o.hermes/

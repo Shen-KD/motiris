@@ -21,8 +21,14 @@ CPPFLAGS += -DMOTIRIS_SHA=\"$(MOTIRIS_SHA)\" -DMOTIRIS_DT=\"$(MOTIRIS_DT)\" \
 LDFLAGS ?= -Wl,-l:libcurl.so.4
 PREFIX  ?= /usr/local
 
+FILE_TOOLS ?= 1
 CORE_SRC    = $(wildcard src/core/*.c)
-TOOLS_SRC   = $(wildcard src/tools/*.c)
+TOOLS_ALL   = $(wildcard src/tools/*.c)
+ifeq ($(FILE_TOOLS),0)
+TOOLS_SRC   = $(filter-out src/tools/filetools.c,$(TOOLS_ALL))
+else
+TOOLS_SRC   = $(filter-out src/tools/filetools_nofs.c,$(TOOLS_ALL))
+endif
 HARNESS_SRC = $(wildcard src/harness/*.c)
 CORE_OBJ    = $(CORE_SRC:.c=.o)
 TOOLS_OBJ   = $(TOOLS_SRC:.c=.o)
@@ -33,13 +39,13 @@ HDR = include/motiris.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 libmotiris_core.a: $(CORE_OBJ)
-	ar rcs $@ $^
+	rm -f $@ && ar rcs $@ $^
 
 libmotiris_tools.a: $(TOOLS_OBJ)
-	ar rcs $@ $^
+	rm -f $@ && ar rcs $@ $^
 
 libmotiris_harness.a: $(HARNESS_OBJ)
-	ar rcs $@ $^
+	rm -f $@ && ar rcs $@ $^
 
 motiris: libmotiris_core.a libmotiris_tools.a libmotiris_harness.a \
 		src/main.o src/compat.o src/vendor/cJSON.o deps/linenoise/linenoise.o
@@ -56,6 +62,38 @@ examples/hello_plugin.so: examples/hello_plugin.c include/motiris.h
 test: motiris
 	sh tests/smoke.sh
 
+# Core-only portability probe: strict C11, no POSIX/file I/O/libcurl.
+# The small test adapter supplies only tool/schema registries and invokes echo.
+NOFS_DIR      = build/nofs
+NOFS_CFLAGS   ?= -O2 -std=c11 -Wall -Wextra -Werror
+NOFS_CPPFLAGS = -Iinclude -Isrc/vendor -DMOTIRIS_NO_FILESYSTEM
+NOFS_CORE_OBJ = $(patsubst src/core/%.c,$(NOFS_DIR)/%.o,$(CORE_SRC))
+
+$(NOFS_DIR)/%.o: src/core/%.c $(HDR)
+	@mkdir -p $(NOFS_DIR)
+	$(CC) $(NOFS_CFLAGS) $(NOFS_CPPFLAGS) -c $< -o $@
+
+$(NOFS_DIR)/cJSON.o: src/vendor/cJSON.c src/vendor/cJSON.h
+	@mkdir -p $(NOFS_DIR)
+	$(CC) $(NOFS_CFLAGS) $(NOFS_CPPFLAGS) -c $< -o $@
+
+$(NOFS_DIR)/core_nofs.o: tests/core_nofs.c $(HDR)
+	@mkdir -p $(NOFS_DIR)
+	$(CC) $(NOFS_CFLAGS) $(NOFS_CPPFLAGS) -c $< -o $@
+
+$(NOFS_DIR)/core-nofs-test: $(NOFS_CORE_OBJ) $(NOFS_DIR)/cJSON.o \
+		$(NOFS_DIR)/core_nofs.o
+	$(CC) $(NOFS_CFLAGS) -o $@ $^
+
+test-core-nofs: $(NOFS_DIR)/core-nofs-test
+	$<
+
+# Full host CLI with the POSIX file backend replaced by bounded stubs.
+test-nofs: test-core-nofs
+	$(MAKE) clean
+	$(MAKE) FILE_TOOLS=0 motiris
+	sh tests/nofs.sh
+
 # run the full smoke suite inside a throwaway container: isolated HOME,
 # ports and processes (no orphan mocks on the host)
 test-docker:
@@ -66,9 +104,10 @@ test-docker:
 
 clean:
 	rm -f motiris *.a
+	rm -rf build/nofs
 	find src deps -name '*.o' -delete
 
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test test-docker clean install
+.PHONY: test test-core-nofs test-nofs test-docker clean install
