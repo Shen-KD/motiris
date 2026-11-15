@@ -44,8 +44,9 @@ agent process stays idle-quiet between requests.
   Text remains available on engine failure; the default build has no TTS code.
 - **Full-turn sessions** — bounded, versioned JSON checkpoints (`--save`,
   `-r`) preserve complete user/assistant/tool-call/tool-result messages.
-  Atomic replacement, ownership/integrity checks and strict legacy rejection
-  protect CLI, REPL and gateway restore; `/sessions` remains the review list.
+  Portable core memory export/import and an optional atomic host-file backend
+  share ownership/integrity checks and strict legacy rejection; `/sessions`
+  remains the review list.
 - **Bounded live history and replay** — per-agent item/byte budgets evict only
   complete oldest user turns. Independent replay limits select a safe suffix
   for the provider without changing stored history or splitting tool calls.
@@ -86,6 +87,7 @@ make test             # offline smoke tests, no API key required
 make FILE_TOOLS=0     # cut the POSIX file backend; bounded stubs remain
 make SHELL_TOOLS=0    # compile out and unregister the host shell backend
 make test-nofs        # strict-C11 core probe + file/shell backend cut test
+make test-core-nofs   # core-only retention + memory snapshot round-trip
 make test-shell       # bounded shell execution integration tests
 make test-vision      # clean optional-vision build + local mock integration
 make VISION_TOOLS=1   # opt in to the host-backed vision_analyze tool
@@ -103,9 +105,10 @@ their documented OS facilities. `VISION_TOOLS=1` is a separate opt-in with
 its own POSIX file and libcurl network backend; it remains excluded when
 `FILE_TOOLS=0` unless both switches are explicitly enabled. Run `make clean`
 when changing compile-time switches. `make test-core-nofs` separately builds
-the core loop/config/echo transport as strict C11 without POSIX file I/O or
-libcurl. That core-only probe is not a claim of MCU/RTOS support; see
-[docs/DEVELOPING.md](docs/DEVELOPING.md) for the platform matrix and bounds.
+the core loop/config/echo transport and memory snapshot codec as strict C11
+without POSIX file I/O or libcurl. That core-only probe is not a claim of
+MCU/RTOS support; see [docs/DEVELOPING.md](docs/DEVELOPING.md) for the
+platform matrix and bounds.
 
 ## Usage
 
@@ -169,6 +172,15 @@ version-mismatched and legacy input fails closed; restoring never executes an
 old tool. REPL `/resume` requires an empty context (use `/new` first). The
 backend is in the host harness and is absent from the strict core-only
 no-filesystem probe; no MCU/RTOS backend is claimed.
+
+The portable core also exposes `motiris_session_export` and
+`motiris_session_import` for caller-owned memory buffers. Export returns one
+malloc'd, NUL-terminated snapshot of at most 1 MiB; import takes an explicit
+length excluding that readable NUL terminator. The core retains no exported
+copy and provides no storage service: an embedder can keep the buffer in RAM
+or supply its own bounded RTOS/HAL persistence. Memory round-trip, ownership
+and corruption rejection run in the strict core-only probe without host file
+I/O. This is not durable storage by itself and is not an MCU hardware claim.
 
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
@@ -316,6 +328,7 @@ history: [CHANGELOG.md](CHANGELOG.md).
 ```
 include/motiris.h      public API: agent, tools, plugin ABI
 src/agent.c            agent loop, request assembly, tool dispatch
+src/core/checkpoint.c  portable bounded memory snapshot export/import
 src/transport.c        libcurl C backend (default) / spawn-curl / echo
 src/tools.c            built-in tools (shell, time)
 src/filetools.c        read/write/patch/search (workspace-guarded)
@@ -341,6 +354,7 @@ Dockerfile.test        isolated test image (make test-docker)
 
 ```
 make test          # 27 default offline smoke checks, no network/key needed
+make test-core-nofs # strict-C11 core + caller-owned memory snapshots
 make test-shell    # shell dual-stream/cap/timeout/reaping regression cases
 make test-vision   # optional vision build + 10 local-mock integration cases
 make test-tts      # optional TTS build + 8 fake-engine integration cases
