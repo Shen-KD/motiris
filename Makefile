@@ -61,6 +61,8 @@ src/harness/repl.o src/harness/tts.o: src/harness/tts.h
 # in the compatibility matrix below the size guard. The strict probe stays -O2.
 src/core/agent.o src/core/transport.o src/core/checkpoint.o \
 	src/tools/filetools.o: override CFLAGS += -Os
+# C snapshot code has no exception unwinding; avoid size-only unwind tables.
+src/core/checkpoint.o: override CFLAGS += -fno-unwind-tables -fno-asynchronous-unwind-tables
 # The host CLI/harness is I/O-bound and outside the agent/tool hot path.
 # Optimize it for size so optional host adapters preserve the tiny-binary guard.
 $(HARNESS_OBJ) src/main.o: override CFLAGS += -Os

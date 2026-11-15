@@ -347,18 +347,21 @@ noted; baseline `2fc9b9a`) are:
 | Checkpoint full CLI (`aaf0730`) | 162,040 bytes; text 150,066; data 2,816; BSS 167,944 | +0 file; +1,517 text; +152 data; -16 BSS; below 163,840 guard |
 | Live/replay retention full CLI (`2d8a7ad`) | 162,040 bytes; text 150,799; data 2,800; BSS 167,944 | vs `aaf0730`: +0 file; +733 text; -16 data; BSS unchanged |
 | Core-only nofs probe with retention (`2d8a7ad`) | 56,744 bytes unstripped; text 40,093; data 808; BSS 4,224 | +4,480 file; +5,102 text; +8 data; BSS unchanged; zero checkpoint symbols |
-| Memory-codec full CLI | 162,040 bytes; text 151,793; data 2,800; BSS 167,944 | vs `2d8a7ad`: +0 file; +994 text; data/BSS unchanged; below 163,840 guard |
+| Memory-codec full CLI (gcc 15) | 162,040 bytes; text 151,409; data 2,800; BSS 167,944 | vs `2d8a7ad`: +0 file; +610 text; data/BSS unchanged; below 163,840 guard |
+| Memory-codec full CLI (Ubuntu 22.04 gcc 11) | 162,048 bytes; text 152,806; data 2,792; BSS 167,944 | container build + full 27-check smoke; original 163,840 guard passes |
 | Core-only nofs probe with memory codec | 65,464 bytes unstripped; text 47,111; data 952; BSS 4,224 | vs `2d8a7ad`: +8,720 file; +7,018 text; +144 data; BSS unchanged; no host file symbols |
 | Near-cap valid restore | 1,006,563-byte snapshot; 256 messages | 10.3 ms REPL startup + restore; 18,132 KiB peak child RSS (checkpoint baseline measurement) |
 | Near-cap restore + new bounded echo turn | input 1,006,563; output 991,187 bytes; 256 messages | 30 ms process elapsed; 12,568 KiB peak RSS; complete-turn eviction and atomic save |
-| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,088 / 9,024 KiB | `2d8a7ad` baseline 9,136 / 8,968 KiB; 50 ms / 50 ms; guards pass |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,064 / 9,024 KiB | `2d8a7ad` baseline 9,136 / 8,968 KiB; 50 ms / 50 ms; guards pass |
 
 Host CLI/harness, full-CLI agent/transport/checkpoint and the POSIX file
 backend use `-Os` because their request/history/snapshot/file work is
 I/O-bound or size-sensitive; the strict core-only probe, config and other tool
 objects remain `-O2`. Keeping the full-CLI snapshot codec at `-Os` preserves
-the same size policy it had in the harness and keeps every compiler in the
-compatibility matrix within the full-binary size guard.
+the same size policy it had in the harness. Its full-CLI object also omits
+C-unneeded asynchronous/unwind tables; the strict probe retains normal unwind
+metadata. These flags keep every compiler in the compatibility matrix within
+the full-binary size guard without changing snapshot limits or behavior.
 The near-cap timing includes process/REPL startup and is not a pure parser
 benchmark. Peak RSS includes libc, cJSON trees and transient copies; it is not
 an MCU RAM budget. Snapshot writes are bounded by the same 1 MiB cap and happen
