@@ -1,10 +1,9 @@
-/* sessions.c - shared session-log helpers: state dir, listing, append.
+/* sessions.c - shared state-dir and session-file listing helpers.
  *
- * Motiris keeps append-only session logs as <tag><line> rows (U=user,
- * A=assistant, T=tool) under $HOME/.local/share/motiris/<sub>/<id>.log
- * (sub = "gateway", "sessions" for the repl, ...).  Everything that
- * reads or writes these logs goes through this module so the CLI
- * (--sessions), the repl (/sessions) and the gateway stay in sync.
+ * Full-turn checkpoint I/O lives in checkpoints.c.  The append helper below
+ * is retained only for legacy human U/A/T traces; ambiguous trace rows are
+ * never accepted as restore input.  --sessions and /sessions can still list
+ * both legacy traces and the newer JSON snapshots under the same state root.
  */
 #include "motiris.h"
 

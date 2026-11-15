@@ -130,11 +130,24 @@ char *motiris_tools_dir_default(void);   /* strdup'd; env > ~/.motiris/tools */
 void  motiris_tool_scan(const char *plugin_dir);    /* index <dir>/<name>/<name>.json schemas */
 const char *motiris_tool_schema(const char *name);  /* external schema or NULL */
 
-/* ---- sessions: shared U/A/T session-log helpers (--sessions, repl) ---- */
+/* ---- sessions: host trace listing + bounded full-turn checkpoints ---- */
 char *motiris_state_dir(const char *sub);  /* mkdir -p, strdup'd; NULL no HOME */
 int  motiris_session_list(const char *sub, const char *term);   /* prints */
+/* Legacy human-trace append only; never accepted as checkpoint restore input. */
 int  motiris_session_append(const char *sub, const char *id, char tag,
                             const char *line);  /* 0 on success */
+/* Versioned JSON snapshots: 1 MiB / 256 messages / 256 KiB per record.
+ * Save atomically replaces path; load requires an empty agent context and
+ * validates roles, tool pairing, ownership and integrity before restoring.
+ * session_id may be NULL/empty for standalone CLI files. */
+int  motiris_session_save(const char *path, MotirisAgent *agent,
+                          const char *session_id, const char **error);
+int  motiris_session_checkpoint(const char *sub, const char *id,
+                                MotirisAgent *agent, const char *session_id,
+                                const char **error);
+int  motiris_session_load(MotirisAgent *agent, const char *path,
+                          const char *expected_session_id,
+                          size_t *loaded_messages, const char **error);
 
 /* ---- cron: scheduled agent runs ---- */
 int motiris_cron_run(const char *jobs_file, int once, int verbose);

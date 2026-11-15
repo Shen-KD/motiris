@@ -9,16 +9,16 @@ motiris = 一个 ~150KB 的 C11 二进制,零运行时依赖(libcurl.so.4 除外
 本次改造后,系统由四层组成:
 
 - 入口层:CLI(`main.c`)、REPL(`repl.c`)、HTTP 网关(`gateway.c`)、定时任务(`cron.c`)
-- 核心层:agent 循环(`agent.c`)、配置(`config.c`)、传输(`transport.c`)、
-  会话日志(`sessions.c`,新增)
+- 核心层:agent 循环(`agent.c`)、配置(`config.c`)、传输(`transport.c`)
 - 工具层:注册表(最多 128 个工具),内置/文件/网络/记忆/技能/子代理/
   浏览器/MCP/插件
-- 存储层:`~/.local/share/motiris/` 下的 sessions/、gateway/、cron/、
-  memory.json、plugins/,以及用户指定的 skill 目录
+- 存储层:host `sessions.c`/`checkpoints.c` 与 `~/.local/share/motiris/`
+  下的 sessions/、gateway/、cron/、memory.json、plugins/,以及用户指定的 skill 目录
 
-新增能力(本轮):REPL 启动横幅显示模型/SKILL/TOOLS、自动会话日志、
+新增能力(本轮):REPL 启动横幅显示模型/SKILL/TOOLS、自动会话保存、
 `/sessions` `/resume` `/skills` 命令、模型可编辑技能的 skill_patch/
-skill_write 工具。
+skill_write 工具。会话恢复已升级为有界 full-turn JSON checkpoint，保留
+完整 assistant/tool 上下文，并拒绝 legacy 行注入。
 
 ## 2. 架构图
 
@@ -34,7 +34,7 @@ skill_write 工具。
                       v                      v                 v
   交互        +----------------+      +-----+-----------+    |
               | REPL (repl.c)  |      | sessions.c      |<---+
-              | banner 信息     |----->| (共享 U/A/T 日志)|
+              | banner 信息     |----->| (共享快照/列表) |
               | /sessions      | 复   +-----------------+
               | /resume        | 用
               | /skills        |
@@ -73,13 +73,17 @@ skill_write 工具。
 工具、把结果作为 tool 消息追加 → 回到循环;finish_reason=stop 输出最终
 答案。token 计数从每次响应的 usage 累加。
 
-**会话日志(U/A/T 行)**:所有入口统一走 `sessions.c`。
-- REPL(tty 下):每轮写 `U<用户行>`,`T<工具名>(<参数摘要>) -> <结果摘要>`
-  (工具钩子),回合结束写 `A<完整回复>`
-- 网关:`gateway/<hex(chat_id)>.log`,首行 I 记录完整 ID 的 hex 归属;
-  校验后按 U 行重放历史,旧 sanitize 文件名不迁移、不归并重放
-- `--sessions` / `/sessions [TERM]`:`motiris_session_list("gateway"|"sessions", term)`
-- `/resume FILE`:读取日志的 U 行注入当前上下文
+**会话快照(full-turn JSON)**:列表/状态目录走 `sessions.c`，原子快照 I/O
+统一走 `checkpoints.c`。
+- CLI `--save`、REPL(tty 下)和 Gateway 只在完整成功回合后保存；保留
+  user/assistant/tool_calls/tool_call_id 的顺序与多行内容，不执行旧工具。
+- 快照上限 1 MiB / 256 messages / 256 KiB record / 256 tool calls；校验
+  session_id、完整性 digest、角色和 tool 配对，legacy/损坏/超限输入 fail closed。
+- 网关:`gateway/<hex(chat_id)>.log` 同时以文件名和 session_id 绑定完整 ID；
+  重启及 64 会话淘汰后恢复完整消息，旧 sanitize/I/U/A/T 文件不迁移。
+- `--sessions` / `/sessions [TERM]` 继续列文件；`/resume FILE` 在空上下文
+  恢复完整快照。host 后端采用短临时名 + flush/fsync + atomic rename，
+  strict core-only nofs 构建不链接该模块。
 
 **Skill 编辑**:skilltools.c 启动时扫描 `--skill-dir` 的 *.md,解析
 frontmatter(name/description)建立索引(含文件名);skill_patch /
@@ -90,8 +94,8 @@ skill_write 按索引构造路径(`skill_dir` + `file`,不经用户输入,天然
 
 ```
 ~/.local/share/motiris/
-├── sessions/        repl 会话日志 repl-YYYYMMDD-HHMMSS-<pid>.log
-├── gateway/         <hex(chat_id)>.log(网关会话,I 归属头 + U/A/T 行)
+├── sessions/        repl full-turn 快照 repl-YYYYMMDD-HHMMSS-<pid>.log
+├── gateway/         <hex(chat_id)>.log(绑定期望 chat_id 的 full-turn 快照)
 ├── cron/            <job_id>.log
 ├── memory.json      持久记忆
 └── plugins/         插件 .so
@@ -212,7 +216,8 @@ MotirisTool.parameters(加载器持有副本,注册时拷贝进 agent 存储);
 1. 方案 B(schema 文件化)落地,约 1 天工作量,从上面的顺序开工
 2. `/jobs` 命令:cron 日志接入 motiris_session_list("cron", term),
    一行命令
-3. 会话日志轮转/清理策略(目前每会话一文件,不删)
+3. live messages item/byte retention、独立 replay 预算与 memory-only/RTOS/HAL
+   持久化后端(当前 host checkpoint 有界，但 live history 尚未裁剪)
 4. 网关会话目录统一读 MOTIRIS_HOME(现状:config 读 MOTIRIS_HOME,
    状态目录读 HOME,属历史遗留不一致)
 

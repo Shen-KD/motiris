@@ -161,11 +161,14 @@ jobs:
           make CFLAGS="-O1 -g -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -fsanitize=address,undefined -fno-omit-frame-pointer" \
             LDFLAGS="-fsanitize=address,undefined -Wl,-l:libcurl.so.4"
 
-      - name: tools smoke under ASAN/UBSAN
+      - name: checkpoint and tools smoke under ASAN/UBSAN
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: sh tests/smoke.sh tools
+          SMOKE_SIZE_MAX: 2097152
+        run: |
+          sh tests/smoke.sh core
+          sh tests/smoke.sh tools
 
   # performance & resource guard: cold-start latency, peak RSS, agent-loop
   # overhead. Informational check (not required for merge).

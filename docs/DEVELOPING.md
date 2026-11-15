@@ -255,6 +255,63 @@ responses. It runs in smoke #11, including the ASAN/UBSAN tools job. These are
 host bounds and measurements only; no MCU/RTOS cross-toolchain, target
 Flash/RAM or hardware validation is available.
 
+### Bounded full-turn checkpoints
+
+`src/harness/checkpoints.c` is the optional host stdio backend for CLI
+`-r/--save`, REPL `/resume`/interactive turns, and gateway restart/eviction.
+It is not linked into `build/nofs/core-nofs-test`; `src/core/` and its direct
+dependencies are unchanged. There is no database, thread, subprocess, socket,
+TLS or new runtime dependency in the checkpoint path.
+
+The versioned `motiris-full-turn` JSON document stores `session_id`, complete
+ordered `messages` and a digest. Only user/assistant/tool roles and the
+`role`, `content`, `tool_calls`, `tool_call_id` message fields are accepted.
+Function calls and results must match exactly in order, the first message must
+be user and the last must be assistant. Restore requires an empty context
+(`/new` before REPL `/resume` when needed), validates ownership and never
+executes an old tool. The FNV-1a-64 digest detects accidental corruption; it
+is not a cryptographic signature or protection against an editor who can also
+recompute it. File permissions and caller/path trust remain necessary.
+
+Hard limits are 1 MiB per snapshot read/write, 256 messages, 256 total tool
+calls and 256 KiB per serialized message. The read buffer is capped at
+1 MiB + 2 bytes; cJSON node overhead is implementation-dependent but the input
+and node count are byte-bounded. Save temporarily holds bounded per-record,
+message-payload, duplicated-tree and root-serialization copies. The previous
+valid file is preserved on validation/write failure: a short same-directory
+mode-0600 temporary file is fully written, flushed/`fsync`ed and atomically
+renamed. The short temporary basename also fits a maximum-length 244-byte
+gateway filename under `NAME_MAX`. Only one latest snapshot is kept per
+session; failed turns are not saved. Gateway responses distinguish `saved`,
+`volatile-only` and `checkpoint_error` rather than silently claiming durable
+storage.
+
+Legacy U/A/T (including I-header) logs are not restore input and are not
+automatically migrated: their role loss and ambiguous line framing cannot be
+repaired safely. Start a new checkpoint, or use gateway `"reset":true` for an
+exact chat ID. Existing files remain visible to `/sessions` only as legacy
+review text.
+
+Reference host measurements on 2026-11-16 (Linux x86_64, gcc, stripped unless
+noted; baseline `2fc9b9a`) are:
+
+| Build / measurement | Bytes / sections / RSS | Relative result |
+| --- | ---: | ---: |
+| Baseline default full CLI | 162,040 bytes; text 148,549; data 2,664; BSS 167,960 | baseline |
+| Checkpoint full CLI | 162,040 bytes; text 150,066; data 2,816; BSS 167,944 | +0 file; +1,517 text; +152 data; -16 BSS; below 163,840 guard |
+| Core-only nofs probe | 52,264 bytes unstripped; text 34,991; data 800; BSS 4,224 | unchanged; zero checkpoint symbols/dependencies |
+| Near-cap valid restore | 1,006,563-byte snapshot; 256 messages | 10.3 ms REPL startup + restore; 18,132 KiB peak child RSS |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,092 / 9,236 KiB | baseline 8,996 / 9,324 KiB; normal host variation; 50 ms / 50 ms |
+
+Host CLI/harness objects use `-Os` because they are I/O-bound; core and tools
+remain `-O2`, which keeps the full binary within the established size guard.
+The near-cap timing includes process/REPL startup and is not a pure parser
+benchmark. Peak RSS includes libc, cJSON trees and transient copies; it is not
+an MCU RAM budget. Snapshot writes are bounded by the same 1 MiB cap and happen
+only after successful turns. Live in-memory history retention, independent
+replay budgets, memory-only/RTOS/HAL persistence and actual MCU/RTOS Flash/RAM
+or hardware validation remain open follow-up work; none is claimed here.
+
 CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
 on main): `build` (gcc clean compile+link, size guard, artifact),
@@ -337,9 +394,11 @@ config.json spawns a stdio JSON-RPC server; each remote tool registers
 as `<server>:<tool>`. `env` overrides are applied in the child process
 before exec (not yet implemented for arbitrary vars — see mcp.c).
 
-Sessions: `src/harness/sessions.c` owns the shared U/A/T log helpers
-(`motiris_state_dir` / `motiris_session_list` / `motiris_session_append`);
-`--sessions`, the gateway and the repl (/sessions) all go through it.
+Sessions: `src/harness/sessions.c` owns state directories and legacy trace
+listing; `src/harness/checkpoints.c` owns validated full-turn snapshot I/O.
+`--save`, `-r`, REPL `/resume`/auto-save and gateway restore all use the
+checkpoint API. `motiris_session_append` is legacy trace-only and must never
+be used as restore input.
 
 Skill files: `skill_patch` / `skill_write` in skilltools.c edit the
 indexed `--skill-dir` files in place; paths are built from the index
@@ -355,13 +414,19 @@ lives in plugin.c and is shared with toolscan.
 
 ## Tests that must not regress
 
-- Smoke #4: binary stays < 163840 bytes.
+- Smoke #4: default binary stays < 163840 bytes (`SMOKE_SIZE_MAX` may be
+  raised only for instrumented builds such as ASAN/UBSAN).
+- Smoke #6: full-turn CLI/REPL round-trip preserves multiline assistant and
+  tool objects without line-prefix role injection; malformed/legacy/digest/
+  pairing/message/record/file-cap failures are offline and rejected before
+  the provider. Near-cap valid restore, failed-turn atomic preservation and
+  PTY auto-save are included.
 - Smoke #9: gateway health/auth plus partial, byte-segmented, malformed
   and oversized requests. Headers are capped at 16 KiB and bodies at
   1 MiB; the receive allocation is capped at their sum plus one NUL byte.
   Gateway session regressions cover colliding punctuation, case, Unicode,
-  120-byte IDs, restart and 64-session eviction replay, fail-closed identity
-  headers, and exact-ID reset without cross-session deletion.
+  120-byte IDs, full assistant restoration after restart and 64-session
+  eviction, legacy/ownership/digest fail-closed behavior, and exact-ID reset.
 - Smoke #11: shell drains both pipes concurrently, enforces per-stream/total
   output caps and a monotonic timeout, kills/reaps its process group, and
   survives repeated calls without fd/direct-child leaks (also under ASAN/UBSAN).
@@ -372,6 +437,8 @@ lives in plugin.c and is shared with toolscan.
 - Smoke #20/#21: skill_patch / skill_write edit real skill files via
   the agent loop (mock model), matching the current schema strings —
   if you change a tool schema, update these mocks.
+- Smoke #23: REPL `/resume` restores a full four-message echo turn and
+  rejects legacy U/A/T rows rather than treating their contents as commands.
 - Smoke #24-26: per-tool schema files (override / invalid json / plugin
   subdir layout) — if you change the merge logic or dir resolution,
   update these.

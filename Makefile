@@ -57,6 +57,9 @@ HDR = include/motiris.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 src/harness/repl.o src/harness/tts.o: src/harness/tts.h
+# The host CLI/harness is I/O-bound and outside the agent/tool hot path.
+# Optimize it for size so optional host adapters preserve the tiny-binary guard.
+$(HARNESS_OBJ) src/main.o: override CFLAGS += -Os
 
 libmotiris_core.a: $(CORE_OBJ)
 	rm -f $@ && ar rcs $@ $^
