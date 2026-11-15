@@ -46,6 +46,9 @@ agent process stays idle-quiet between requests.
   `-r`) preserve complete user/assistant/tool-call/tool-result messages.
   Atomic replacement, ownership/integrity checks and strict legacy rejection
   protect CLI, REPL and gateway restore; `/sessions` remains the review list.
+- **Bounded live history and replay** — per-agent item/byte budgets evict only
+  complete oldest user turns. Independent replay limits select a safe suffix
+  for the provider without changing stored history or splitting tool calls.
 - **Skills** — a directory of `.md` files injected as system context.
 - **Tiny core** — cJSON is the only runtime-embedded vendor; HTTP goes
   through a built-in libcurl C backend (no child process; HTTPS/TLS
@@ -138,18 +141,34 @@ filenames are not migrated or replayed. `"reset":true` removes only that exact
 ID's snapshot and starts fresh. Successful responses report `checkpoint` as
 `saved` or `volatile-only`, or include a bounded `checkpoint_error`.
 
+Each agent's live history is capped at 256 messages and 16 MiB of compact
+serialized message records by default. `MOTIRIS_HISTORY_MAX_MESSAGES` and
+`MOTIRIS_HISTORY_MAX_BYTES` lower those limits (also available through the C
+API). When a new record would exceed either budget, complete oldest user turns
+are evicted first; assistant/tool sequences are never split. If the active
+turn alone cannot fit, the run fails with an explicit diagnostic instead of
+truncating content or growing without bound. The 16 MiB ceiling accommodates
+existing bounded host-tool results, is not preallocated, and is not an MCU RAM
+budget; embedded users should select a target-appropriate limit.
+
+Provider replay has independent `MOTIRIS_REPLAY_MAX_MESSAGES` and
+`MOTIRIS_REPLAY_MAX_BYTES` limits (the same defaults). Replay includes the
+whole active turn plus as many newest complete older turns as fit. A smaller
+replay budget does not delete live or persisted history; an over-budget active
+turn fails before any provider request. Restore applies the live limits before
+reporting the number of retained messages.
+
 CLI `--save`, interactive REPL turns and gateway turns atomically replace one
-latest snapshot per session. The host backend limits files to 1 MiB, history
+latest snapshot per session. The host backend limits files to 1 MiB, snapshots
 to 256 messages and 256 tool calls, and each serialized message to 256 KiB.
 It preserves message order and multiline text as JSON, validates tool
 call/result pairing and an integrity digest, and writes a mode-0600 temporary
 file followed by flush/`fsync` and atomic `rename`. The FNV-1a-64 digest is
 for corruption detection, not cryptographic authentication. Corrupt, oversized,
 version-mismatched and legacy input fails closed; restoring never executes an
-old tool. REPL `/resume` requires an empty context (use `/new` first). These
-are persistence/replay bounds, not yet a live-agent history
-retention policy. The backend is in the host harness and is absent from the
-strict core-only no-filesystem probe; no MCU/RTOS backend is claimed.
+old tool. REPL `/resume` requires an empty context (use `/new` first). The
+backend is in the host harness and is absent from the strict core-only
+no-filesystem probe; no MCU/RTOS backend is claimed.
 
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
@@ -158,7 +177,9 @@ Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_VISION_MAX_BYTES`, `MOTIRIS_VISION_TIMEOUT_S`,
 `MOTIRIS_TTS_CMD`, `MOTIRIS_TTS_TIMEOUT_S`,
 `MOTIRIS_SHELL_TIMEOUT_S`, `MOTIRIS_SHELL_STDOUT_MAX`,
-`MOTIRIS_SHELL_STDERR_MAX`, `MOTIRIS_SHELL_OUTPUT_MAX`. Default endpoint:
+`MOTIRIS_SHELL_STDERR_MAX`, `MOTIRIS_SHELL_OUTPUT_MAX`,
+`MOTIRIS_HISTORY_MAX_MESSAGES`, `MOTIRIS_HISTORY_MAX_BYTES`,
+`MOTIRIS_REPLAY_MAX_MESSAGES`, `MOTIRIS_REPLAY_MAX_BYTES`. Default endpoint:
 `https://api.openai.com/v1/chat/completions`.
 
 Built-in tools (disable with `--no-tools`):

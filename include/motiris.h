@@ -31,6 +31,15 @@ void motiris_set_base_url(MotirisAgent *a, const char *u);
 void motiris_set_api_key(MotirisAgent *a, const char *k);
 void motiris_set_system(MotirisAgent *a, const char *sys);
 void motiris_add_user(MotirisAgent *a, const char *msg);
+/* Per-agent bounded live history and independent provider replay selection.
+ * Limits accept 1..256 messages and 1..16 MiB; retention evicts only complete
+ * oldest user turns. These APIs return 0, or -1 with motiris_last_error(). */
+int  motiris_set_history_limits(MotirisAgent *a, size_t max_messages,
+                                size_t max_bytes);
+int  motiris_set_replay_limits(MotirisAgent *a, size_t max_messages,
+                               size_t max_bytes);
+/* Reapply live limits after a backend imports directly into motiris_messages. */
+int  motiris_history_retain(MotirisAgent *a);
 
 /* ---- multi-provider fallback ---- */
 typedef struct MotirisProvider {

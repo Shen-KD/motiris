@@ -15,6 +15,10 @@
 #include <string.h>
 
 #define MAX_TOOLS 128
+#define HISTORY_MAX_MESSAGES 256
+/* Host tools can return bounded, escaped multi-MiB results. The live cap is
+ * an allocation ceiling, not a preallocation; MCU embedders can set it lower. */
+#define HISTORY_MAX_BYTES (16 * 1024 * 1024)
 #define DEF_BASE_URL "https://api.openai.com/v1/chat/completions"
 
 struct MotirisAgent {
@@ -41,6 +45,11 @@ struct MotirisAgent {
   MotirisProvider providers[8];
   int nproviders;
   char *last_error;
+  /* Per-agent live history and provider replay budgets. */
+  size_t history_max_messages, history_max_bytes;
+  size_t replay_max_messages, replay_max_bytes;
+  cJSON *run_start;       /* latest user turn; never evicted during its run */
+  int history_error;
 };
 
 /* transport.c */
@@ -96,6 +105,18 @@ static const char *pname(const MotirisAgent *a, int pi) {
   return a->providers[pi].name ? a->providers[pi].name : a->providers[pi].model;
 }
 
+static size_t env_limit(const char *name, size_t dflt, size_t maximum) {
+  const char *s = getenv(name);
+  if (!s || !*s) return dflt;
+  char *end = NULL;
+  unsigned long value = strtoul(s, &end, 10);
+  if (!end || *end || end == s || !value || value > maximum) {
+    fprintf(stderr, "motiris: invalid %s=%s; using %zu\n", name, s, dflt);
+    return dflt;
+  }
+  return (size_t)value;
+}
+
 MotirisAgent *motiris_new(void) {
   MotirisAgent *a = calloc(1, sizeof *a);
   const char *u = getenv("MOTIRIS_BASE_URL");
@@ -105,6 +126,14 @@ MotirisAgent *motiris_new(void) {
   a->messages = cJSON_CreateArray();
   strcpy(a->transport, "auto");
   a->max_steps = 10;
+  a->history_max_messages = env_limit("MOTIRIS_HISTORY_MAX_MESSAGES",
+                                      HISTORY_MAX_MESSAGES, HISTORY_MAX_MESSAGES);
+  a->history_max_bytes = env_limit("MOTIRIS_HISTORY_MAX_BYTES",
+                                   HISTORY_MAX_BYTES, HISTORY_MAX_BYTES);
+  a->replay_max_messages = env_limit("MOTIRIS_REPLAY_MAX_MESSAGES",
+                                     HISTORY_MAX_MESSAGES, HISTORY_MAX_MESSAGES);
+  a->replay_max_bytes = env_limit("MOTIRIS_REPLAY_MAX_BYTES",
+                                  HISTORY_MAX_BYTES, HISTORY_MAX_BYTES);
   a->tools_on = 1;
   a->plugins_on = 1;
   const char *gc = getenv("MOTIRIS_GOAL_CHECK");
@@ -188,11 +217,163 @@ void motiris_set_system(MotirisAgent *a, const char *sys) {
   a->system = sdup(sys);
 }
 
-void motiris_add_user(MotirisAgent *a, const char *msg) {
+static int history_fail(MotirisAgent *a, const char *message) {
+  a->history_error = 1;
+  set_error(a, "%s", message);
+  return -1;
+}
+
+static int message_size(const cJSON *message, size_t *size) {
+  char *printed = cJSON_PrintUnformatted(message);
+  if (!printed) return -1;
+  *size = strlen(printed);
+  free(printed);
+  return 0;
+}
+
+static const char *message_role(const cJSON *message) {
+  const char *role = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(message, "role"));
+  return role ? role : "";
+}
+
+static int history_measure(MotirisAgent *a, size_t *count, size_t *bytes) {
+  *count = 0;
+  *bytes = 0;
+  for (cJSON *m = a->messages->child; m; m = m->next) {
+    size_t size;
+    if (message_size(m, &size)) return history_fail(a, "cannot serialize history");
+    if (++*count > HISTORY_MAX_MESSAGES)
+      return history_fail(a, "history message budget exceeded");
+    if (size > HISTORY_MAX_BYTES - *bytes)
+      return history_fail(a, "history byte budget exceeded");
+    *bytes += size;
+  }
+  return 0;
+}
+
+/* Remove one oldest complete user turn, stopping before the active turn.
+ * Incomplete tool sequences and non-user prefixes are never split/evicted. */
+static size_t drop_oldest_turn(MotirisAgent *a, cJSON *active,
+                               size_t *dropped_bytes) {
+  cJSON *first = a->messages->child;
+  if (!first || first == active || strcmp(message_role(first), "user")) return 0;
+  cJSON *pending = NULL, *last = NULL, *end = NULL;
+  for (cJSON *m = first; m && m != active; m = m->next) {
+    const char *role = message_role(m);
+    if (m != first && !strcmp(role, "user")) { end = m; break; }
+    if (pending && strcmp(role, "tool")) return 0;
+    if (!strcmp(role, "assistant")) {
+      cJSON *calls = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+      if (calls && !cJSON_IsArray(calls)) return 0;
+      pending = calls ? calls->child : NULL;
+    } else if (!strcmp(role, "tool")) {
+      if (!pending) return 0;
+      pending = pending->next;
+    } else if (strcmp(role, "user")) {
+      return 0;
+    }
+    last = m;
+    end = m->next;
+  }
+  if (!last || pending || strcmp(message_role(last), "assistant")) return 0;
+
+  size_t count = 0, bytes = 0;
+  for (cJSON *m = first; m != end; m = m->next) {
+    size_t size;
+    if (message_size(m, &size)) return 0;
+    bytes += size;
+    count++;
+  }
+  while (a->messages->child != end)
+    cJSON_Delete(cJSON_DetachItemFromArray(a->messages, 0));
+  if (a->verbose)
+    fprintf(stderr, "[motiris] history retention: evicted %zu messages, %zu bytes\n",
+            count, bytes);
+  *dropped_bytes = bytes;
+  return count;
+}
+
+static int history_retain(MotirisAgent *a, cJSON *active) {
+  size_t count, bytes;
+  if (history_measure(a, &count, &bytes)) return -1;
+  while (count > a->history_max_messages || bytes > a->history_max_bytes) {
+    size_t dropped_bytes = 0;
+    size_t dropped = drop_oldest_turn(a, active, &dropped_bytes);
+    if (!dropped)
+      return history_fail(a, count > a->history_max_messages
+                          ? "history message budget exceeded for active turn"
+                          : "history byte budget exceeded for active turn");
+    count -= dropped;
+    bytes -= dropped_bytes;
+  }
+  return 0;
+}
+
+static int append_message(MotirisAgent *a, cJSON *message) {
+  size_t size, count, bytes;
+  if (message_size(message, &size)) return history_fail(a, "cannot serialize history");
+  if (size > a->history_max_bytes)
+    return history_fail(a, "history byte budget exceeded for active turn");
+  if (history_measure(a, &count, &bytes)) return -1;
+  while (count >= a->history_max_messages ||
+         bytes > a->history_max_bytes - size) {
+    size_t dropped_bytes = 0;
+    size_t dropped = drop_oldest_turn(a, a->run_start, &dropped_bytes);
+    if (!dropped)
+      return history_fail(a, count >= a->history_max_messages
+                          ? "history message budget exceeded for active turn"
+                          : "history byte budget exceeded for active turn");
+    count -= dropped;
+    bytes -= dropped_bytes;
+  }
+  cJSON_AddItemToArray(a->messages, message);
+  return 0;
+}
+
+int motiris_history_retain(MotirisAgent *a) {
+  if (!a) return -1;
+  a->history_error = 0;
+  return history_retain(a, NULL);
+}
+
+int motiris_set_history_limits(MotirisAgent *a, size_t max_messages,
+                               size_t max_bytes) {
+  if (!a || !max_messages || max_messages > HISTORY_MAX_MESSAGES ||
+      !max_bytes || max_bytes > HISTORY_MAX_BYTES) {
+    if (a) history_fail(a, "invalid history limits");
+    return -1;
+  }
+  a->history_max_messages = max_messages;
+  a->history_max_bytes = max_bytes;
+  return motiris_history_retain(a);
+}
+
+int motiris_set_replay_limits(MotirisAgent *a, size_t max_messages,
+                              size_t max_bytes) {
+  if (!a || !max_messages || max_messages > HISTORY_MAX_MESSAGES ||
+      !max_bytes || max_bytes > HISTORY_MAX_BYTES) {
+    if (a) history_fail(a, "invalid replay limits");
+    return -1;
+  }
+  a->replay_max_messages = max_messages;
+  a->replay_max_bytes = max_bytes;
+  return 0;
+}
+
+static void add_user_message(MotirisAgent *a, const char *msg, int external) {
+  if (external) {
+    a->run_start = NULL;
+    a->history_error = 0;
+  }
   cJSON *m = cJSON_CreateObject();
   cJSON_AddStringToObject(m, "role", "user");
   cJSON_AddStringToObject(m, "content", msg);
-  cJSON_AddItemToArray(a->messages, m);
+  if (append_message(a, m)) cJSON_Delete(m);
+}
+
+void motiris_add_user(MotirisAgent *a, const char *msg) {
+  add_user_message(a, msg, 1);
 }
 
 void motiris_register_tool(MotirisAgent *a, const MotirisTool *t) {
@@ -249,7 +430,74 @@ static int done_reply(const char *s) {
 }
 
 /* ---------------- request assembly ---------------- */
+static int replay_range_size(cJSON *start, const cJSON *end,
+                             size_t *count, size_t *bytes) {
+  *count = 0;
+  *bytes = 0;
+  for (cJSON *m = start; m && m != end; m = m->next) {
+    size_t size;
+    if (message_size(m, &size)) return -1;
+    (*count)++;
+    *bytes += size;
+  }
+  return 0;
+}
+
+/* Select a suffix of whole user turns. The active turn is mandatory; older
+ * turns are included newest-first only while the independent replay budget
+ * fits. This never creates an orphan tool result in a provider request. */
+static cJSON *replay_start(MotirisAgent *a, int *ok) {
+  *ok = 0;
+  cJSON *first = a->messages->child;
+  if (!first) { *ok = 1; return NULL; }
+  cJSON *start = a->run_start;
+  if (!start) {
+    for (start = first; start && strcmp(message_role(start), "user");
+         start = start->next) {}
+    if (!start) start = first;
+  }
+  size_t count, bytes;
+  if (replay_range_size(start, NULL, &count, &bytes)) {
+    set_error(a, "cannot serialize replay history", NULL);
+    return NULL;
+  }
+  if (count > a->replay_max_messages || bytes > a->replay_max_bytes) {
+    set_error(a, count > a->replay_max_messages
+              ? "replay message budget exceeded for active turn"
+              : "replay byte budget exceeded for active turn", NULL);
+    return NULL;
+  }
+  while (start != first) {
+    cJSON *candidate = NULL;
+    for (cJSON *m = first; m != start; m = m->next)
+      if (!strcmp(message_role(m), "user")) candidate = m;
+    if (!candidate) break;
+    size_t extra_count, extra_bytes;
+    if (replay_range_size(candidate, start, &extra_count, &extra_bytes)) {
+      set_error(a, "cannot serialize replay history", NULL);
+      return NULL;
+    }
+    if (extra_count > a->replay_max_messages - count ||
+        extra_bytes > a->replay_max_bytes - bytes)
+      break;
+    start = candidate;
+    count += extra_count;
+    bytes += extra_bytes;
+  }
+  if (a->verbose && start != first) {
+    size_t total = 0;
+    for (cJSON *m = first; m; m = m->next) total++;
+    fprintf(stderr, "[motiris] replay retention: sending %zu of %zu messages, %zu bytes\n",
+            count, total, bytes);
+  }
+  *ok = 1;
+  return start;
+}
+
 static char *build_request(MotirisAgent *a, const char *model) {
+  int replay_ok;
+  cJSON *replay = replay_start(a, &replay_ok);
+  if (!replay_ok) return NULL;
   cJSON *req = cJSON_CreateObject();
   cJSON_AddStringToObject(req, "model", model);
 
@@ -261,7 +509,7 @@ static char *build_request(MotirisAgent *a, const char *model) {
     cJSON_AddStringToObject(s, "content", a->system);
     cJSON_AddItemToArray(msgs, s);
   }
-  for (cJSON *m = a->messages->child; m; m = m->next)
+  for (cJSON *m = replay; m; m = m->next)
     cJSON_AddItemToArray(msgs, cJSON_Duplicate(m, 1));
   cJSON_AddItemToObject(req, "messages", msgs);
 
@@ -294,16 +542,22 @@ static char *build_request(MotirisAgent *a, const char *model) {
 }
 
 /* ---------------- response handling ---------------- */
-static void push_tool_message(MotirisAgent *a, const char *call_id,
-                              const char *content) {
+static int push_tool_message(MotirisAgent *a, const char *call_id,
+                             const char *content) {
   cJSON *m = cJSON_CreateObject();
   cJSON_AddStringToObject(m, "role", "tool");
   cJSON_AddStringToObject(m, "tool_call_id", call_id);
   cJSON_AddStringToObject(m, "content", content);
-  cJSON_AddItemToArray(a->messages, m);
+  if (append_message(a, m)) { cJSON_Delete(m); return -1; }
+  return 0;
 }
 
 int motiris_run(MotirisAgent *a) {
+  if (a->history_error) return 1;
+  a->run_start = NULL;
+  for (cJSON *m = a->messages->child; m; m = m->next)
+    if (!strcmp(message_role(m), "user")) a->run_start = m;
+  if (history_retain(a, a->run_start)) return 1;
   const char *env_key = getenv("MOTIRIS_API_KEY");
   const char *fallback_key = a->api_key ? a->api_key : (env_key ? env_key : NULL);
   int np = a->nproviders > 0 ? a->nproviders : 1;
@@ -331,7 +585,7 @@ int motiris_run(MotirisAgent *a) {
                 np > 1 ? pname(a, pi) : "default provider");
 
       char *body = build_request(a, model);
-      if (!body) { set_error(a, "request assembly failed", NULL); return 1; }
+      if (!body) return 1;
 
       char auth[512];
       char *authp = NULL;
@@ -417,7 +671,12 @@ int motiris_run(MotirisAgent *a) {
     }
 
     /* keep assistant message in history (may carry tool_calls) */
-    cJSON_AddItemToArray(a->messages, cJSON_Duplicate(msg, 1));
+    cJSON *assistant = cJSON_Duplicate(msg, 1);
+    if (!assistant || append_message(a, assistant)) {
+      cJSON_Delete(assistant);
+      cJSON_Delete(j);
+      return 1;
+    }
 
     cJSON *calls = cJSON_GetObjectItemCaseSensitive(msg, "tool_calls");
     const char *finish = cJSON_GetStringValue(
@@ -449,7 +708,11 @@ int motiris_run(MotirisAgent *a) {
                     a->tool_hooks[hi].cb(name, args ? args : "{}", result,
                                          a->tool_hooks[hi].ud);
         }
-        push_tool_message(a, id ? id : "", result);
+        if (push_tool_message(a, id ? id : "", result)) {
+          free(result);
+          cJSON_Delete(j);
+          return 1;
+        }
         free(result);
       }
       cJSON_Delete(j);
@@ -479,8 +742,9 @@ int motiris_run(MotirisAgent *a) {
                "Goal check: <%s>. If the goal is fully achieved reply "
                "exactly DONE; otherwise keep working (you may call tools).",
                goal);
-      motiris_add_user(a, confirm);
+      add_user_message(a, confirm, 0);
       free(confirm);
+      if (a->history_error) { cJSON_Delete(j); return 1; }
       confirm_asked = 1;
       cJSON_Delete(j);
       continue;

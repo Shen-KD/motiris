@@ -287,12 +287,13 @@ static int tts_goal_ack(cJSON *message, const char *content) {
       && !strncmp(prompt, "Goal check: <", 13);
 }
 
-static void tts_new_reply(MotirisAgent *a, cJSON *before) {
+static void tts_new_reply(MotirisAgent *a) {
   if (!motiris_tts_enabled()) return;
   cJSON *messages = motiris_messages(a);
-  cJSON *m = before ? before->next : (messages ? messages->child : NULL);
+  cJSON *m = messages ? messages->child : NULL;
+  if (m) while (m->next) m = m->next;
   const char *speech = NULL;
-  for (; m; m = m->next) {
+  for (; m; m = m->prev) {
     const char *role = cJSON_GetStringValue(
         cJSON_GetObjectItemCaseSensitive(m, "role"));
     const char *content = cJSON_GetStringValue(
@@ -301,6 +302,7 @@ static void tts_new_reply(MotirisAgent *a, cJSON *before) {
     /* With goal-check, retain the real answer instead of the later DONE. */
     if (tts_goal_ack(m, content)) continue;
     speech = content;
+    break;  /* newest final reply; also avoids cJSON's circular first->prev */
   }
   if (!speech) return;
 
@@ -356,10 +358,6 @@ int motiris_repl(MotirisAgent *a) {
     if (cmd == 1) { free(line); break; }
     if (cmd == 0) { free(line); continue; }
 
-#ifdef MOTIRIS_TTS_TOOLS
-    cJSON *tts_before = motiris_messages(a)->child;
-    while (tts_before && tts_before->next) tts_before = tts_before->next;
-#endif
     motiris_add_user(a, line);
     free(line);
 
@@ -378,7 +376,7 @@ int motiris_repl(MotirisAgent *a) {
     if (rc) fprintf(stderr, C_RED "motiris: %s" C_RESET "\n",
                     motiris_last_error(a));
 #ifdef MOTIRIS_TTS_TOOLS
-    if (!rc) tts_new_reply(a, tts_before);
+    if (!rc) tts_new_reply(a);
 #endif
     if (sess_id && !rc) {
       const char *error = NULL;
