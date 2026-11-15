@@ -29,7 +29,9 @@ trap 'for p in $MOCK_PIDS; do kill "$p" 2>/dev/null || true; done; true' EXIT
 # (shell-exported values intentionally override config.json)
 unset MOTIRIS_API_KEY MOTIRIS_MODEL MOTIRIS_BASE_URL MOTIRIS_PLUGIN_DIR \
       MOTIRIS_GATEWAY_TOKEN MOTIRIS_WORKSPACE MOTIRIS_TTS_CMD \
-      MOTIRIS_TTS_TIMEOUT_S 2>/dev/null || true
+      MOTIRIS_TTS_TIMEOUT_S MOTIRIS_SHELL_TIMEOUT_S \
+      MOTIRIS_SHELL_STDOUT_MAX MOTIRIS_SHELL_STDERR_MAX \
+      MOTIRIS_SHELL_OUTPUT_MAX 2>/dev/null || true
 
 make motiris examples/hello_plugin.so >/dev/null 2>&1
 
@@ -497,6 +499,7 @@ wait $M11PID 2>/dev/null || true
 cd "$ROOT"
 rm -rf "$F11"
 python3 tests/webtools.py
+python3 tests/shell.py
 
 fi
 if test_in 12; then

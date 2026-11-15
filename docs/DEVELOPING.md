@@ -32,6 +32,8 @@ make test             # offline smoke suite (27 checks, mock LLM/MCP)
 make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
 make FILE_TOOLS=0     # optional POSIX file backend -> bounded stubs
+make SHELL_TOOLS=0    # compile out and unregister host shell subprocesses
+make test-shell       # dual-stream, output cap, timeout and reaping tests
 make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
 make VISION_TOOLS=1   # opt in to host-backed vision_analyze
 make test-vision      # clean optional build + bounded local-provider tests
@@ -39,12 +41,12 @@ make TTS_TOOLS=1      # opt in to host-only REPL external TTS adapter
 make test-tts         # clean optional build + fake-engine integration tests
 ```
 
-### Platform matrix and file-search resource bounds
+### Platform matrix and resource bounds
 
 | Target | Build/test evidence | Boundary |
 | --- | --- | --- |
 | Linux gcc / clang | `make`, `make test`, CI `-Werror` and ASAN/UBSAN | Full host CLI; libcurl and POSIX tools enabled |
-| Host CLI without file backend | `make test-nofs` (`FILE_TOOLS=0`) | Excludes `filetools.c`; `filetools_nofs.c` returns a fixed bounded error for all four file tools. Other host tools/harness are unchanged |
+| Host CLI without file/shell backends | `make test-nofs` (`FILE_TOOLS=0 SHELL_TOOLS=0`) | Excludes `filetools.c` and the shell subprocess implementation; file tools return fixed bounded errors and `shell` is unregistered. Other host tools/harness are unchanged |
 | Optional host vision | `make test-vision` (`VISION_TOOLS=1`) | One workspace-local image to a configured remote provider; separate POSIX file + libcurl backend, excluded by default and not local inference |
 | Optional host TTS | `make test-tts` (`TTS_TOOLS=1`) | Final REPL text to one trusted external executable over a bounded pipe; fake-engine tests only, no audio device or MCU claim |
 | Portable core-only probe | `make test-core-nofs` | Strict C11 `-Werror`; core loop/config/echo transport + cJSON, no POSIX feature macros, filesystem I/O or libcurl. A small test adapter supplies tool/schema registries; this is not the full CLI |
@@ -163,6 +165,60 @@ failure, timeout/reaping, truncation, goal-check filtering, missing engine,
 invalid timeout and runtime-disabled behavior. No real speech engine, audio
 device, MCU cross-toolchain or hardware validation is claimed.
 
+### Bounded optional shell subprocess backend
+
+`SHELL_TOOLS=1` is the host default; `SHELL_TOOLS=0` defines
+`MOTIRIS_NO_SHELL`, compiling the `fork`/`pipe`/`poll`/`waitpid` implementation
+and its registry entry out of `src/tools/tools.c`. The strict core-only probe
+does not compile this host tool at all. No public API, agent/session state,
+thread, third-party runtime or direct dependency is added.
+
+The parent creates a process group and uses nonblocking stdout/stderr fds with
+one monotonic deadline. It interleaves reads instead of waiting for either
+stream's EOF first. Bytes beyond either per-stream cap or the shared total cap
+are drained and discarded, with `truncated`, `stdout_truncated` and
+`stderr_truncated` diagnostics. Timeout, setup/poll/read/wait errors kill the
+process group and reap the direct child; all pipe/fork/fcntl failure paths
+close their fds. Results retain `exit_code`, add `signal` and `timed_out`, and
+return bounded model-visible errors. This is execution budgeting, not a
+sandbox, general cancellation tree or asynchronous agent runtime.
+
+Defaults are 30 s, 16 KiB per stream and 32 KiB total. Environment overrides
+are `MOTIRIS_SHELL_TIMEOUT_S` (1..120 s), `MOTIRIS_SHELL_STDOUT_MAX`,
+`MOTIRIS_SHELL_STDERR_MAX` and `MOTIRIS_SHELL_OUTPUT_MAX` (each output setting
+1..262,144 bytes). Invalid values fail before process creation. Let `T` be
+the total output cap. Exact-size reallocations keep retained stdout+stderr at
+at most `T` bytes plus two NUL bytes; the read scratch buffer is 4 KiB. cJSON
+holds another at-most-`T` copy while constructing the result. Worst-case
+control-byte escaping makes the returned JSON and its agent-history copy each
+smaller than `6*T + 512` bytes (about 1.5 MiB at the hard cap). Request
+construction creates similarly bounded duplicate/serialized copies. Raw
+stream buffers are freed before the handler returns; only the bounded final
+tool result remains in the existing conversation history. These are per-call
+application bounds, not a new total-session history policy or a libc/libcurl
+internal allocation guarantee.
+
+Reference host measurements on 2026-11-15 (Linux x86_64, gcc `-O2`, stripped;
+baseline `1af30f9`) are:
+
+| Build / measurement | Bytes / sections / RSS | Relative result |
+| --- | ---: | ---: |
+| Baseline default full CLI | 157,944 bytes; text 144,973; data 2,648; BSS 167,960 | baseline |
+| Bounded-shell default full CLI | 162,040 bytes; text 148,549; data 2,664; BSS 167,960 | +4,096 file; +3,576 text; +16 data; BSS unchanged; below 163,840-byte guard |
+| `SHELL_TOOLS=0` full CLI | 153,848 bytes; text 143,165; data 2,616; BSS 167,960 | optional backend and registration compiled out |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 8,996 / 9,324 KiB | baseline 9,136 / 9,188 KiB; both below 64 MiB guard |
+| Maximum 256 KiB cap through local mock | 21,476 KiB max child RSS; Agent RSS 11,816 -> 12,508 KiB | +692 KiB retained across the sampled call; host allocator/libcurl included |
+| Timeout regression | 1.008 s for a 1 s deadline | background `sleep` descendant confirmed gone |
+
+Default and shell-cut direct ELF dependencies remain only `libcurl.so.4` and
+`libc.so.6`; `src/core/` and the public header are unchanged. `tests/shell.py`
+covers short/exit-status behavior, the 128 KiB stderr-first deadlock,
+alternating dual-stream output, exact/total caps, invalid settings, timeout
+process-group cleanup, 16 repeated calls without fd/direct-child leaks, and
+the maximum cap/result/RSS bounds. It runs in smoke #11, including the
+ASAN/UBSAN tools job. No MCU/RTOS cross-toolchain, target Flash/RAM or
+hardware validation is available; none of these host numbers is an MCU claim.
+
 ### Bounded web tool responses
 
 `web_fetch` and `web_search` share one per-GET receive buffer. It retains at
@@ -206,8 +262,8 @@ on main): `build` (gcc clean compile+link, size guard, artifact),
 `test-skills` / `test-schema` / `test-goal` (component-scoped smoke
 groups, see `tests/smoke.sh <group>`), `plugins` (example .so with gcc +
 clang -Werror), `tools` (component static libs compile independently
-with clang -Werror), `no-filesystem` (strict-C11 core and optional file
-backend cut), `vision` (optional local-mock integration and clang `-Werror`),
+with clang -Werror), `no-filesystem` (strict-C11 core and optional file/shell
+backend cuts), `vision` (optional local-mock integration and clang `-Werror`),
 `tts` (optional fake-engine integration and clang `-Werror`),
 and `sanitizers` (ASAN/UBSAN tools smoke).
 `perf` and `compat-matrix` are informational
@@ -306,6 +362,9 @@ lives in plugin.c and is shared with toolscan.
   Gateway session regressions cover colliding punctuation, case, Unicode,
   120-byte IDs, restart and 64-session eviction replay, fail-closed identity
   headers, and exact-ID reset without cross-session deletion.
+- Smoke #11: shell drains both pipes concurrently, enforces per-stream/total
+  output caps and a monotonic timeout, kills/reaps its process group, and
+  survives repeated calls without fd/direct-child leaks (also under ASAN/UBSAN).
 - Smoke #14: SSE delta aggregation (first-delta termination).
 - Smoke #16: repl shows tool lines + token stats (streamed tool_calls
   + usage through the mock).
