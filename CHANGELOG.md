@@ -12,10 +12,14 @@ published by `.github/workflows/release.yml`.
   colored labels; per-turn status footer (tokens, elapsed ms, model);
   first-run command hints.
 - REPL commands: `/sessions [TERM]` (review repl + gateway session
-  logs), `/resume FILE` (load a past session into context),
-  `/skills [TERM]`. Interactive sessions auto-log to
-  `~/.local/share/motiris/sessions/` (U/A/T rows, same format as
-  gateway logs).
+  files), `/resume FILE` (restore a validated full-turn snapshot),
+  `/skills [TERM]`. Interactive turns checkpoint to
+  `~/.local/share/motiris/sessions/`.
+- Bounded full-turn JSON checkpoints for CLI `-r/--save`, REPL and gateway:
+  complete user/assistant/tool-call/tool-result order, 1 MiB/256-message/
+  256-KiB-record limits, ownership/integrity/pairing validation and atomic
+  mode-0600 replacement. The host backend is excluded from the strict core
+  no-filesystem probe and adds no core dependency.
 - Skills: `skill_patch` / `skill_write` model tools to edit indexed
   `--skill-dir` files in place (frontmatter re-parsed on write).
 - Goal check (`--goal-check` / config `"goal_check"`): after a first
@@ -38,6 +42,10 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- Session restore no longer trusts ambiguous U/A/T rows: multiline model/tool
+  content cannot forge later user turns, and assistant/tool state survives
+  CLI/REPL/gateway restoration. Legacy, corrupt, oversized, mismatched and
+  incomplete snapshots fail closed; failed turns preserve the last valid file.
 - `shell` now drains stdout/stderr concurrently, caps per-stream and combined
   retained output, applies a monotonic timeout, and kills/reaps the command
   process group on timeout or execution errors. Model-visible results include
@@ -52,10 +60,10 @@ published by `.github/workflows/release.yml`.
   malformed input gets `400`, headers over 16 KiB or bodies over 1 MiB
   get `413`, and receive-buffer allocation is bounded. Added segmented
   request regressions and an ASAN/UBSAN CI job.
-- Gateway session logs now use injective hex filenames plus canonical
-  identity headers, preventing cross-chat history leaks after restart or
-  eviction. Legacy sanitized logs are not guessed or merged; invalid
-  ownership fails closed and exact-ID reset does not affect other chats.
+- Gateway snapshots use injective hex filenames plus canonical `session_id`
+  binding, preventing cross-chat history leaks after restart or eviction.
+  Legacy sanitized/I-header logs are not guessed or merged; invalid ownership
+  fails closed and exact-ID reset does not affect other chats.
 - `search_files` no longer follows recursive symlinks outside the workspace
   or around directory loops. fd-relative no-follow opens, iterative traversal,
   depth/node/byte/line/result bounds and provider-round privacy regressions

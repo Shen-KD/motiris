@@ -11,9 +11,10 @@
  *        body: {"chat_id":"...","message":"...","reset":true?}
  *        auth: Authorization: Bearer <token> (when token set)
  *
- * Sessions are append-only logged under ~/.local/share/motiris/
- * gateway/<hex(chat_id)>.log (I identity header + U/A/T rows) and user
- * history is replayed only after the identity header has been verified.
+ * Sessions are bounded full-turn JSON snapshots under
+ * ~/.local/share/motiris/gateway/<hex(chat_id)>.log.  The snapshot binds
+ * the encoded chat_id and restores complete messages only after ownership,
+ * integrity and tool-call/result validation.
  */
 #include "motiris.h"
 
@@ -97,46 +98,18 @@ static void mkdir_p(const char *path) {
   mkdir(tmp, 0755);
 }
 
-/* The I row binds the log to its canonical, reversible chat_id encoding.
- * Legacy U/A/T-only files have no proof of ownership and are rejected. */
-static int write_log_header(FILE *f, const char *chat_id) {
-  char encoded[MAX_CHAT_ID_ENCODED + 1];
-  encode_chat_id(encoded, chat_id);
-  return fprintf(f, "I%s\n", encoded) < 0 || fflush(f) ? -1 : 0;
-}
-
-static int check_log_header(FILE *f, const char *chat_id) {
-  char encoded[MAX_CHAT_ID_ENCODED + 1];
-  char expected[MAX_CHAT_ID_ENCODED + 3];
-  char actual[MAX_CHAT_ID_ENCODED + 3];
-  encode_chat_id(encoded, chat_id);
-  snprintf(expected, sizeof expected, "I%s\n", encoded);
-  return !fgets(actual, sizeof actual, f) || strcmp(actual, expected) ? -1 : 0;
-}
-
 static int load_session_log(Session *s, const char **error) {
-  FILE *f = fopen(s->log_path, "r");
-  if (!f) {
-    if (errno != ENOENT) { *error = "cannot open session log"; return -1; }
-    f = fopen(s->log_path, "w");
-    if (!f) { *error = "cannot create session log"; return -1; }
-    int rc = write_log_header(f, s->chat_id);
-    if (fclose(f)) rc = -1;
-    if (rc) *error = "cannot initialize session log";
-    return rc;
-  }
-  if (check_log_header(f, s->chat_id)) {
-    fclose(f);
-    *error = "session log ownership mismatch";
+  struct stat st;
+  if (stat(s->log_path, &st)) {
+    if (errno == ENOENT) return 0; /* first turn creates it atomically */
+    *error = "cannot stat session snapshot";
     return -1;
   }
-  /* Replay only rows following the verified identity header. */
-  char line[65536];
-  while (fgets(line, sizeof line, f))
-    if (line[0] == 'U') motiris_add_user(s->agent, line + 1);
-  int rc = ferror(f);
-  fclose(f);
-  if (rc) { *error = "cannot read session log"; return -1; }
+  char encoded[MAX_CHAT_ID_ENCODED + 1];
+  encode_chat_id(encoded, s->chat_id);
+  size_t loaded = 0;
+  if (motiris_session_load(s->agent, s->log_path, encoded, &loaded, error))
+    return -1;
   return 0;
 }
 
@@ -178,37 +151,6 @@ fail:
   free(s->log_path);
   free(s);
   return NULL;
-}
-
-/* append messages added since the given index to the session log */
-static void log_new_messages(Session *s, int from_index) {
-  if (!s->log_path) return;
-  FILE *f = fopen(s->log_path, "r+");
-  if (!f) return;
-  if (check_log_header(f, s->chat_id) || fseek(f, 0, SEEK_END)) {
-    fprintf(stderr, "motiris gateway: refusing unverified session log append\n");
-    fclose(f);
-    return;
-  }
-  cJSON *msgs = motiris_messages(s->agent);
-  int i = 0;
-  for (cJSON *m = msgs->child; m; m = m->next, i++) {
-    if (i < from_index) continue;
-    const char *role = cJSON_GetStringValue(
-        cJSON_GetObjectItemCaseSensitive(m, "role"));
-    const char *content = cJSON_GetStringValue(
-        cJSON_GetObjectItemCaseSensitive(m, "content"));
-    if (!role || !role[0]) continue;
-    char tag;
-    switch (role[0]) {
-      case 'u': tag = 'U'; break;
-      case 'a': tag = 'A'; break;
-      case 't': tag = 'T'; break;
-      default: continue;
-    }
-    fprintf(f, "%c%s\n", tag, content ? content : "");
-  }
-  fclose(f);
 }
 
 /* ---------------- HTTP plumbing ---------------- */
@@ -463,11 +405,9 @@ static void handle_connection(int fd, int tools_on) {
     send_err(fd, 500, session_error ? session_error : "could not create session");
     goto out;
   }
-  int before = (int)cJSON_GetArraySize(motiris_messages(s->agent));
   motiris_add_user(s->agent, message);
 
   int rc = motiris_run(s->agent);
-  log_new_messages(s, before);
   if (rc) {
     cJSON *e = cJSON_CreateObject();
     cJSON_AddStringToObject(e, "error", motiris_last_error(s->agent));
@@ -475,9 +415,25 @@ static void handle_connection(int fd, int tools_on) {
     goto out;
   }
 
+  const char *checkpoint_error = NULL;
+  if (s->log_path) {
+    char encoded[MAX_CHAT_ID_ENCODED + 1];
+    encode_chat_id(encoded, s->chat_id);
+    if (motiris_session_save(s->log_path, s->agent, encoded,
+                             &checkpoint_error)) {
+      fprintf(stderr, "motiris gateway: checkpoint not saved: %s\n",
+              checkpoint_error ? checkpoint_error : "snapshot failed");
+    }
+  }
   char *reply = last_reply(s->agent);
   cJSON *r = cJSON_CreateObject();
   cJSON_AddStringToObject(r, "reply", reply ? reply : "(no reply)");
+  if (!s->log_path)
+    cJSON_AddStringToObject(r, "checkpoint", "volatile-only");
+  else if (checkpoint_error)
+    cJSON_AddStringToObject(r, "checkpoint_error", checkpoint_error);
+  else
+    cJSON_AddStringToObject(r, "checkpoint", "saved");
   free(reply);
   send_json(fd, 200, r);
 

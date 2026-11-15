@@ -43,29 +43,20 @@ static const char *const CMDS_DESC[] = {
   "reset session context",
   "list tool information",
   "review past session logs [TERM]",
-  "load a session log into context FILE",
+  "restore a full-turn snapshot FILE",
   "list available skills [TERM]",
   "leave the repl",
   "leave the repl",
 };
 #define NCMDS (sizeof CMDS / sizeof CMDS[0])
 
-/* session logging (tty only): log id, accumulating assistant reply */
+/* Automatic full-turn checkpoint id (tty only). */
 static char *sess_id = NULL;
-static char *reply_buf = NULL;
-static size_t reply_len = 0;
 
 static void delta_print(const char *text, void *ud) {
   (void)ud;
   fputs(text, stdout);
   fflush(stdout);
-  if (sess_id) {
-    size_t n = strlen(text);
-    reply_buf = realloc(reply_buf, reply_len + n + 1);
-    memcpy(reply_buf + reply_len, text, n);
-    reply_len += n;
-    reply_buf[reply_len] = '\0';
-  }
 }
 
 /* copy at most n-1 chars, whitespace collapsed */
@@ -85,7 +76,7 @@ static void clip(char *dst, size_t n, const char *src, size_t maxlen) {
   dst[o] = '\0';
 }
 
-/* tool-call observer: yellow ⚙ line + session T row */
+/* tool-call observer: yellow ⚙ line; full tool objects enter the snapshot */
 static void repl_tool_hook(const char *name, const char *args,
                            const char *result, void *ud) {
   (void)ud;
@@ -100,12 +91,6 @@ static void repl_tool_hook(const char *name, const char *args,
     clip(rbuf, sizeof rbuf, result, 72);
     printf("  " C_YELLOW "⚙ %s" C_RESET "(%s) " C_DIM "→ %s" C_RESET "\n",
            name, abuf, rbuf);
-  }
-  if (sess_id) {
-    char row[320];
-    snprintf(row, sizeof row, "%s(%s) -> %s%s", name, abuf,
-             is_err ? "err:" : "", rbuf);
-    motiris_session_append("sessions", sess_id, 'T', row);
   }
 }
 
@@ -188,14 +173,15 @@ static int handle_command(MotirisAgent *a, const char *line) {
       printf(C_RED "usage: /resume FILE\n" C_RESET);
       return 0;
     }
-    FILE *f = fopen(file, "r");
-    if (!f) { printf(C_RED "cannot open %s\n" C_RESET, file); return 0; }
-    char buf[65536];
-    long n = 0;
-    while (fgets(buf, sizeof buf, f))
-      if (buf[0] == 'U') { motiris_add_user(a, buf + 1); n++; }
-    fclose(f);
-    printf(C_DIM "[loaded %ld turns from %s]\n" C_RESET, n, file);
+    const char *error = NULL;
+    size_t loaded = 0;
+    if (motiris_session_load(a, file, NULL, &loaded, &error)) {
+      printf(C_RED "cannot resume %s: %s%s\n" C_RESET, file,
+             error ? error : "invalid snapshot",
+             motiris_messages(a)->child ? " (use /new first)" : "");
+      return 0;
+    }
+    printf(C_DIM "[loaded %zu messages from %s]\n" C_RESET, loaded, file);
     return 0;
   }
   if (!strcmp(line, "/skills") || !strncmp(line, "/skills ", 8)) {
@@ -375,7 +361,6 @@ int motiris_repl(MotirisAgent *a) {
     while (tts_before && tts_before->next) tts_before = tts_before->next;
 #endif
     motiris_add_user(a, line);
-    if (sess_id) motiris_session_append("sessions", sess_id, 'U', line);
     free(line);
 
     printf(C_DIM "→ you" C_RESET "\n");
@@ -395,10 +380,11 @@ int motiris_repl(MotirisAgent *a) {
 #ifdef MOTIRIS_TTS_TOOLS
     if (!rc) tts_new_reply(a, tts_before);
 #endif
-    if (sess_id && reply_len > 0) {
-      motiris_session_append("sessions", sess_id, 'A', reply_buf);
-      reply_len = 0;
-      if (reply_buf) reply_buf[0] = '\0';
+    if (sess_id && !rc) {
+      const char *error = NULL;
+      if (motiris_session_checkpoint("sessions", sess_id, a, sess_id, &error))
+        fprintf(stderr, C_YELLOW "session checkpoint not saved: %s" C_RESET "\n",
+                error ? error : "snapshot failed");
     }
     if (di || dout)
       printf(C_DIM "[tokens " C_RESET C_CYAN "↑%ld" C_RESET C_DIM
@@ -409,5 +395,7 @@ int motiris_repl(MotirisAgent *a) {
     printf("\n");
   }
   printf(C_DIM "bye" C_RESET "\n");
+  free(sess_id);
+  sess_id = NULL;
   return 0;
 }

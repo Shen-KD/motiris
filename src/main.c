@@ -26,8 +26,8 @@ static void usage(FILE *f) {
 "      --transport NAME  curl (default) | echo (offline test)\n"
 "      --max-steps N     agent loop bound (default 10)\n"
 "      --goal-check      confirm the goal is met (one extra round)\n"
-"  -r, --resume FILE     resume previous session log\n"
-"      --save FILE       persist session log to FILE\n"
+"  -r, --resume FILE     restore a full-turn session snapshot\n"
+"      --save FILE       atomically save a full-turn session snapshot\n"
 "  -v, --verbose         print step/tool/trace to stderr\n"
 "  -i, --interactive     force interactive REPL (default when tty)\n"
 "      --stream          stream tokens as they arrive (once-run mode)\n"
@@ -254,14 +254,19 @@ int main(int argc, char **argv) {
     free(sk);
   }
 
-  /* resume: replay a saved session log line by line */
+  /* Restore only a validated full-turn snapshot; U/A/T traces and malformed
+   * input are not trusted as control records. */
   if (resume) {
-    FILE *f = fopen(resume, "r");
-    if (!f) { fprintf(stderr, "motiris: cannot open %s\n", resume); return 2; }
-    char line[65536];
-    while (fgets(line, sizeof line, f))
-      if (line[0] == 'U') motiris_add_user(ag, line + 1);
-    fclose(f);
+    const char *error = NULL;
+    size_t loaded = 0;
+    if (motiris_session_load(ag, resume, NULL, &loaded, &error)) {
+      fprintf(stderr, "motiris: cannot resume %s: %s\n", resume,
+              error ? error : "invalid snapshot");
+      motiris_free(ag);
+      return 2;
+    }
+    if (verbose)
+      fprintf(stderr, "[motiris] restored %zu complete messages\n", loaded);
   }
 
   if (prompt) motiris_add_user(ag, prompt);
@@ -285,28 +290,15 @@ int main(int argc, char **argv) {
 
   int rc = motiris_run(ag);
   if (rc) fprintf(stderr, "motiris: %s\n", motiris_last_error(ag));
-  if (save) {
-    /* append-only trace: U=user, A=assistant content, T=tool result.
-       resume (-r) replays U lines; the rest stay for human inspection. */
-    FILE *f = fopen(save, "a");
-    if (f) {
-      for (cJSON *m = motiris_messages(ag)->child; m; m = m->next) {
-        const char *role = cJSON_GetStringValue(
-            cJSON_GetObjectItemCaseSensitive(m, "role"));
-        const char *content = cJSON_GetStringValue(
-            cJSON_GetObjectItemCaseSensitive(m, "content"));
-        if (!role || !role[0]) continue;
-        char tag;
-        switch (role[0]) {
-          case 'u': tag = 'U'; break;
-          case 'a': tag = 'A'; break;
-          case 't': tag = 'T'; break;
-          default: continue; /* system etc. */
-        }
-        fprintf(f, "%c%s\n", tag, content ? content : "");
-      }
-      fclose(f);
+  if (save && !rc) {
+    const char *error = NULL;
+    if (motiris_session_save(save, ag, NULL, &error)) {
+      fprintf(stderr, "motiris: cannot save %s: %s\n", save,
+              error ? error : "snapshot failed");
+      rc = 1;
     }
+  } else if (save) {
+    fprintf(stderr, "motiris: incomplete turn; previous snapshot preserved\n");
   }
   motiris_free(ag);
   return rc;

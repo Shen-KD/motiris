@@ -42,10 +42,10 @@ agent process stays idle-quiet between requests.
 - **Optional host TTS** — `TTS_TOOLS=1` lets the REPL pass each final reply
   to one trusted external speech engine, with bounded input and timeout.
   Text remains available on engine failure; the default build has no TTS code.
-- **Sessions** — append-only trace log (`--save`), resume replay (`-r`);
-  the repl auto-logs every interactive session to
-  `~/.local/share/motiris/sessions/` (gateway format) with
-  `/sessions`, `/resume` review commands.
+- **Full-turn sessions** — bounded, versioned JSON checkpoints (`--save`,
+  `-r`) preserve complete user/assistant/tool-call/tool-result messages.
+  Atomic replacement, ownership/integrity checks and strict legacy rejection
+  protect CLI, REPL and gateway restore; `/sessions` remains the review list.
 - **Skills** — a directory of `.md` files injected as system context.
 - **Tiny core** — cJSON is the only runtime-embedded vendor; HTTP goes
   through a built-in libcurl C backend (no child process; HTTPS/TLS
@@ -64,8 +64,8 @@ agent process stays idle-quiet between requests.
  Tools     registry with runtime plug/unplug, incl. shell/time built-ins
  Plugins   .so files, dlopen'd, register tools via MotirisPluginApi
  Skills    --skill-dir *.md injected as system prompt
- Sessions  append-only trace + resume replay (no database);
-          repl auto-logs to ~/.local/share/motiris/sessions/
+ Sessions  bounded full-turn JSON checkpoints (no database);
+          repl saves to ~/.local/share/motiris/sessions/
  Storage   out of the way: only what you ask for (--save)
  Trace     -v step/tool logging to stderr
  Sandbox   none by default: shell runs as your uid (documented risk)
@@ -119,7 +119,7 @@ curl -X POST localhost:8899/v1/chat -d '{"chat_id":"dev","message":"hi"}'
 motiris --cron jobs.json --once                          # scheduled jobs
 motiris --sessions [TERM]                                # list/search logs
 # repl (-i) commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM]
-# repl sessions auto-log to ~/.local/share/motiris/sessions/ (U/A/T rows)
+# interactive repl turns checkpoint to ~/.local/share/motiris/sessions/
 # token-protected: MOTIRIS_GATEWAY_TOKEN=sekret motiris --gateway :8899
 ```
 
@@ -129,13 +129,27 @@ restarts under `~/.local/share/motiris/gateway/`), exposes
 and optionally requires `Authorization: Bearer $MOTIRIS_GATEWAY_TOKEN`.
 Requests are limited to 16 KiB of headers and a 1 MiB body; malformed or
 incomplete requests get `400`, while oversized requests get `413` and the
-connection is closed. `chat_id` is limited to 120 UTF-8 bytes. Its log filename
-is the lowercase hex encoding of the complete ID (at most 244 bytes including
-`.log`), with an identity header of at most 242 bytes; punctuation, case,
-Unicode and long IDs therefore cannot alias. Logs from the former sanitized
-filename format are not migrated or replayed. A canonical log with a missing
-or mismatched identity header is rejected before any history reaches the
-provider; `"reset":true` removes only that exact ID's log and starts fresh.
+connection is closed. `chat_id` is limited to 120 UTF-8 bytes. Its snapshot
+filename is the lowercase hex encoding of the complete ID (at most 244 bytes
+including `.log`), so punctuation, case, Unicode and long IDs cannot alias.
+Each snapshot also binds that encoded ID in `session_id`; mismatches fail
+before history reaches the provider. Legacy I/U/A/T logs and former sanitized
+filenames are not migrated or replayed. `"reset":true` removes only that exact
+ID's snapshot and starts fresh. Successful responses report `checkpoint` as
+`saved` or `volatile-only`, or include a bounded `checkpoint_error`.
+
+CLI `--save`, interactive REPL turns and gateway turns atomically replace one
+latest snapshot per session. The host backend limits files to 1 MiB, history
+to 256 messages and 256 tool calls, and each serialized message to 256 KiB.
+It preserves message order and multiline text as JSON, validates tool
+call/result pairing and an integrity digest, and writes a mode-0600 temporary
+file followed by flush/`fsync` and atomic `rename`. The FNV-1a-64 digest is
+for corruption detection, not cryptographic authentication. Corrupt, oversized,
+version-mismatched and legacy input fails closed; restoring never executes an
+old tool. REPL `/resume` requires an empty context (use `/new` first). These
+are persistence/replay bounds, not yet a live-agent history
+retention policy. The backend is in the host harness and is absent from the
+strict core-only no-filesystem probe; no MCU/RTOS backend is claimed.
 
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
