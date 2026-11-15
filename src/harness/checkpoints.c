@@ -364,6 +364,11 @@ int motiris_session_load(MotirisAgent *agent, const char *path,
   }
   cJSON_Delete(copy);
   cJSON_Delete(root);
+  if (motiris_history_retain(agent)) {
+    const char *message = motiris_last_error(agent);
+    return fail(error, *message ? message : "history retention failed");
+  }
+  count = (size_t)cJSON_GetArraySize(target);
   if (loaded_messages) *loaded_messages = count;
   return 0;
 }

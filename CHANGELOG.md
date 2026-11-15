@@ -20,6 +20,12 @@ published by `.github/workflows/release.yml`.
   256-KiB-record limits, ownership/integrity/pairing validation and atomic
   mode-0600 replacement. The host backend is excluded from the strict core
   no-filesystem probe and adds no core dependency.
+- Per-agent live-history item/byte retention and independent replay budgets.
+  Complete oldest user turns are evicted without orphaning tool results;
+  over-budget active turns fail closed. Environment/C-API limits are
+  configurable, restore enforces live limits, and replay never mutates saved
+  history. Strict-C11/no-filesystem and offline multi-turn bounds tests cover
+  the portable core implementation.
 - Skills: `skill_patch` / `skill_write` model tools to edit indexed
   `--skill-dir` files in place (frontmatter re-parsed on write).
 - Goal check (`--goal-check` / config `"goal_check"`): after a first

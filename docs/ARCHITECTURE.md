@@ -73,8 +73,13 @@ skill_write 工具。会话恢复已升级为有界 full-turn JSON checkpoint，
 工具、把结果作为 tool 消息追加 → 回到循环;finish_reason=stop 输出最终
 答案。token 计数从每次响应的 usage 累加。
 
-**会话快照(full-turn JSON)**:列表/状态目录走 `sessions.c`，原子快照 I/O
-统一走 `checkpoints.c`。
+**有界历史与会话快照**:core 在每 Agent 上分别维护 live/replay item/byte
+预算；live 淘汰只删除最老的完整 user turn，active turn 超限则失败，不留下
+孤儿 tool result。replay 从最新完整 turn 选择安全后缀，不改写 live 历史。
+列表/状态目录走 `sessions.c`，原子快照 I/O 统一走 `checkpoints.c`。
+- live/replay 默认各为 256 messages / 16 MiB compact records；可用
+  `MOTIRIS_HISTORY_MAX_{MESSAGES,BYTES}` 与 `MOTIRIS_REPLAY_MAX_{MESSAGES,BYTES}`
+  或 C API 调低。16 MiB 是有界上限而非预分配，也不是 MCU RAM 预算。
 - CLI `--save`、REPL(tty 下)和 Gateway 只在完整成功回合后保存；保留
   user/assistant/tool_calls/tool_call_id 的顺序与多行内容，不执行旧工具。
 - 快照上限 1 MiB / 256 messages / 256 KiB record / 256 tool calls；校验
@@ -216,8 +221,8 @@ MotirisTool.parameters(加载器持有副本,注册时拷贝进 agent 存储);
 1. 方案 B(schema 文件化)落地,约 1 天工作量,从上面的顺序开工
 2. `/jobs` 命令:cron 日志接入 motiris_session_list("cron", term),
    一行命令
-3. live messages item/byte retention、独立 replay 预算与 memory-only/RTOS/HAL
-   持久化后端(当前 host checkpoint 有界，但 live history 尚未裁剪)
+3. memory-only/RTOS/HAL 持久化后端、需要时的 full-CLI persistence 编译开关
+   (live/replay retention 已落地；目标 MCU 资源与硬件矩阵仍未建立)
 4. 网关会话目录统一读 MOTIRIS_HOME(现状:config 读 MOTIRIS_HOME,
    状态目录读 HOME,属历史遗留不一致)
 

@@ -283,9 +283,12 @@ int main(int argc, char **argv) {
 
   cJSON *msgs = motiris_messages(ag);
   if (!msgs || !msgs->child) {
-    fprintf(stderr, "motiris: no prompt (use -p or pipe stdin)\n");
+    const char *error = motiris_last_error(ag);
+    int rc = *error ? 1 : 2;
+    if (*error) fprintf(stderr, "motiris: %s\n", error);
+    else fprintf(stderr, "motiris: no prompt (use -p or pipe stdin)\n");
     motiris_free(ag);
-    return 2;
+    return rc;
   }
 
   int rc = motiris_run(ag);

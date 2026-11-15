@@ -31,7 +31,9 @@ unset MOTIRIS_API_KEY MOTIRIS_MODEL MOTIRIS_BASE_URL MOTIRIS_PLUGIN_DIR \
       MOTIRIS_GATEWAY_TOKEN MOTIRIS_WORKSPACE MOTIRIS_TTS_CMD \
       MOTIRIS_TTS_TIMEOUT_S MOTIRIS_SHELL_TIMEOUT_S \
       MOTIRIS_SHELL_STDOUT_MAX MOTIRIS_SHELL_STDERR_MAX \
-      MOTIRIS_SHELL_OUTPUT_MAX 2>/dev/null || true
+      MOTIRIS_SHELL_OUTPUT_MAX MOTIRIS_HISTORY_MAX_MESSAGES \
+      MOTIRIS_HISTORY_MAX_BYTES MOTIRIS_REPLAY_MAX_MESSAGES \
+      MOTIRIS_REPLAY_MAX_BYTES 2>/dev/null || true
 
 make motiris examples/hello_plugin.so >/dev/null 2>&1
 
@@ -70,8 +72,9 @@ echo "== 5: missing prompt -> clean error"
 
 fi
 if test_in 6; then
-echo "== 6: bounded injection-safe full-turn checkpoints"
+echo "== 6: bounded injection-safe full-turn checkpoints + history retention"
 python3 tests/checkpoints.py
+python3 tests/history.py
 
 fi
 if test_in 7; then

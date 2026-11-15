@@ -255,7 +255,34 @@ responses. It runs in smoke #11, including the ASAN/UBSAN tools job. These are
 host bounds and measurements only; no MCU/RTOS cross-toolchain, target
 Flash/RAM or hardware validation is available.
 
-### Bounded full-turn checkpoints
+### Bounded live history, replay and full-turn checkpoints
+
+`src/core/agent.c` owns per-agent live-history and replay budgets; there is no
+global session state. Both default to 256 messages and 16 MiB measured as the
+sum of compact serialized message records. `MOTIRIS_HISTORY_MAX_MESSAGES` /
+`MOTIRIS_HISTORY_MAX_BYTES` and `MOTIRIS_REPLAY_MAX_MESSAGES` /
+`MOTIRIS_REPLAY_MAX_BYTES` configure the CLI, while
+`motiris_set_history_limits` / `motiris_set_replay_limits` expose the same
+bounds to embedders. Values above 256 or 16 MiB and zero are rejected. The
+16 MiB ceiling accommodates existing bounded host-tool results; it is not
+preallocated and is not a recommended MCU budget. A target port must choose
+and measure a smaller appropriate limit.
+
+Every append accounts for the candidate and current records before mutation.
+Overflow evicts oldest complete user turns only. The active turn (including
+its assistant calls and ordered tool results) is protected; if it cannot fit,
+the run fails without truncating content, splitting a tool sequence or sending
+an over-budget request. Serialized measurement uses one bounded temporary
+record at a time; cJSON trees, request duplicates and printed request bodies
+add phase-wise copies, so the byte metric is not a total-process RSS guarantee.
+
+Replay independently selects the whole active turn plus the newest complete
+older turns that fit. It never deletes live/checkpoint state and fails before
+transport if the active turn alone exceeds replay limits. Checkpoint restore
+calls `motiris_history_retain`, so a smaller live budget is enforced before the
+REPL/CLI reports its retained message count. Verbose mode diagnoses both live
+eviction and replay omission. The strict-C11 nofs probe exercises two complete
+turns with a four-message live/replay limit and no POSIX/file/libcurl backend.
 
 `src/harness/checkpoints.c` is the optional host stdio backend for CLI
 `-r/--save`, REPL `/resume`/interactive turns, and gateway restart/eviction.
@@ -298,19 +325,22 @@ noted; baseline `2fc9b9a`) are:
 | Build / measurement | Bytes / sections / RSS | Relative result |
 | --- | ---: | ---: |
 | Baseline default full CLI | 162,040 bytes; text 148,549; data 2,664; BSS 167,960 | baseline |
-| Checkpoint full CLI | 162,040 bytes; text 150,066; data 2,816; BSS 167,944 | +0 file; +1,517 text; +152 data; -16 BSS; below 163,840 guard |
-| Core-only nofs probe | 52,264 bytes unstripped; text 34,991; data 800; BSS 4,224 | unchanged; zero checkpoint symbols/dependencies |
-| Near-cap valid restore | 1,006,563-byte snapshot; 256 messages | 10.3 ms REPL startup + restore; 18,132 KiB peak child RSS |
-| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,092 / 9,236 KiB | baseline 8,996 / 9,324 KiB; normal host variation; 50 ms / 50 ms |
+| Checkpoint full CLI (`aaf0730`) | 162,040 bytes; text 150,066; data 2,816; BSS 167,944 | +0 file; +1,517 text; +152 data; -16 BSS; below 163,840 guard |
+| Live/replay retention full CLI | 162,040 bytes; text 152,902; data 2,824; BSS 167,944 | vs `aaf0730`: +0 file; +2,836 text; +8 data; BSS unchanged |
+| Core-only nofs probe with retention | 56,744 bytes unstripped; text 40,093; data 808; BSS 4,224 | +4,480 file; +5,102 text; +8 data; BSS unchanged; zero checkpoint symbols |
+| Near-cap valid restore | 1,006,563-byte snapshot; 256 messages | 10.3 ms REPL startup + restore; 18,132 KiB peak child RSS (checkpoint baseline measurement) |
+| Near-cap restore + new bounded echo turn | input 1,006,563; output 991,187 bytes; 256 messages | 30 ms process elapsed; 12,568 KiB peak RSS; complete-turn eviction and atomic save |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,124 / 9,100 KiB | `aaf0730` baseline 9,232 / 8,996 KiB; normal host variation; 50 ms / 50 ms |
 
-Host CLI/harness objects use `-Os` because they are I/O-bound; core and tools
-remain `-O2`, which keeps the full binary within the established size guard.
+Host CLI/harness objects and the request/history-heavy `src/core/agent.o` use
+`-Os`; the strict core-only probe and other core/tool objects remain `-O2`.
+This keeps the full binary within the established size guard.
 The near-cap timing includes process/REPL startup and is not a pure parser
 benchmark. Peak RSS includes libc, cJSON trees and transient copies; it is not
 an MCU RAM budget. Snapshot writes are bounded by the same 1 MiB cap and happen
-only after successful turns. Live in-memory history retention, independent
-replay budgets, memory-only/RTOS/HAL persistence and actual MCU/RTOS Flash/RAM
-or hardware validation remain open follow-up work; none is claimed here.
+only after successful turns. Memory-only/RTOS/HAL persistence, any additional
+full-CLI persistence switch and actual MCU/RTOS Flash/RAM or hardware
+validation remain open follow-up work; none is claimed here.
 
 CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
@@ -420,7 +450,10 @@ lives in plugin.c and is shared with toolscan.
   tool objects without line-prefix role injection; malformed/legacy/digest/
   pairing/message/record/file-cap failures are offline and rejected before
   the provider. Near-cap valid restore, failed-turn atomic preservation and
-  PTY auto-save are included.
+  PTY auto-save are included. Multi-turn item/byte retention, complete-turn
+  eviction, restore-time limits and independent replay item/byte budgets run
+  in `tests/history.py`; live overflow fails closed, and an over-budget replay
+  active turn is rejected before transport.
 - Smoke #9: gateway health/auth plus partial, byte-segmented, malformed
   and oversized requests. Headers are capped at 16 KiB and bodies at
   1 MiB; the receive allocation is capped at their sum plus one NUL byte.

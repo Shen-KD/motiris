@@ -36,11 +36,36 @@ int main(void) {
         strstr(content, "unknown tool") && strlen(content) < 128)
       found_bounded_error = 1;
   }
-  motiris_free(a);
   if (!found_bounded_error) {
     fprintf(stderr, "core-nofs: bounded unavailable-tool error missing\n");
+    motiris_free(a);
     return 1;
   }
-  puts("core-nofs: strict C11 echo loop + bounded tool error passed");
+  if (motiris_set_history_limits(a, 4, 1024 * 1024) ||
+      motiris_set_replay_limits(a, 4, 1024 * 1024)) {
+    fprintf(stderr, "core-nofs: cannot set bounded history/replay\n");
+    motiris_free(a);
+    return 1;
+  }
+  motiris_add_user(a, "second retained turn");
+  if (motiris_run(a)) {
+    fprintf(stderr, "core-nofs retention: %s\n", motiris_last_error(a));
+    motiris_free(a);
+    return 1;
+  }
+  msgs = motiris_messages(a);
+  cJSON *first = msgs ? msgs->child : NULL;
+  const char *role = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(first, "role"));
+  const char *content = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(first, "content"));
+  if (cJSON_GetArraySize(msgs) != 4 || !role || strcmp(role, "user") ||
+      !content || strcmp(content, "second retained turn")) {
+    fprintf(stderr, "core-nofs: complete-turn retention failed\n");
+    motiris_free(a);
+    return 1;
+  }
+  motiris_free(a);
+  puts("core-nofs: strict C11 echo, tool bounds and complete-turn retention passed");
   return 0;
 }
