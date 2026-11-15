@@ -22,8 +22,12 @@ LDFLAGS ?= -Wl,-l:libcurl.so.4
 PREFIX  ?= /usr/local
 
 FILE_TOOLS ?= 1
+SHELL_TOOLS ?= 1
 VISION_TOOLS ?= 0
 TTS_TOOLS ?= 0
+ifeq ($(SHELL_TOOLS),0)
+CPPFLAGS += -DMOTIRIS_NO_SHELL=1
+endif
 CORE_SRC    = $(wildcard src/core/*.c)
 TOOLS_ALL   = $(wildcard src/tools/*.c)
 ifeq ($(VISION_TOOLS),0)
@@ -78,6 +82,9 @@ examples/hello_plugin.so: examples/hello_plugin.c include/motiris.h
 test: motiris
 	sh tests/smoke.sh
 
+test-shell: motiris
+	python3 tests/shell.py
+
 # Optional host-backed vision tool; clean rebuild isolates its compile flag.
 test-vision:
 	$(MAKE) clean
@@ -116,10 +123,11 @@ $(NOFS_DIR)/core-nofs-test: $(NOFS_CORE_OBJ) $(NOFS_DIR)/cJSON.o \
 test-core-nofs: $(NOFS_DIR)/core-nofs-test
 	$<
 
-# Full host CLI with the POSIX file backend replaced by bounded stubs.
+# Full host CLI with the POSIX file backend replaced by bounded stubs and
+# the optional shell subprocess backend compiled out.
 test-nofs: test-core-nofs
 	$(MAKE) clean
-	$(MAKE) FILE_TOOLS=0 motiris
+	$(MAKE) FILE_TOOLS=0 SHELL_TOOLS=0 motiris
 	sh tests/nofs.sh
 
 # run the full smoke suite inside a throwaway container: isolated HOME,
@@ -138,4 +146,4 @@ clean:
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test test-vision test-tts test-core-nofs test-nofs test-docker clean install
+.PHONY: test test-shell test-vision test-tts test-core-nofs test-nofs test-docker clean install

@@ -25,6 +25,8 @@ published by `.github/workflows/release.yml`.
 - Optional file-backend cut (`FILE_TOOLS=0`) with bounded unavailable-tool
   stubs, plus a strict-C11 no-POSIX-file-I/O core/echo portability probe and
   documented host/MCU validation boundary.
+- Optional shell-backend cut (`SHELL_TOOLS=0`) compiles out and unregisters
+  the host subprocess tool without changing the portable core or public API.
 - Optional host-backed `vision_analyze` (`VISION_TOOLS=1`): one bounded,
   workspace-local image to a trusted OpenAI-compatible vision provider, with
   explicit MIME, configurable input/timeout limits, bounded responses/text,
@@ -36,6 +38,11 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- `shell` now drains stdout/stderr concurrently, caps per-stream and combined
+  retained output, applies a monotonic timeout, and kills/reaps the command
+  process group on timeout or execution errors. Model-visible results include
+  truncation/signal/timeout diagnostics; regression tests cover the former
+  128 KiB stderr deadlock, output floods, cleanup and maximum-cap RSS.
 - `web_fetch` / `web_search` receive buffers now cover every full libcurl
   chunk without integer overflow, out-of-bounds writes or `realloc` loss.
   Bodies retain at most 64 KiB plus a private NUL byte; excess is drained

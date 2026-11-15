@@ -1,5 +1,5 @@
 #!/bin/sh
-# Verify the full host CLI when the optional POSIX file backend is cut.
+# Verify the full host CLI without optional POSIX file/shell backends.
 set -e
 cd "$(dirname "$0")/.."
 
@@ -61,9 +61,13 @@ try:
         assert "file tools unavailable" in proc.stdout, proc.stdout
         assert len(captures) == 2, len(captures)
         assert "file tools unavailable" in json.dumps(captures[-1])
+        tool_names = [tool["function"]["name"]
+                      for tool in captures[0].get("tools", [])]
+        assert "shell" not in tool_names, tool_names
+        assert "time" in tool_names, tool_names
 finally:
     server.shutdown()
     server.server_close()
     thread.join(timeout=5)
-print("nofs: optional file backend cut + bounded stub passed")
+print("nofs: file stub + shell backend cut passed")
 PY

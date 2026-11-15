@@ -81,7 +81,9 @@ stays out of the core — the plugin API is the seam where it plugs back in.
 make                  # cc -O2, single binary ./motiris (stripped)
 make test             # offline smoke tests, no API key required
 make FILE_TOOLS=0     # cut the POSIX file backend; bounded stubs remain
-make test-nofs        # strict-C11 core probe + file-backend cut test
+make SHELL_TOOLS=0    # compile out and unregister the host shell backend
+make test-nofs        # strict-C11 core probe + file/shell backend cut test
+make test-shell       # bounded shell execution integration tests
 make test-vision      # clean optional-vision build + local mock integration
 make VISION_TOOLS=1   # opt in to the host-backed vision_analyze tool
 make TTS_TOOLS=1      # opt in to host-only REPL speech output
@@ -91,11 +93,13 @@ make test-tts         # optional TTS tests with a fake engine, no audio device
 Requires: a C11 compiler and the libcurl shared library at runtime
 (libcurl dev headers are vendored in `deps/libcurl/`, pinned to the
 curl 8.18 ABI). No other dependencies. `FILE_TOOLS=0` replaces only the
-optional file tools with fixed-error stubs; other host tools and the CLI still
-use their documented OS facilities. `VISION_TOOLS=1` is a separate opt-in with
+optional file tools with fixed-error stubs. `SHELL_TOOLS=0` independently
+compiles out the `fork`/`pipe`/`poll`/`waitpid` backend and leaves `shell`
+unregistered; the `time` tool remains. Other host tools and the CLI still use
+their documented OS facilities. `VISION_TOOLS=1` is a separate opt-in with
 its own POSIX file and libcurl network backend; it remains excluded when
 `FILE_TOOLS=0` unless both switches are explicitly enabled. Run `make clean`
-when changing either compile-time switch. `make test-core-nofs` separately builds
+when changing compile-time switches. `make test-core-nofs` separately builds
 the core loop/config/echo transport as strict C11 without POSIX file I/O or
 libcurl. That core-only probe is not a claim of MCU/RTOS support; see
 [docs/DEVELOPING.md](docs/DEVELOPING.md) for the platform matrix and bounds.
@@ -138,13 +142,24 @@ Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_GATEWAY_TOKEN`, `MOTIRIS_VISION_MODEL`,
 `MOTIRIS_VISION_BASE_URL`, `MOTIRIS_VISION_API_KEY`,
 `MOTIRIS_VISION_MAX_BYTES`, `MOTIRIS_VISION_TIMEOUT_S`,
-`MOTIRIS_TTS_CMD`, `MOTIRIS_TTS_TIMEOUT_S`. Default endpoint:
+`MOTIRIS_TTS_CMD`, `MOTIRIS_TTS_TIMEOUT_S`,
+`MOTIRIS_SHELL_TIMEOUT_S`, `MOTIRIS_SHELL_STDOUT_MAX`,
+`MOTIRIS_SHELL_STDERR_MAX`, `MOTIRIS_SHELL_OUTPUT_MAX`. Default endpoint:
 `https://api.openai.com/v1/chat/completions`.
 
 Built-in tools (disable with `--no-tools`):
 
-- `shell(command)` — run `/bin/sh -c`, returns stdout/stderr/exit_code.
-  **Your uid, no sandbox. Use with care.**
+- `shell(command)` — run `/bin/sh -c`, returning bounded stdout/stderr plus
+  `exit_code`, `signal`, `timed_out` and overall/per-stream truncation flags.
+  One monotonic deadline covers process setup, execution and pipe draining.
+  `MOTIRIS_SHELL_TIMEOUT_S` defaults to 30 s (allowed 1..120);
+  `MOTIRIS_SHELL_STDOUT_MAX` / `MOTIRIS_SHELL_STDERR_MAX` default to 16,384
+  retained bytes per stream and `MOTIRIS_SHELL_OUTPUT_MAX` to 32,768 bytes
+  combined. Each output limit accepts 1..262,144 bytes. Excess output is
+  drained and discarded with truncation flags; an over-deadline process group
+  is killed and the direct child is reaped. Invalid limits fail before `fork`.
+  **Your uid, no sandbox. Use with care.** The execution budget is not a
+  security boundary. `SHELL_TOOLS=0` removes this host backend at build time.
 - `time()` — UTC ISO-8601 + unix seconds.
 
 File tools (workspace = `MOTIRIS_WORKSPACE` or cwd; paths outside it are
@@ -291,6 +306,7 @@ Dockerfile.test        isolated test image (make test-docker)
 
 ```
 make test          # 27 default offline smoke checks, no network/key needed
+make test-shell    # shell dual-stream/cap/timeout/reaping regression cases
 make test-vision   # optional vision build + 10 local-mock integration cases
 make test-tts      # optional TTS build + 8 fake-engine integration cases
 make test-docker   # default suite inside a throwaway debian container
