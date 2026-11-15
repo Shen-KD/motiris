@@ -78,6 +78,7 @@ static void encode_chat_id(char out[MAX_CHAT_ID_ENCODED + 1], const char *id) {
   out[j] = '\0';
 }
 
+#ifndef MOTIRIS_NO_PERSISTENCE
 static char *session_log_path(const char *chat_id) {
   const char *h = getenv("HOME");
   if (!h) return NULL;
@@ -112,6 +113,7 @@ static int load_session_log(Session *s, const char **error) {
     return -1;
   return 0;
 }
+#endif
 
 static Session *get_session(const char *chat_id, int tools_on,
                             const char **error) {
@@ -127,6 +129,7 @@ static Session *get_session(const char *chat_id, int tools_on,
   motiris_apply_config(s->agent);   /* model/base_url/transport from config */
   if (tools_on) motiris_register_core_tools(s->agent);
 
+#ifndef MOTIRIS_NO_PERSISTENCE
   /* Per-chat log: gateway/<lowercase-hex(chat_id)>.log. */
   if (getenv("HOME")) {
     s->log_path = session_log_path(chat_id);
@@ -139,6 +142,7 @@ static Session *get_session(const char *chat_id, int tools_on,
     free(dir);
     if (load_session_log(s, error)) goto fail;
   }
+#endif
   if (n_sessions >= MAX_SESSIONS) evict_oldest();
   s->next = sessions;
   sessions = s;
@@ -379,7 +383,8 @@ static void handle_connection(int fd, int tools_on) {
     goto out;
   }
 
-  if (cJSON_IsTrue(jrst)) { /* reset: drop only this exact chat_id's log */
+  if (cJSON_IsTrue(jrst)) { /* reset context and this exact ID's host snapshot */
+#ifndef MOTIRIS_NO_PERSISTENCE
     char *path = session_log_path(chat_id);
     if (path && unlink(path) && errno != ENOENT) {
       free(path);
@@ -387,6 +392,7 @@ static void handle_connection(int fd, int tools_on) {
       goto out;
     }
     free(path);
+#endif
     Session *s = find_session(chat_id);
     if (s) {
       motiris_free(s->agent);

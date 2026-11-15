@@ -33,8 +33,10 @@ make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
 make FILE_TOOLS=0     # optional POSIX file backend -> bounded stubs
 make SHELL_TOOLS=0    # compile out and unregister host shell subprocesses
+make PERSISTENCE=0    # optional host checkpoint files -> volatile sessions
 make test-shell       # dual-stream, output cap, timeout and reaping tests
 make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
+make test-persistence # full-CLI checkpoint-cut fail-closed/volatile tests
 make VISION_TOOLS=1   # opt in to host-backed vision_analyze
 make test-vision      # clean optional build + bounded local-provider tests
 make TTS_TOOLS=1      # opt in to host-only REPL external TTS adapter
@@ -47,6 +49,7 @@ make test-tts         # clean optional build + fake-engine integration tests
 | --- | --- | --- |
 | Linux gcc / clang | `make`, `make test`, CI `-Werror` and ASAN/UBSAN | Full host CLI; libcurl and POSIX tools enabled |
 | Host CLI without file/shell backends | `make test-nofs` (`FILE_TOOLS=0 SHELL_TOOLS=0`) | Excludes `filetools.c` and the shell subprocess implementation; file tools return fixed bounded errors and `shell` is unregistered. Other host tools/harness are unchanged |
+| Host CLI without checkpoint files | `make test-persistence` (`PERSISTENCE=0`) | Excludes the stdio/`fsync`/atomic-`rename` backend; explicit file operations fail closed, REPL/gateway use volatile bounded history. Portable core memory snapshots remain; other host facilities are unchanged |
 | Optional host vision | `make test-vision` (`VISION_TOOLS=1`) | One workspace-local image to a configured remote provider; separate POSIX file + libcurl backend, excluded by default and not local inference |
 | Optional host TTS | `make test-tts` (`TTS_TOOLS=1`) | Final REPL text to one trusted external executable over a bounded pipe; fake-engine tests only, no audio device or MCU claim |
 | Portable core-only probe | `make test-core-nofs` | Strict C11 `-Werror`; core loop/config/echo transport, bounded memory snapshot codec + cJSON, no POSIX feature macros, filesystem I/O or libcurl. A small test adapter supplies tool/schema registries; this is not the full CLI |
@@ -302,6 +305,23 @@ backend is not linked into `build/nofs/core-nofs-test`. Caller-owned memory
 snapshots are volatile unless an embedder supplies its own bounded storage;
 they are not a durable RTOS/HAL implementation by themselves.
 
+The full CLI defaults to `PERSISTENCE=1`. `PERSISTENCE=0` selects
+`src/harness/checkpoints_nofs.c` instead of the host backend and defines
+`MOTIRIS_NO_PERSISTENCE` for the REPL/gateway call sites. The stubs preserve
+the host-file API but never inspect or modify a supplied path: explicit
+`--save`, `-r` and `/resume` return `snapshot persistence unavailable`.
+The REPL does not allocate an automatic checkpoint ID; the gateway neither
+loads/creates snapshots nor unlinks one during reset. Its in-process session
+list remains bounded at 64 chats and replies use `checkpoint=volatile-only`.
+After restart, history starts empty instead of pretending to be durable.
+This switch does not remove unrelated host tools, transports or gateway
+POSIX dependencies, and is not an MCU port. The core archive and strict
+memory-codec probe are unchanged. `tests/persistence.py` covers explicit
+operations, TTY auto-save suppression, volatile gateway continuation,
+restart/reset behavior and no file creation/deletion; `tests/persistence.sh`
+also checks that the full binary has no `fsync`/`rename` imports or atomic
+temporary-file marker.
+
 The versioned `motiris-full-turn` JSON document stores `session_id`, complete
 ordered `messages` and a digest. Memory export/import and host-file save/load
 use identical format, limits and validation. Only user/assistant/tool roles
@@ -350,6 +370,8 @@ noted; baseline `2fc9b9a`) are:
 | Memory-codec full CLI (gcc 15) | 162,040 bytes; text 151,409; data 2,800; BSS 167,944 | vs `2d8a7ad`: +0 file; +610 text; data/BSS unchanged; below 163,840 guard |
 | Memory-codec full CLI (Ubuntu 22.04 gcc 11) | 162,048 bytes; text 152,806; data 2,792; BSS 167,944 | container build + full 27-check smoke; original 163,840 guard passes |
 | Core-only nofs probe with memory codec | 65,464 bytes unstripped; text 47,111; data 952; BSS 4,224 | vs `2d8a7ad`: +8,720 file; +7,018 text; +144 data; BSS unchanged; no host file symbols |
+| `PERSISTENCE=0` full CLI | 157,944 bytes; text 143,870; data 2,632; BSS 167,944 | vs `c78f59d`: -4,096 file; -7,539 text; -168 data; BSS unchanged; no `fsync`/`rename` imports |
+| Persistence-switch default / cut perf cold / 5-step loop peak RSS | default 9,116 / 9,072 KiB; cut 9,100 / 9,084 KiB | baseline 9,088 / 9,088 KiB; 50 ms / 50 ms; normal host variation; guards pass |
 | Near-cap valid restore | 1,006,563-byte snapshot; 256 messages | 10.3 ms REPL startup + restore; 18,132 KiB peak child RSS (checkpoint baseline measurement) |
 | Near-cap restore + new bounded echo turn | input 1,006,563; output 991,187 bytes; 256 messages | 30 ms process elapsed; 12,568 KiB peak RSS; complete-turn eviction and atomic save |
 | Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,064 / 9,024 KiB | `2d8a7ad` baseline 9,136 / 8,968 KiB; 50 ms / 50 ms; guards pass |
@@ -366,11 +388,13 @@ The near-cap timing includes process/REPL startup and is not a pure parser
 benchmark. Peak RSS includes libc, cJSON trees and transient copies; it is not
 an MCU RAM budget. Snapshot writes are bounded by the same 1 MiB cap and happen
 only after successful turns. Caller-owned memory snapshot buffers are
-implemented and tested; concrete RTOS/HAL persistence, any additional
-full-CLI persistence switch and actual MCU/RTOS Flash/RAM or hardware
-validation remain open follow-up work. Memory
-buffers alone are volatile and none of those unimplemented targets is claimed
-here.
+implemented and tested; the buffers alone are volatile. The full-CLI
+`PERSISTENCE=0` switch is now implemented and tested, while concrete RTOS/HAL
+persistence plus actual MCU/RTOS cross-build, RAM/Flash and hardware validation
+remain open follow-up work; none of those unimplemented targets is claimed.
+Default and cut direct ELF dependencies remain only `libcurl.so.4` and
+`libc.so.6`; the strict core-only probe stays at 65,464 bytes with unchanged
+sections.
 
 CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
@@ -383,7 +407,9 @@ with clang -Werror), `no-filesystem` (strict-C11 core, memory snapshots and opti
 file/shell backend cuts), `vision` (optional local-mock integration and
 clang `-Werror`),
 `tts` (optional fake-engine integration and clang `-Werror`),
-and `sanitizers` (ASAN/UBSAN tools smoke).
+and `sanitizers` (ASAN/UBSAN tools smoke). The `no-filesystem` job also
+runs `make test-persistence` and a clang `-Werror` build/test for the full-CLI
+host-checkpoint cut.
 `perf` and `compat-matrix` are informational
 (ubuntu 22.04 gcc-11 / 24.04 gcc-13 / 26.04 gcc-15 / centos-stream9
 container / clang).
@@ -459,8 +485,11 @@ Sessions: `src/harness/sessions.c` owns state directories and legacy trace
 listing; `src/core/checkpoint.c` owns validated full-turn memory
 serialization/restoration, and `src/harness/checkpoints.c` adds bounded atomic
 host-file I/O. `--save`, `-r`, REPL `/resume`/auto-save and gateway restore
-all use the same snapshot contract. `motiris_session_append` is legacy
-trace-only and must never be used as restore input.
+all use the same snapshot contract. `PERSISTENCE=0` replaces the host backend
+with `checkpoints_nofs.c` fixed-error stubs and suppresses implicit REPL/gateway
+file operations while preserving in-memory sessions and the portable core
+codec. `motiris_session_append` is legacy trace-only and must never be used
+as restore input.
 
 Skill files: `skill_patch` / `skill_write` in skilltools.c edit the
 indexed `--skill-dir` files in place; paths are built from the index
@@ -487,7 +516,10 @@ lives in plugin.c and is shared with toolscan.
   in `tests/history.py`; live overflow fails closed, and an over-budget replay
   active turn is rejected before transport. `make test-core-nofs` separately
   verifies byte-exact caller-owned memory round-trip and fail-closed ownership
-  and digest checks under strict C11 without host file I/O.
+  and digest checks under strict C11 without host file I/O. `make test-persistence`
+  verifies the full-CLI `PERSISTENCE=0` cut: explicit operations fail closed,
+  TTY auto-save is absent, gateway RAM history works but restarts are empty,
+  reset does not unlink files, and `fsync`/`rename` backend imports are gone.
 - Smoke #9: gateway health/auth plus partial, byte-segmented, malformed
   and oversized requests. Headers are capped at 16 KiB and bodies at
   1 MiB; the receive allocation is capped at their sum plus one NUL byte.

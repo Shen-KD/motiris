@@ -23,6 +23,7 @@ PREFIX  ?= /usr/local
 
 FILE_TOOLS ?= 1
 SHELL_TOOLS ?= 1
+PERSISTENCE ?= 1
 VISION_TOOLS ?= 0
 TTS_TOOLS ?= 0
 ifeq ($(SHELL_TOOLS),0)
@@ -42,10 +43,15 @@ else
 TOOLS_SRC   = $(filter-out src/tools/filetools_nofs.c,$(TOOLS_AVAILABLE))
 endif
 HARNESS_ALL = $(wildcard src/harness/*.c)
+HARNESS_SRC = $(filter-out src/harness/checkpoints_nofs.c,$(HARNESS_ALL))
+ifeq ($(PERSISTENCE),0)
+HARNESS_SRC := $(filter-out src/harness/checkpoints.c,$(HARNESS_SRC)) \
+	src/harness/checkpoints_nofs.c
+CPPFLAGS += -DMOTIRIS_NO_PERSISTENCE=1
+endif
 ifeq ($(TTS_TOOLS),0)
-HARNESS_SRC = $(filter-out src/harness/tts.c,$(HARNESS_ALL))
+HARNESS_SRC := $(filter-out src/harness/tts.c,$(HARNESS_SRC))
 else
-HARNESS_SRC = $(HARNESS_ALL)
 CPPFLAGS += -DMOTIRIS_TTS_TOOLS=1
 endif
 CORE_OBJ    = $(CORE_SRC:.c=.o)
@@ -139,6 +145,13 @@ test-nofs: test-core-nofs
 	$(MAKE) FILE_TOOLS=0 SHELL_TOOLS=0 motiris
 	sh tests/nofs.sh
 
+# Full host CLI without the optional stdio/atomic-rename checkpoint backend.
+# Explicit file operations fail closed; REPL/gateway stay memory-only.
+test-persistence:
+	$(MAKE) clean
+	$(MAKE) PERSISTENCE=0 motiris
+	sh tests/persistence.sh
+
 # run the full smoke suite inside a throwaway container: isolated HOME,
 # ports and processes (no orphan mocks on the host)
 test-docker:
@@ -155,4 +168,5 @@ clean:
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test test-shell test-vision test-tts test-core-nofs test-nofs test-docker clean install
+.PHONY: test test-shell test-vision test-tts test-core-nofs test-nofs \
+	test-persistence test-docker clean install

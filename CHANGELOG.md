@@ -24,6 +24,11 @@ published by `.github/workflows/release.yml`.
   share the same bounded full-turn contract with the host-file backend. The
   caller owns exported RAM and supplies any persistence; strict-C11 nofs tests
   cover exact round-trip, ownership and corruption rejection without file I/O.
+- Optional full-CLI checkpoint-backend cut (`PERSISTENCE=0`): explicit file
+  save/resume operations fail closed with bounded no-I/O stubs, REPL automatic
+  checkpoints are disabled, and gateway sessions report `volatile-only`
+  without loading, writing or reset-unlinking snapshots. The portable core
+  memory codec remains available; offline PTY/gateway integration runs in CI.
 - Per-agent live-history item/byte retention and independent replay budgets.
   Complete oldest user turns are evicted without orphaning tool results;
   over-budget active turns fail closed. Environment/C-API limits are

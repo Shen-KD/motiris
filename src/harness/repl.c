@@ -331,6 +331,7 @@ int motiris_repl(MotirisAgent *a) {
   struct stat hst;
   int first_run = stat(hist, &hst) || hst.st_size == 0;
 
+#ifndef MOTIRIS_NO_PERSISTENCE
   /* interactive sessions log to ~/.local/share/motiris/sessions/ */
   if (isatty(0)) {
     char id[64];
@@ -342,6 +343,7 @@ int motiris_repl(MotirisAgent *a) {
     snprintf(id, sizeof id, "repl-%s-%ld", ts, (long)getpid());
     sess_id = strdup(id);
   }
+#endif
 
   print_banner(a);
   if (first_run)
