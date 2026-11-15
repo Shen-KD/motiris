@@ -160,8 +160,10 @@ rejected):
 
 Knowledge & delegation tools:
 
-- `web_fetch(url)` — libcurl GET, HTML stripped to text
-- `web_search(query)` — DuckDuckGo lite (keyless), titles+links
+- `web_fetch(url)` — libcurl GET, HTML stripped to text; retains at most
+  64 KiB, drains/discards excess bytes and reports `"truncated": true`
+- `web_search(query)` — DuckDuckGo lite (keyless), titles+links; uses the
+  same 64 KiB response cap and truncation flag
 - `memory_set(key, value)` / `memory_get(key?)` — persistent JSON memory
   (`~/.local/share/motiris/memory.json`)
 - `skill_list()` / `skill_load(name)` — SKILL.md frontmatter index,

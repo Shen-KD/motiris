@@ -9,6 +9,7 @@
 
 #include <curl/curl.h>
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,23 +71,44 @@ static void strip_html(char *s) {
   if (t != s) memmove(s, t, strlen(t) + 1);
 }
 
-typedef struct { char *data; size_t len; size_t cap; } WBuf;
+typedef struct {
+  char *data;
+  size_t len, cap;
+  int truncated, overflow, oom;
+} WBuf;
 
 static size_t wbuf_cb(char *p, size_t sz, size_t nm, void *ud) {
   WBuf *b = ud;
+  if (sz && nm > SIZE_MAX / sz) { b->overflow = 1; return 0; }
   size_t n = sz * nm;
-  if (b->len + n + 1 > FETCH_CAP) n = FETCH_CAP - b->len - 1;
-  if (b->len + n + 1 > b->cap) {
-    b->cap = b->cap ? b->cap * 2 : 16384;
-    b->data = realloc(b->data, b->cap);
+  size_t available = FETCH_CAP - b->len;
+  size_t keep = n < available ? n : available;
+  if (n > available) b->truncated = 1;
+
+  if (keep) {
+    /* keep <= FETCH_CAP - len, so need <= FETCH_CAP + 1 cannot overflow. */
+    size_t need = b->len + keep + 1;
+    if (need > b->cap) {
+      size_t cap = b->cap ? b->cap : 16384;
+      while (cap < need)
+        cap = cap > FETCH_CAP / 2 ? FETCH_CAP + 1 : cap * 2;
+      char *tmp = realloc(b->data, cap);
+      if (!tmp) { b->oom = 1; return 0; }
+      b->data = tmp;
+      b->cap = cap;
+    }
+    memcpy(b->data + b->len, p, keep);
+    b->len += keep;
+    b->data[b->len] = '\0';
   }
-  memcpy(b->data + b->len, p, n);
-  b->len += n;
-  b->data[b->len] = '\0';
+
+  /* Report discarded bytes as consumed so libcurl drains the response. */
   return n;
 }
 
-static char *get_url(const char *url, char *errb, size_t errn) {
+static char *get_url(const char *url, char *errb, size_t errn,
+                     int *truncated) {
+  *truncated = 0;
   CURL *c = curl_easy_init();
   if (!c) { snprintf(errb, errn, "curl init failed"); return NULL; }
 
@@ -103,6 +125,16 @@ static char *get_url(const char *url, char *errb, size_t errn) {
   curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http);
   curl_easy_cleanup(c);
 
+  if (b.overflow) {
+    snprintf(errb, errn, "response size overflow");
+    free(b.data);
+    return NULL;
+  }
+  if (b.oom) {
+    snprintf(errb, errn, "response buffer allocation failed");
+    free(b.data);
+    return NULL;
+  }
   if (rc != CURLE_OK) {
     snprintf(errb, errn, "curl: %s", curl_easy_strerror(rc));
     free(b.data);
@@ -113,6 +145,15 @@ static char *get_url(const char *url, char *errb, size_t errn) {
     free(b.data);
     return NULL;
   }
+  if (!b.data) {
+    b.data = malloc(1);
+    if (!b.data) {
+      snprintf(errb, errn, "response buffer allocation failed");
+      return NULL;
+    }
+    b.data[0] = '\0';
+  }
+  *truncated = b.truncated;
   return b.data;
 }
 
@@ -126,13 +167,15 @@ static char *web_fetch_call(const char *args_json, void *ud) {
   if (!url || !*url) { cJSON_Delete(args); return err_json("url required"); }
 
   char errb[256];
-  char *raw = get_url(url, errb, sizeof errb);
+  int truncated;
+  char *raw = get_url(url, errb, sizeof errb, &truncated);
   if (!raw) { cJSON_Delete(args); return err_json(errb); }
 
   strip_html(raw);
   cJSON *r = cJSON_CreateObject();
   cJSON_AddStringToObject(r, "url", url);
   cJSON_AddStringToObject(r, "text", raw);
+  cJSON_AddBoolToObject(r, "truncated", truncated);
   free(raw);
   cJSON_Delete(args);
   char *s = cJSON_PrintUnformatted(r);
@@ -208,7 +251,8 @@ static char *web_search_call(const char *args_json, void *ud) {
   snprintf(url, sizeof url, "%s%s", DDG, enc);
 
   char errb[256];
-  char *html = get_url(url, errb, sizeof errb);
+  int truncated;
+  char *html = get_url(url, errb, sizeof errb, &truncated);
   cJSON_Delete(args);
   if (!html) return err_json(errb);
 
@@ -220,6 +264,7 @@ static char *web_search_call(const char *args_json, void *ud) {
   cJSON *r = cJSON_CreateObject();
   cJSON_AddItemToObject(r, "results", results);
   cJSON_AddNumberToObject(r, "count", (double)count);
+  cJSON_AddBoolToObject(r, "truncated", truncated);
   char *s = cJSON_PrintUnformatted(r);
   cJSON_Delete(r);
   return s;

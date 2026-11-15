@@ -36,6 +36,11 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- `web_fetch` / `web_search` receive buffers now cover every full libcurl
+  chunk without integer overflow, out-of-bounds writes or `realloc` loss.
+  Bodies retain at most 64 KiB plus a private NUL byte; excess is drained
+  and discarded with an explicit `truncated` result. Real tool-call
+  regressions cover chunk/cap boundaries under ASAN/UBSAN.
 - Gateway request parsing no longer scans unterminated partial headers;
   malformed input gets `400`, headers over 16 KiB or bodies over 1 MiB
   get `413`, and receive-buffer allocation is bounded. Added segmented
