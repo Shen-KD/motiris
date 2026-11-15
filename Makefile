@@ -57,9 +57,9 @@ HDR = include/motiris.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 src/harness/repl.o src/harness/tts.o: src/harness/tts.h
-# Request/history serialization is I/O-bound; keep the full CLI below its
-# established size guard while the strict core-only probe remains -O2.
-src/core/agent.o: override CFLAGS += -Os
+# Full-CLI request/history/transport code is I/O-bound; keep every compiler
+# in the compatibility matrix below the size guard. The strict probe stays -O2.
+src/core/agent.o src/core/transport.o src/tools/filetools.o: override CFLAGS += -Os
 # The host CLI/harness is I/O-bound and outside the agent/tool hot path.
 # Optimize it for size so optional host adapters preserve the tiny-binary guard.
 $(HARNESS_OBJ) src/main.o: override CFLAGS += -Os

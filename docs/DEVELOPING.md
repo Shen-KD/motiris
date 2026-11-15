@@ -326,15 +326,16 @@ noted; baseline `2fc9b9a`) are:
 | --- | ---: | ---: |
 | Baseline default full CLI | 162,040 bytes; text 148,549; data 2,664; BSS 167,960 | baseline |
 | Checkpoint full CLI (`aaf0730`) | 162,040 bytes; text 150,066; data 2,816; BSS 167,944 | +0 file; +1,517 text; +152 data; -16 BSS; below 163,840 guard |
-| Live/replay retention full CLI | 162,040 bytes; text 152,902; data 2,824; BSS 167,944 | vs `aaf0730`: +0 file; +2,836 text; +8 data; BSS unchanged |
+| Live/replay retention full CLI | 162,040 bytes; text 150,799; data 2,800; BSS 167,944 | vs `aaf0730`: +0 file; +733 text; -16 data; BSS unchanged |
 | Core-only nofs probe with retention | 56,744 bytes unstripped; text 40,093; data 808; BSS 4,224 | +4,480 file; +5,102 text; +8 data; BSS unchanged; zero checkpoint symbols |
 | Near-cap valid restore | 1,006,563-byte snapshot; 256 messages | 10.3 ms REPL startup + restore; 18,132 KiB peak child RSS (checkpoint baseline measurement) |
 | Near-cap restore + new bounded echo turn | input 1,006,563; output 991,187 bytes; 256 messages | 30 ms process elapsed; 12,568 KiB peak RSS; complete-turn eviction and atomic save |
-| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,124 / 9,100 KiB | `aaf0730` baseline 9,232 / 8,996 KiB; normal host variation; 50 ms / 50 ms |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,012 / 9,108 KiB | `aaf0730` baseline 9,232 / 8,996 KiB; normal host variation; 50 ms / 50 ms |
 
-Host CLI/harness objects and the request/history-heavy `src/core/agent.o` use
-`-Os`; the strict core-only probe and other core/tool objects remain `-O2`.
-This keeps the full binary within the established size guard.
+Host CLI/harness, full-CLI agent/transport and the POSIX file backend use `-Os`
+because their request/history/transport/file work is I/O-bound; the strict
+core-only probe, config and other tool objects remain `-O2`. This keeps every
+compiler in the compatibility matrix within the full-binary size guard.
 The near-cap timing includes process/REPL startup and is not a pure parser
 benchmark. Peak RSS includes libc, cJSON trees and transient copies; it is not
 an MCU RAM budget. Snapshot writes are bounded by the same 1 MiB cap and happen
