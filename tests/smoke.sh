@@ -449,7 +449,7 @@ rm -rf "$F10"
 
 fi
 if test_in 11; then
-echo "== 11: web_fetch + memory + shell deny"
+echo "== 11: web_fetch boundaries + memory + shell deny"
 F11=$(mktemp -d)
 mkdir -p "$F11/ws" "$F11/h3" "$F11/h4"
 printf '<html><body><h1>Hi there</h1><script>x</script>web ok</body></html>' > "$F11/ws/page.html"
@@ -496,6 +496,7 @@ kill $M11PID 2>/dev/null
 wait $M11PID 2>/dev/null || true
 cd "$ROOT"
 rm -rf "$F11"
+python3 tests/webtools.py
 
 fi
 if test_in 12; then

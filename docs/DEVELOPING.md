@@ -163,6 +163,42 @@ failure, timeout/reaping, truncation, goal-check filtering, missing engine,
 invalid timeout and runtime-disabled behavior. No real speech engine, audio
 device, MCU cross-toolchain or hardware validation is claimed.
 
+### Bounded web tool responses
+
+`web_fetch` and `web_search` share one per-GET receive buffer. It retains at
+most 65,536 response bytes and requests at most 65,537 bytes including the
+NUL terminator. Growth covers the current chunk before copying, multiplication
+and addition stay within that bound, and a temporary pointer preserves the
+original allocation if `realloc` fails. Overflow/OOM returns a bounded tool
+error and frees the original buffer. After the cap, the callback reports bytes
+as consumed but discards them, so libcurl drains the response without growing
+the buffer or turning normal oversized pages into a write error. Both tools
+add `"truncated": true` when bytes were discarded; successful empty bodies
+return an empty string. Tool input schemas and public APIs are unchanged.
+
+The buffer is per-call state, not per-agent global or retained session state.
+HTML stripping is in place. cJSON result construction/serialization adds
+phase-wise allocations derived from the same cap, while libcurl/libc internals
+remain implementation-dependent. No thread, process, runtime or default core
+dependency was added. The host web tools are absent from the strict core-only
+nofs probe; `FILE_TOOLS=0` behavior is unchanged.
+
+Reference host measurements on 2026-11-15 (Linux x86_64, gcc `-O2`, stripped;
+baseline `85502b9`) are:
+
+| Build / measurement | Bytes / RSS | Relative result |
+| --- | ---: | ---: |
+| Baseline default full CLI | 157,944 bytes; text 144,405; data 2,648; BSS 167,960 | baseline |
+| Fixed default full CLI | 157,944 bytes; text 144,973; data 2,648; BSS 167,960 | +0 file; +568 text; data/BSS unchanged |
+| `tests/perf.sh` cold / 5-step loop peak RSS | 9,016 / 9,016 KiB | baseline 9,028 / 9,148 KiB; normal host variation |
+| `tests/webtools.py`, including 1 MiB response | 21,940 KiB max child RSS | includes full agent/provider/libcurl rounds, not just the 65,537-byte receive allocation |
+
+The integration test drives actual model tool-calls and local GETs through
+16 KiB±1, byte/irregular segmentation, 64 KiB±1, empty, 128 KiB and 1 MiB
+responses. It runs in smoke #11, including the ASAN/UBSAN tools job. These are
+host bounds and measurements only; no MCU/RTOS cross-toolchain, target
+Flash/RAM or hardware validation is available.
+
 CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
 on main): `build` (gcc clean compile+link, size guard, artifact),
