@@ -20,6 +20,10 @@ published by `.github/workflows/release.yml`.
   256-KiB-record limits, ownership/integrity/pairing validation and atomic
   mode-0600 replacement. The host backend is excluded from the strict core
   no-filesystem probe and adds no core dependency.
+- Portable `motiris_session_export` / `motiris_session_import` memory snapshots
+  share the same bounded full-turn contract with the host-file backend. The
+  caller owns exported RAM and supplies any persistence; strict-C11 nofs tests
+  cover exact round-trip, ownership and corruption rejection without file I/O.
 - Per-agent live-history item/byte retention and independent replay budgets.
   Complete oldest user turns are evicted without orphaning tool results;
   over-budget active turns fail closed. Environment/C-API limits are

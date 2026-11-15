@@ -4,6 +4,7 @@
 #include "motiris.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int motiris_register_core_tools_count(void) { return 0; }
@@ -65,7 +66,97 @@ int main(void) {
     motiris_free(a);
     return 1;
   }
+
+  /* Caller-owned memory is a complete optional backend: no host file symbols
+   * or process-global snapshot store are needed by the portable core. */
+  const char *error = NULL;
+  char *snapshot = NULL, *roundtrip = NULL, *tampered = NULL;
+  size_t snapshot_len = 0, roundtrip_len = 0, loaded = 0;
+  if (motiris_session_export(a, "nofs-memory", &snapshot, &snapshot_len,
+                             &error) ||
+      !snapshot || snapshot_len == 0 || snapshot_len > 1024 * 1024 ||
+      snapshot[snapshot_len] != '\0') {
+    fprintf(stderr, "core-nofs: memory export failed: %s\n",
+            error ? error : "invalid buffer");
+    goto fail;
+  }
+
+  MotirisAgent *b = motiris_new();
+  MotirisAgent *c = motiris_new();
+  if (!b || !c) goto fail;
+  if (motiris_session_import(b, snapshot, snapshot_len, "nofs-memory",
+                             &loaded, &error) ||
+      loaded != 4 || cJSON_GetArraySize(motiris_messages(b)) != 4) {
+    fprintf(stderr, "core-nofs: memory import failed: %s\n",
+            error ? error : "message count mismatch");
+    motiris_free(b);
+    motiris_free(c);
+    goto fail;
+  }
+  if (motiris_session_export(b, "nofs-memory", &roundtrip, &roundtrip_len,
+                             &error) ||
+      roundtrip_len != snapshot_len ||
+      memcmp(roundtrip, snapshot, snapshot_len + 1)) {
+    fprintf(stderr, "core-nofs: memory round-trip changed the snapshot\n");
+    motiris_free(b);
+    motiris_free(c);
+    goto fail;
+  }
+
+  if (!motiris_session_import(c, snapshot, snapshot_len, "another-session",
+                              &loaded, &error) ||
+      !error || !strstr(error, "ownership") || motiris_messages(c)->child) {
+    fprintf(stderr, "core-nofs: snapshot ownership was not fail-closed\n");
+    motiris_free(b);
+    motiris_free(c);
+    goto fail;
+  }
+  tampered = malloc(snapshot_len + 1);
+  if (!tampered) {
+    motiris_free(b);
+    motiris_free(c);
+    goto fail;
+  }
+  memcpy(tampered, snapshot, snapshot_len + 1);
+  char *digest = strstr(tampered, "\"digest\":\"");
+  if (!digest) {
+    motiris_free(b);
+    motiris_free(c);
+    goto fail;
+  }
+  digest += strlen("\"digest\":\"");
+  digest[0] = digest[0] == '0' ? '1' : '0';
+  if (!motiris_session_import(c, tampered, snapshot_len, "nofs-memory",
+                              &loaded, &error) ||
+      !error || !strstr(error, "integrity") || motiris_messages(c)->child) {
+    fprintf(stderr, "core-nofs: snapshot integrity was not fail-closed\n");
+    motiris_free(b);
+    motiris_free(c);
+    goto fail;
+  }
+  memcpy(tampered, snapshot, snapshot_len + 1);
+  tampered[1] = '\0';
+  if (!motiris_session_import(c, tampered, snapshot_len, "nofs-memory",
+                              &loaded, &error) ||
+      !error || !strstr(error, "embedded NUL") || motiris_messages(c)->child) {
+    fprintf(stderr, "core-nofs: embedded NUL was not fail-closed\n");
+    motiris_free(b);
+    motiris_free(c);
+    goto fail;
+  }
+  motiris_free(b);
+  motiris_free(c);
+  free(tampered);
+  free(roundtrip);
+  free(snapshot);
   motiris_free(a);
-  puts("core-nofs: strict C11 echo, tool bounds and complete-turn retention passed");
+  puts("core-nofs: strict C11 echo, retention and memory snapshots passed");
   return 0;
+
+fail:
+  free(tampered);
+  free(roundtrip);
+  free(snapshot);
+  motiris_free(a);
+  return 1;
 }

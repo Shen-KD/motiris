@@ -142,6 +142,17 @@ const char *motiris_tool_schema(const char *name);  /* external schema or NULL *
 /* ---- sessions: host trace listing + bounded full-turn checkpoints ---- */
 char *motiris_state_dir(const char *sub);  /* mkdir -p, strdup'd; NULL no HOME */
 int  motiris_session_list(const char *sub, const char *term);   /* prints */
+/* Portable memory-only snapshots: export returns a malloc'd, NUL-terminated
+ * buffer owned by the caller; length excludes the NUL. Import requires that
+ * snapshot[length] is readable and NUL, and applies the same 1 MiB / 256
+ * message / 256 KiB record limits and full-turn validation as file restore.
+ * No storage is retained by the core; the caller supplies any persistence. */
+int  motiris_session_export(MotirisAgent *agent, const char *session_id,
+                            char **snapshot, size_t *length,
+                            const char **error);
+int  motiris_session_import(MotirisAgent *agent, const char *snapshot,
+                            size_t length, const char *expected_session_id,
+                            size_t *loaded_messages, const char **error);
 /* Legacy human-trace append only; never accepted as checkpoint restore input. */
 int  motiris_session_append(const char *sub, const char *id, char tag,
                             const char *line);  /* 0 on success */

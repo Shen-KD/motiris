@@ -49,7 +49,7 @@ make test-tts         # clean optional build + fake-engine integration tests
 | Host CLI without file/shell backends | `make test-nofs` (`FILE_TOOLS=0 SHELL_TOOLS=0`) | Excludes `filetools.c` and the shell subprocess implementation; file tools return fixed bounded errors and `shell` is unregistered. Other host tools/harness are unchanged |
 | Optional host vision | `make test-vision` (`VISION_TOOLS=1`) | One workspace-local image to a configured remote provider; separate POSIX file + libcurl backend, excluded by default and not local inference |
 | Optional host TTS | `make test-tts` (`TTS_TOOLS=1`) | Final REPL text to one trusted external executable over a bounded pipe; fake-engine tests only, no audio device or MCU claim |
-| Portable core-only probe | `make test-core-nofs` | Strict C11 `-Werror`; core loop/config/echo transport + cJSON, no POSIX feature macros, filesystem I/O or libcurl. A small test adapter supplies tool/schema registries; this is not the full CLI |
+| Portable core-only probe | `make test-core-nofs` | Strict C11 `-Werror`; core loop/config/echo transport, bounded memory snapshot codec + cJSON, no POSIX feature macros, filesystem I/O or libcurl. A small test adapter supplies tool/schema registries; this is not the full CLI |
 | MCU / RTOS | **待定 / 未验证** | Chip, RTOS, cross-toolchain, RAM/Flash and hardware test matrix have not been supplied; host results are not MCU support claims |
 
 `search_files` keeps directory enumeration inside the optional POSIX file
@@ -284,15 +284,29 @@ REPL/CLI reports its retained message count. Verbose mode diagnoses both live
 eviction and replay omission. The strict-C11 nofs probe exercises two complete
 turns with a four-message live/replay limit and no POSIX/file/libcurl backend.
 
+`src/core/checkpoint.c` owns the versioned snapshot contract and the portable
+`motiris_session_export` / `motiris_session_import` memory-buffer API. Export
+returns a malloc'd NUL-terminated buffer and explicit length; the caller owns
+it and the core retains no exported copy. Import requires a readable NUL at
+`buffer[length]`, validates before restore and applies live retention. The
+codec uses existing cJSON plus bounded dynamic allocation, with no global
+session state, database, thread, subprocess, socket, TLS, filesystem or new
+runtime dependency. The strict-C11 nofs probe exercises exact full-turn
+round-trip plus ownership and corruption rejection without host file I/O.
+
 `src/harness/checkpoints.c` is the optional host stdio backend for CLI
 `-r/--save`, REPL `/resume`/interactive turns, and gateway restart/eviction.
-It is not linked into `build/nofs/core-nofs-test`; `src/core/` and its direct
-dependencies are unchanged. There is no database, thread, subprocess, socket,
-TLS or new runtime dependency in the checkpoint path.
+It delegates the same snapshot contract to the core codec and adds only
+bounded reads, mode-0600 writes, flush/`fsync` and atomic `rename`. The host
+backend is not linked into `build/nofs/core-nofs-test`. Caller-owned memory
+snapshots are volatile unless an embedder supplies its own bounded storage;
+they are not a durable RTOS/HAL implementation by themselves.
 
 The versioned `motiris-full-turn` JSON document stores `session_id`, complete
-ordered `messages` and a digest. Only user/assistant/tool roles and the
-`role`, `content`, `tool_calls`, `tool_call_id` message fields are accepted.
+ordered `messages` and a digest. Memory export/import and host-file save/load
+use identical format, limits and validation. Only user/assistant/tool roles
+and the `role`, `content`, `tool_calls`, `tool_call_id` message fields are
+accepted.
 Function calls and results must match exactly in order, the first message must
 be user and the last must be assistant. Restore requires an empty context
 (`/new` before REPL `/resume` when needed), validates ownership and never
@@ -303,9 +317,14 @@ recompute it. File permissions and caller/path trust remain necessary.
 Hard limits are 1 MiB per snapshot read/write, 256 messages, 256 total tool
 calls and 256 KiB per serialized message. The read buffer is capped at
 1 MiB + 2 bytes; cJSON node overhead is implementation-dependent but the input
-and node count are byte-bounded. Save temporarily holds bounded per-record,
-message-payload, duplicated-tree and root-serialization copies. The previous
-valid file is preserved on validation/write failure: a short same-directory
+and node count are byte-bounded. Memory export returns at most 1 MiB plus its
+NUL and retains no core-owned copy afterward; import accepts at most 1 MiB
+and 256 records, then applies the configured live-history limits. Save/export
+and load/import temporarily hold bounded per-record, message-payload,
+duplicated-tree and root-serialization copies. Exact cJSON/libc overhead is
+implementation-dependent, but there is no idle or background storage cost.
+The previous valid file is preserved on validation/write failure: a short
+same-directory
 mode-0600 temporary file is fully written, flushed/`fsync`ed and atomically
 renamed. The short temporary basename also fits a maximum-length 244-byte
 gateway filename under `NAME_MAX`. Only one latest snapshot is kept per
@@ -326,22 +345,32 @@ noted; baseline `2fc9b9a`) are:
 | --- | ---: | ---: |
 | Baseline default full CLI | 162,040 bytes; text 148,549; data 2,664; BSS 167,960 | baseline |
 | Checkpoint full CLI (`aaf0730`) | 162,040 bytes; text 150,066; data 2,816; BSS 167,944 | +0 file; +1,517 text; +152 data; -16 BSS; below 163,840 guard |
-| Live/replay retention full CLI | 162,040 bytes; text 150,799; data 2,800; BSS 167,944 | vs `aaf0730`: +0 file; +733 text; -16 data; BSS unchanged |
-| Core-only nofs probe with retention | 56,744 bytes unstripped; text 40,093; data 808; BSS 4,224 | +4,480 file; +5,102 text; +8 data; BSS unchanged; zero checkpoint symbols |
+| Live/replay retention full CLI (`2d8a7ad`) | 162,040 bytes; text 150,799; data 2,800; BSS 167,944 | vs `aaf0730`: +0 file; +733 text; -16 data; BSS unchanged |
+| Core-only nofs probe with retention (`2d8a7ad`) | 56,744 bytes unstripped; text 40,093; data 808; BSS 4,224 | +4,480 file; +5,102 text; +8 data; BSS unchanged; zero checkpoint symbols |
+| Memory-codec full CLI (gcc 15) | 162,040 bytes; text 151,409; data 2,800; BSS 167,944 | vs `2d8a7ad`: +0 file; +610 text; data/BSS unchanged; below 163,840 guard |
+| Memory-codec full CLI (Ubuntu 22.04 gcc 11) | 162,048 bytes; text 152,806; data 2,792; BSS 167,944 | container build + full 27-check smoke; original 163,840 guard passes |
+| Core-only nofs probe with memory codec | 65,464 bytes unstripped; text 47,111; data 952; BSS 4,224 | vs `2d8a7ad`: +8,720 file; +7,018 text; +144 data; BSS unchanged; no host file symbols |
 | Near-cap valid restore | 1,006,563-byte snapshot; 256 messages | 10.3 ms REPL startup + restore; 18,132 KiB peak child RSS (checkpoint baseline measurement) |
 | Near-cap restore + new bounded echo turn | input 1,006,563; output 991,187 bytes; 256 messages | 30 ms process elapsed; 12,568 KiB peak RSS; complete-turn eviction and atomic save |
-| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,012 / 9,108 KiB | `aaf0730` baseline 9,232 / 8,996 KiB; normal host variation; 50 ms / 50 ms |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,064 / 9,024 KiB | `2d8a7ad` baseline 9,136 / 8,968 KiB; 50 ms / 50 ms; guards pass |
 
-Host CLI/harness, full-CLI agent/transport and the POSIX file backend use `-Os`
-because their request/history/transport/file work is I/O-bound; the strict
-core-only probe, config and other tool objects remain `-O2`. This keeps every
-compiler in the compatibility matrix within the full-binary size guard.
+Host CLI/harness, full-CLI agent/transport/checkpoint and the POSIX file
+backend use `-Os` because their request/history/snapshot/file work is
+I/O-bound or size-sensitive; the strict core-only probe, config and other tool
+objects remain `-O2`. Keeping the full-CLI snapshot codec at `-Os` preserves
+the same size policy it had in the harness. Its full-CLI object also omits
+C-unneeded asynchronous/unwind tables; the strict probe retains normal unwind
+metadata. These flags keep every compiler in the compatibility matrix within
+the full-binary size guard without changing snapshot limits or behavior.
 The near-cap timing includes process/REPL startup and is not a pure parser
 benchmark. Peak RSS includes libc, cJSON trees and transient copies; it is not
 an MCU RAM budget. Snapshot writes are bounded by the same 1 MiB cap and happen
-only after successful turns. Memory-only/RTOS/HAL persistence, any additional
+only after successful turns. Caller-owned memory snapshot buffers are
+implemented and tested; concrete RTOS/HAL persistence, any additional
 full-CLI persistence switch and actual MCU/RTOS Flash/RAM or hardware
-validation remain open follow-up work; none is claimed here.
+validation remain open follow-up work. Memory
+buffers alone are volatile and none of those unimplemented targets is claimed
+here.
 
 CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
@@ -350,8 +379,9 @@ on main): `build` (gcc clean compile+link, size guard, artifact),
 `test-skills` / `test-schema` / `test-goal` (component-scoped smoke
 groups, see `tests/smoke.sh <group>`), `plugins` (example .so with gcc +
 clang -Werror), `tools` (component static libs compile independently
-with clang -Werror), `no-filesystem` (strict-C11 core and optional file/shell
-backend cuts), `vision` (optional local-mock integration and clang `-Werror`),
+with clang -Werror), `no-filesystem` (strict-C11 core, memory snapshots and optional
+file/shell backend cuts), `vision` (optional local-mock integration and
+clang `-Werror`),
 `tts` (optional fake-engine integration and clang `-Werror`),
 and `sanitizers` (ASAN/UBSAN tools smoke).
 `perf` and `compat-matrix` are informational
@@ -426,10 +456,11 @@ as `<server>:<tool>`. `env` overrides are applied in the child process
 before exec (not yet implemented for arbitrary vars — see mcp.c).
 
 Sessions: `src/harness/sessions.c` owns state directories and legacy trace
-listing; `src/harness/checkpoints.c` owns validated full-turn snapshot I/O.
-`--save`, `-r`, REPL `/resume`/auto-save and gateway restore all use the
-checkpoint API. `motiris_session_append` is legacy trace-only and must never
-be used as restore input.
+listing; `src/core/checkpoint.c` owns validated full-turn memory
+serialization/restoration, and `src/harness/checkpoints.c` adds bounded atomic
+host-file I/O. `--save`, `-r`, REPL `/resume`/auto-save and gateway restore
+all use the same snapshot contract. `motiris_session_append` is legacy
+trace-only and must never be used as restore input.
 
 Skill files: `skill_patch` / `skill_write` in skilltools.c edit the
 indexed `--skill-dir` files in place; paths are built from the index
@@ -454,7 +485,9 @@ lives in plugin.c and is shared with toolscan.
   PTY auto-save are included. Multi-turn item/byte retention, complete-turn
   eviction, restore-time limits and independent replay item/byte budgets run
   in `tests/history.py`; live overflow fails closed, and an over-budget replay
-  active turn is rejected before transport.
+  active turn is rejected before transport. `make test-core-nofs` separately
+  verifies byte-exact caller-owned memory round-trip and fail-closed ownership
+  and digest checks under strict C11 without host file I/O.
 - Smoke #9: gateway health/auth plus partial, byte-segmented, malformed
   and oversized requests. Headers are capped at 16 KiB and bodies at
   1 MiB; the receive allocation is capped at their sum plus one NUL byte.
