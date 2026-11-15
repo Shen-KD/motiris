@@ -159,7 +159,9 @@ int  motiris_session_append(const char *sub, const char *id, char tag,
 /* Versioned JSON snapshots: 1 MiB / 256 messages / 256 KiB per record.
  * Save atomically replaces path; load requires an empty agent context and
  * validates roles, tool pairing, ownership and integrity before restoring.
- * session_id may be NULL/empty for standalone CLI files. */
+ * session_id may be NULL/empty for standalone CLI files. PERSISTENCE=0
+ * replaces these host-file entry points with fixed-error, no-I/O stubs;
+ * the portable memory export/import API above remains in the core library. */
 int  motiris_session_save(const char *path, MotirisAgent *agent,
                           const char *session_id, const char **error);
 int  motiris_session_checkpoint(const char *sub, const char *id,

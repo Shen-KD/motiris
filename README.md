@@ -86,7 +86,9 @@ make                  # cc -O2, single binary ./motiris (stripped)
 make test             # offline smoke tests, no API key required
 make FILE_TOOLS=0     # cut the POSIX file backend; bounded stubs remain
 make SHELL_TOOLS=0    # compile out and unregister the host shell backend
+make PERSISTENCE=0    # cut host checkpoint files; REPL/gateway use RAM only
 make test-nofs        # strict-C11 core probe + file/shell backend cut test
+make test-persistence # full-CLI volatile-only checkpoint backend cut test
 make test-core-nofs   # core-only retention + memory snapshot round-trip
 make test-shell       # bounded shell execution integration tests
 make test-vision      # clean optional-vision build + local mock integration
@@ -101,10 +103,16 @@ curl 8.18 ABI). No other dependencies. `FILE_TOOLS=0` replaces only the
 optional file tools with fixed-error stubs. `SHELL_TOOLS=0` independently
 compiles out the `fork`/`pipe`/`poll`/`waitpid` backend and leaves `shell`
 unregistered; the `time` tool remains. Other host tools and the CLI still use
-their documented OS facilities. `VISION_TOOLS=1` is a separate opt-in with
-its own POSIX file and libcurl network backend; it remains excluded when
-`FILE_TOOLS=0` unless both switches are explicitly enabled. Run `make clean`
-when changing compile-time switches. `make test-core-nofs` separately builds
+their documented OS facilities. `PERSISTENCE=0` independently replaces only
+the host full-turn checkpoint file backend with fixed-error stubs: explicit
+`--save`, `-r` and `/resume` fail closed without touching the supplied path,
+REPL automatic checkpoints are disabled, and the gateway reports
+`checkpoint: volatile-only` while retaining bounded in-process history. The
+portable core memory export/import API and unrelated memory tools remain.
+`VISION_TOOLS=1` is a separate opt-in with its own POSIX file and libcurl
+network backend; it remains excluded when `FILE_TOOLS=0` unless both switches
+are explicitly enabled. Run `make clean` when changing compile-time switches.
+`make test-core-nofs` separately builds
 the core loop/config/echo transport and memory snapshot codec as strict C11
 without POSIX file I/O or libcurl. That core-only probe is not a claim of
 MCU/RTOS support; see [docs/DEVELOPING.md](docs/DEVELOPING.md) for the
@@ -171,7 +179,12 @@ for corruption detection, not cryptographic authentication. Corrupt, oversized,
 version-mismatched and legacy input fails closed; restoring never executes an
 old tool. REPL `/resume` requires an empty context (use `/new` first). The
 backend is in the host harness and is absent from the strict core-only
-no-filesystem probe; no MCU/RTOS backend is claimed.
+no-filesystem probe. It defaults to `PERSISTENCE=1`; `PERSISTENCE=0` compiles
+out its stdio/`fsync`/atomic-`rename` implementation. In that full-CLI cut,
+explicit file operations return `snapshot persistence unavailable`, TTY REPL
+turns do not auto-save, and gateway sessions neither load nor write snapshots
+(including reset unlinking); successful gateway replies remain
+`volatile-only`. No MCU/RTOS backend is claimed.
 
 The portable core also exposes `motiris_session_export` and
 `motiris_session_import` for caller-owned memory buffers. Export returns one
@@ -340,6 +353,7 @@ src/browser.c          headless chromium fetch
 src/tools/visiontools.c optional bounded vision provider tool
 src/mcp.c              MCP stdio client (JSON-RPC)
 src/gateway.c          embedded HTTP gateway (session-per-chat_id)
+src/harness/checkpoints_nofs.c fixed-error stubs for PERSISTENCE=0
 src/cron.c             scheduled agent runs
 src/plugin.c           .so loader (MOTIRIS_PLUGIN_DIR, --plugin-dir)
 src/main.c             CLI parsing (switch), --sessions, modes
@@ -355,6 +369,7 @@ Dockerfile.test        isolated test image (make test-docker)
 ```
 make test          # 27 default offline smoke checks, no network/key needed
 make test-core-nofs # strict-C11 core + caller-owned memory snapshots
+make test-persistence # PERSISTENCE=0 fail-closed/volatile-only integration
 make test-shell    # shell dual-stream/cap/timeout/reaping regression cases
 make test-vision   # optional vision build + 10 local-mock integration cases
 make test-tts      # optional TTS build + 8 fake-engine integration cases
