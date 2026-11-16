@@ -370,8 +370,9 @@ POSIX dependencies, and is not an MCU port. The core archive and strict
 memory-codec probe are unchanged. `tests/persistence.py` covers explicit
 operations, TTY auto-save suppression, volatile gateway continuation,
 restart/reset behavior and no file creation/deletion; `tests/persistence.sh`
-also checks that the full binary has no `fsync`/`rename` imports or atomic
-temporary-file marker.
+also checks that the checkpoint object and atomic temporary-file marker are
+absent and the selected stub has no `fsync`/`rename` imports. The independent
+memory backend may still use atomic replacement.
 
 The versioned `motiris-full-turn` JSON document stores `session_id`, complete
 ordered `messages` and a digest. Memory export/import and host-file save/load
@@ -421,7 +422,7 @@ noted; baseline `2fc9b9a`) are:
 | Memory-codec full CLI (gcc 15) | 162,040 bytes; text 151,409; data 2,800; BSS 167,944 | vs `2d8a7ad`: +0 file; +610 text; data/BSS unchanged; below 163,840 guard |
 | Memory-codec full CLI (Ubuntu 22.04 gcc 11) | 162,048 bytes; text 152,806; data 2,792; BSS 167,944 | container build + full 27-check smoke; original 163,840 guard passes |
 | Core-only nofs probe with memory codec | 65,464 bytes unstripped; text 47,111; data 952; BSS 4,224 | vs `2d8a7ad`: +8,720 file; +7,018 text; +144 data; BSS unchanged; no host file symbols |
-| `PERSISTENCE=0` full CLI | 157,944 bytes; text 143,870; data 2,632; BSS 167,944 | vs `c78f59d`: -4,096 file; -7,539 text; -168 data; BSS unchanged; no `fsync`/`rename` imports |
+| `PERSISTENCE=0` full CLI | 157,944 bytes; text 143,870; data 2,632; BSS 167,944 | vs `c78f59d`: -4,096 file; -7,539 text; -168 data; BSS unchanged; checkpoint backend/marker absent |
 | Persistence-switch default / cut perf cold / 5-step loop peak RSS | default 9,116 / 9,072 KiB; cut 9,100 / 9,084 KiB | baseline 9,088 / 9,088 KiB; 50 ms / 50 ms; normal host variation; guards pass |
 | Near-cap valid restore | 1,006,563-byte snapshot; 256 messages | 10.3 ms REPL startup + restore; 18,132 KiB peak child RSS (checkpoint baseline measurement) |
 | Near-cap restore + new bounded echo turn | input 1,006,563; output 991,187 bytes; 256 messages | 30 ms process elapsed; 12,568 KiB peak RSS; complete-turn eviction and atomic save |
@@ -571,7 +572,9 @@ lives in plugin.c and is shared with toolscan.
   and digest checks under strict C11 without host file I/O. `make test-persistence`
   verifies the full-CLI `PERSISTENCE=0` cut: explicit operations fail closed,
   TTY auto-save is absent, gateway RAM history works but restarts are empty,
-  reset does not unlink files, and `fsync`/`rename` backend imports are gone.
+  reset does not unlink files. The checkpoint object/marker is absent and the
+selected stub has no `fsync`/`rename` imports; the unrelated memory backend
+may still use its own atomic replacement.
 - Smoke #9: gateway health/auth plus partial, byte-segmented, malformed
   and oversized requests. Headers are capped at 16 KiB and bodies at
   1 MiB; the receive allocation is capped at their sum plus one NUL byte.
