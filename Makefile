@@ -23,6 +23,7 @@ PREFIX  ?= /usr/local
 
 FILE_TOOLS ?= 1
 SHELL_TOOLS ?= 1
+MEMORY_TOOLS ?= 1
 PERSISTENCE ?= 1
 VISION_TOOLS ?= 0
 TTS_TOOLS ?= 0
@@ -41,6 +42,12 @@ ifeq ($(FILE_TOOLS),0)
 TOOLS_SRC   = $(filter-out src/tools/filetools.c,$(TOOLS_AVAILABLE))
 else
 TOOLS_SRC   = $(filter-out src/tools/filetools_nofs.c,$(TOOLS_AVAILABLE))
+endif
+ifeq ($(MEMORY_TOOLS),0)
+TOOLS_SRC := $(filter-out src/tools/memorytools.c src/tools/memorytools_nofs.c,$(TOOLS_SRC)) \
+	src/tools/memorytools_nofs.c
+else
+TOOLS_SRC := $(filter-out src/tools/memorytools_nofs.c,$(TOOLS_SRC))
 endif
 HARNESS_ALL = $(wildcard src/harness/*.c)
 HARNESS_SRC = $(filter-out src/harness/checkpoints_nofs.c,$(HARNESS_ALL))
@@ -66,7 +73,7 @@ src/harness/repl.o src/harness/tts.o: src/harness/tts.h
 # Full-CLI request/history/transport code is I/O-bound; keep every compiler
 # in the compatibility matrix below the size guard. The strict probe stays -O2.
 src/core/agent.o src/core/transport.o src/core/checkpoint.o \
-	src/tools/filetools.o: override CFLAGS += -Os
+	src/tools/filetools.o src/tools/memorytools.o: override CFLAGS += -Os
 # C snapshot code has no exception unwinding; avoid size-only unwind tables.
 src/core/checkpoint.o: override CFLAGS += -fno-unwind-tables -fno-asynchronous-unwind-tables
 # The host CLI/harness is I/O-bound and outside the agent/tool hot path.
@@ -99,6 +106,14 @@ test: motiris
 
 test-shell: motiris
 	python3 tests/shell.py
+
+# Host memory file fault injection plus model-driven integration coverage.
+test-memory: motiris
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o build/memory-unit \
+		tests/memory_unit.c src/vendor/cJSON.c $(LDFLAGS)
+	./build/memory-unit
+	python3 tests/memory.py
 
 # Optional host-backed vision tool; clean rebuild isolates its compile flag.
 test-vision:
@@ -142,7 +157,7 @@ test-core-nofs: $(NOFS_DIR)/core-nofs-test
 # the optional shell subprocess backend compiled out.
 test-nofs: test-core-nofs
 	$(MAKE) clean
-	$(MAKE) FILE_TOOLS=0 SHELL_TOOLS=0 motiris
+	$(MAKE) FILE_TOOLS=0 SHELL_TOOLS=0 MEMORY_TOOLS=0 motiris
 	sh tests/nofs.sh
 
 # Full host CLI without the optional stdio/atomic-rename checkpoint backend.
@@ -161,12 +176,12 @@ test-docker:
 		motiris-test bash -c 'mkdir -p /tmp/home && make clean && make && sh tests/smoke.sh'
 
 clean:
-	rm -f motiris *.a
+	rm -f motiris *.a build/memory-unit
 	rm -rf build/nofs
 	find src deps -name '*.o' -delete
 
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test test-shell test-vision test-tts test-core-nofs test-nofs \
+.PHONY: test test-shell test-memory test-vision test-tts test-core-nofs test-nofs \
 	test-persistence test-docker clean install

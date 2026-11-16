@@ -33,8 +33,10 @@ make test-docker      # same suite in a throwaway debian container
 sh tests/perf.sh      # cold-start latency, peak RSS, agent-loop guard
 make FILE_TOOLS=0     # optional POSIX file backend -> bounded stubs
 make SHELL_TOOLS=0    # compile out and unregister host shell subprocesses
+make MEMORY_TOOLS=0   # optional persistent memory files -> no-I/O stubs
 make PERSISTENCE=0    # optional host checkpoint files -> volatile sessions
 make test-shell       # dual-stream, output cap, timeout and reaping tests
+make test-memory      # memory corruption, atomic fault and replacement tests
 make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
 make test-persistence # full-CLI checkpoint-cut fail-closed/volatile tests
 make VISION_TOOLS=1   # opt in to host-backed vision_analyze
@@ -48,7 +50,7 @@ make test-tts         # clean optional build + fake-engine integration tests
 | Target | Build/test evidence | Boundary |
 | --- | --- | --- |
 | Linux gcc / clang | `make`, `make test`, CI `-Werror` and ASAN/UBSAN | Full host CLI; libcurl and POSIX tools enabled |
-| Host CLI without file/shell backends | `make test-nofs` (`FILE_TOOLS=0 SHELL_TOOLS=0`) | Excludes `filetools.c` and the shell subprocess implementation; file tools return fixed bounded errors and `shell` is unregistered. Other host tools/harness are unchanged |
+| Host CLI without file/memory/shell backends | `make test-nofs` (`FILE_TOOLS=0 MEMORY_TOOLS=0 SHELL_TOOLS=0`) | Excludes `filetools.c`, `memorytools.c` and the shell subprocess implementation; file/memory tools return fixed bounded no-I/O errors and `shell` is unregistered. Other host tools/harness are unchanged |
 | Host CLI without checkpoint files | `make test-persistence` (`PERSISTENCE=0`) | Excludes the stdio/`fsync`/atomic-`rename` backend; explicit file operations fail closed, REPL/gateway use volatile bounded history. Portable core memory snapshots remain; other host facilities are unchanged |
 | Optional host vision | `make test-vision` (`VISION_TOOLS=1`) | One workspace-local image to a configured remote provider; separate POSIX file + libcurl backend, excluded by default and not local inference |
 | Optional host TTS | `make test-tts` (`TTS_TOOLS=1`) | Final REPL text to one trusted external executable over a bounded pipe; fake-engine tests only, no audio device or MCU claim |
@@ -258,6 +260,55 @@ responses. It runs in smoke #11, including the ASAN/UBSAN tools job. These are
 host bounds and measurements only; no MCU/RTOS cross-toolchain, target
 Flash/RAM or hardware validation is available.
 
+### Bounded, failure-safe persistent memory files
+
+`memory_set` / `memory_get` use the optional host
+`$HOME/.local/share/motiris/memory.json` backend. `MEMORY_TOOLS=0` replaces
+`src/tools/memorytools.c` with `memorytools_nofs.c`: both tool schemas remain
+registered, but calls return a fixed bounded error and never create/read a
+file. `make test-nofs` verifies this cut together with the file/shell cuts;
+the strict-C11 core-only probe never included these host tools and is unchanged.
+
+Only `ENOENT` creates an empty in-memory object. Empty, malformed, non-object,
+oversized, non-regular and short/incompletely read files fail both get and set
+with bounded errors. Set never treats invalid existing data as empty and never
+opens the original for truncating writes. Keys are limited to 256 bytes, values
+to 256 KiB, paths to 4096 bytes including NUL, and input/serialized files to
+1 MiB. A successful update serializes first, writes a same-directory
+`mkstemp` mode-0600 file completely, checks `fsync` and `close`, then uses
+atomic `rename`. Every failure before rename removes the temporary file and
+preserves the original bytes. Detached cJSON replacements use `cJSON_Delete`.
+There is no multi-process read/modify/write lock or idle/background I/O.
+
+The read allocation is `file_size + 2`, at most 1 MiB + 2 bytes. Parsing adds
+a cJSON tree derived from that bounded input; listing temporarily duplicates
+it, while set owns a separate serialized buffer capped at 1 MiB plus NUL.
+Exact cJSON/libc node overhead is implementation-dependent, so these are
+phase-wise application bounds rather than total-process RSS guarantees.
+Tool arguments and outer Agent history have their own existing bounds.
+
+Reference host measurements on 2026-11-16 (Linux x86_64, gcc, stripped;
+baseline `4f36c9d`) are:
+
+| Build / measurement | Bytes / sections / RSS | Relative result |
+| --- | ---: | --- |
+| Baseline default full CLI | 162,040 bytes; text 151,409; data 2,800; BSS 167,944 | baseline |
+| Failure-safe memory full CLI | 162,040 bytes; text 153,515; data 2,808; BSS 167,944 | +0 file; +2,106 text; +8 data; BSS unchanged; below 163,840 guard |
+| `FILE_TOOLS=0 MEMORY_TOOLS=0 SHELL_TOOLS=0` full CLI | 145,656 bytes; text 136,347; data 2,648; BSS 163,848 | Combined optional-backend cut; memory host object absent and no-I/O stub tests pass |
+| Strict core-only nofs probe | 65,464 bytes unstripped; text 47,111; data 952; BSS 4,224 | Unchanged from baseline; libc only, no host memory/file backends |
+| Maximum 256 KiB value through local provider | 12,972 KiB peak process RSS | Includes two Agent/provider rounds, cJSON and libcurl; not an MCU RAM budget |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,156 / 9,072 KiB | Baseline 9,088 / 9,072 KiB; both 50 ms and below guards; normal host variation |
+
+`tests/memory_unit.c` includes the production translation unit with syscall
+fault injection for short reads and write/`fsync`/close/rename failures. It
+also covers invalid/empty/non-object/oversized input, exact key/value limits,
+mode 0600, byte preservation and repeated replacements. `tests/memory.py`
+drives separate real CLI/provider processes for round-trip, corruption,
+write-failure and maximum-value coverage. `make test-memory` runs both; CI
+runs them under ASAN/UBSAN with leak detection enabled. The default direct
+ELF dependencies remain only `libcurl.so.4` and `libc.so.6`. No MCU/RTOS
+cross-toolchain, target Flash/RAM or hardware validation is available.
+
 ### Bounded live history, replay and full-turn checkpoints
 
 `src/core/agent.c` owns per-agent live-history and replay budgets; there is no
@@ -404,10 +455,11 @@ on main): `build` (gcc clean compile+link, size guard, artifact),
 groups, see `tests/smoke.sh <group>`), `plugins` (example .so with gcc +
 clang -Werror), `tools` (component static libs compile independently
 with clang -Werror), `no-filesystem` (strict-C11 core, memory snapshots and optional
-file/shell backend cuts), `vision` (optional local-mock integration and
+file/memory/shell backend cuts), `vision` (optional local-mock integration and
 clang `-Werror`),
 `tts` (optional fake-engine integration and clang `-Werror`),
-and `sanitizers` (ASAN/UBSAN tools smoke). The `no-filesystem` job also
+and `sanitizers` (ASAN/UBSAN tools smoke plus leak-enabled memory fault and
+integration tests). The `no-filesystem` job also
 runs `make test-persistence` and a clang `-Werror` build/test for the full-CLI
 host-checkpoint cut.
 `perf` and `compat-matrix` are informational
@@ -529,6 +581,9 @@ lives in plugin.c and is shared with toolscan.
 - Smoke #11: shell drains both pipes concurrently, enforces per-stream/total
   output caps and a monotonic timeout, kills/reaps its process group, and
   survives repeated calls without fd/direct-child leaks (also under ASAN/UBSAN).
+  `make test-memory` additionally proves invalid-file preservation, bounded
+  input/storage, atomic failure cleanup and leak-free repeated replacement;
+  the dedicated sanitizer CI step enables LSan for both memory test layers.
 - Smoke #14: SSE delta aggregation (first-delta termination).
 - Smoke #16: repl shows tool lines + token stats (streamed tool_calls
   + usage through the mock).

@@ -46,6 +46,10 @@ published by `.github/workflows/release.yml`.
   documented host/MCU validation boundary.
 - Optional shell-backend cut (`SHELL_TOOLS=0`) compiles out and unregisters
   the host subprocess tool without changing the portable core or public API.
+- Optional persistent-memory backend cut (`MEMORY_TOOLS=0`) replaces host
+  JSON file I/O with bounded no-I/O `memory_get`/`memory_set` stubs. Offline
+  fault-injection and model-driven tests cover atomic failure and corruption
+  preservation, with a leak-enabled sanitizer CI gate.
 - Optional host-backed `vision_analyze` (`VISION_TOOLS=1`): one bounded,
   workspace-local image to a trusted OpenAI-compatible vision provider, with
   explicit MIME, configurable input/timeout limits, bounded responses/text,
@@ -66,6 +70,12 @@ published by `.github/workflows/release.yml`.
   process group on timeout or execution errors. Model-visible results include
   truncation/signal/timeout diagnostics; regression tests cover the former
   128 KiB stderr deadlock, output floods, cleanup and maximum-cap RSS.
+- Persistent memory no longer silently erases empty, malformed, non-object,
+  oversized or incompletely read files. Only a missing file starts empty;
+  updates use bounded 256-byte keys, 256 KiB values and 1 MiB files, complete
+  mode-0600 temporary writes plus `fsync`/close checks and atomic rename.
+  Failures preserve the last valid bytes, and replaced cJSON values are fully
+  freed rather than leaking on every overwrite.
 - `web_fetch` / `web_search` receive buffers now cover every full libcurl
   chunk without integer overflow, out-of-bounds writes or `realloc` loss.
   Bodies retain at most 64 KiB plus a private NUL byte; excess is drained

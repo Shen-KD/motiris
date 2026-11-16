@@ -86,11 +86,13 @@ make                  # cc -O2, single binary ./motiris (stripped)
 make test             # offline smoke tests, no API key required
 make FILE_TOOLS=0     # cut the POSIX file backend; bounded stubs remain
 make SHELL_TOOLS=0    # compile out and unregister the host shell backend
+make MEMORY_TOOLS=0   # cut persistent memory files; bounded stubs remain
 make PERSISTENCE=0    # cut host checkpoint files; REPL/gateway use RAM only
-make test-nofs        # strict-C11 core probe + file/shell backend cut test
+make test-nofs        # strict-C11 core + file/memory/shell backend cut test
 make test-persistence # full-CLI volatile-only checkpoint backend cut test
 make test-core-nofs   # core-only retention + memory snapshot round-trip
 make test-shell       # bounded shell execution integration tests
+make test-memory      # memory corruption/atomic-failure/replacement tests
 make test-vision      # clean optional-vision build + local mock integration
 make VISION_TOOLS=1   # opt in to the host-backed vision_analyze tool
 make TTS_TOOLS=1      # opt in to host-only REPL speech output
@@ -102,8 +104,10 @@ Requires: a C11 compiler and the libcurl shared library at runtime
 curl 8.18 ABI). No other dependencies. `FILE_TOOLS=0` replaces only the
 optional file tools with fixed-error stubs. `SHELL_TOOLS=0` independently
 compiles out the `fork`/`pipe`/`poll`/`waitpid` backend and leaves `shell`
-unregistered; the `time` tool remains. Other host tools and the CLI still use
-their documented OS facilities. `PERSISTENCE=0` independently replaces only
+unregistered; the `time` tool remains. `MEMORY_TOOLS=0` independently replaces
+the persistent JSON memory backend with fixed-error `memory_get`/`memory_set`
+stubs that perform no file I/O. Other host tools and the CLI still use their
+documented OS facilities. `PERSISTENCE=0` independently replaces only
 the host full-turn checkpoint file backend with fixed-error stubs: explicit
 `--save`, `-r` and `/resume` fail closed without touching the supplied path,
 REPL automatic checkpoints are disabled, and the gateway reports
@@ -240,7 +244,14 @@ Knowledge & delegation tools:
 - `web_search(query)` — DuckDuckGo lite (keyless), titles+links; uses the
   same 64 KiB response cap and truncation flag
 - `memory_set(key, value)` / `memory_get(key?)` — persistent JSON memory
-  (`~/.local/share/motiris/memory.json`)
+  (`~/.local/share/motiris/memory.json`). Keys are limited to 256 bytes, values
+  to 256 KiB and the file to 1 MiB. Only a missing file starts empty: empty,
+  malformed, non-object, oversized, non-regular or incompletely read files
+  return a bounded error and are preserved byte-for-byte. Updates write a
+  mode-0600 same-directory temporary file, check write/`fsync`/close and
+  atomically rename it; failures preserve the last valid file. Concurrent
+  multi-process read/modify/write locking is not provided. `MEMORY_TOOLS=0`
+  compiles out this host backend and leaves no-I/O stubs.
 - `skill_list()` / `skill_load(name)` — SKILL.md frontmatter index,
   on-demand loading (`--skill-dir DIR`)
 - `skill_patch(name, old, new)` / `skill_write(name, content)` —
@@ -371,6 +382,7 @@ make test          # 27 default offline smoke checks, no network/key needed
 make test-core-nofs # strict-C11 core + caller-owned memory snapshots
 make test-persistence # PERSISTENCE=0 fail-closed/volatile-only integration
 make test-shell    # shell dual-stream/cap/timeout/reaping regression cases
+make test-memory   # memory corruption/atomic faults + replacement coverage
 make test-vision   # optional vision build + 10 local-mock integration cases
 make test-tts      # optional TTS build + 8 fake-engine integration cases
 make test-docker   # default suite inside a throwaway debian container

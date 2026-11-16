@@ -469,7 +469,7 @@ fi
 if test_in 11; then
 echo "== 11: web_fetch boundaries + memory + shell deny"
 F11=$(mktemp -d)
-mkdir -p "$F11/ws" "$F11/h3" "$F11/h4"
+mkdir -p "$F11/ws" "$F11/h3" "$F11/h4" "$F11/home"
 printf '<html><body><h1>Hi there</h1><script>x</script>web ok</body></html>' > "$F11/ws/page.html"
 printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18093/v1/chat/completions","shell_deny":"rm"}' > "$F11/h3/config.json"
 printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18094/v1/chat/completions"}' > "$F11/h4/config.json"
@@ -506,16 +506,17 @@ ROOT=$(pwd)
 cd "$F11/ws"
 O3=$(MOTIRIS_HOME="$F11/h3" MOTIRIS_WORKSPACE="$F11/ws" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
 echo "$O3" | grep -q 'blocked by shell policy' || { echo "FAIL deny: $O3"; kill $M11PID 2>/dev/null; exit 1; }
-O4=$(MOTIRIS_HOME="$F11/h4" MOTIRIS_WORKSPACE="$F11/ws" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
+O4=$(HOME="$F11/home" MOTIRIS_HOME="$F11/h4" MOTIRIS_WORKSPACE="$F11/ws" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
 echo "$O4" | grep -q 'stored' || { echo "FAIL memory: $O4"; kill $M11PID 2>/dev/null; exit 1; }
 # memory persisted file exists
-ls "$HOME/.local/share/motiris/memory.json" >/dev/null 2>&1 || { echo "FAIL memory file"; kill $M11PID 2>/dev/null; exit 1; }
+ls "$F11/home/.local/share/motiris/memory.json" >/dev/null 2>&1 || { echo "FAIL memory file"; kill $M11PID 2>/dev/null; exit 1; }
 kill $M11PID 2>/dev/null
 wait $M11PID 2>/dev/null || true
 cd "$ROOT"
 rm -rf "$F11"
 python3 tests/webtools.py
 python3 tests/shell.py
+make test-memory
 
 fi
 if test_in 12; then
