@@ -109,6 +109,17 @@ test: motiris
 test-shell: motiris
 	python3 tests/shell.py
 
+WEBTOOLS_TEST_CFLAGS ?= -O1 -g -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
+WEBTOOLS_TEST_LDFLAGS ?= -Wl,-l:libcurl.so.4
+
+# Direct parser regression, including malformed/truncated DDG responses.
+test-webtools-parser:
+	@mkdir -p build
+	$(CC) $(WEBTOOLS_TEST_CFLAGS) $(CPPFLAGS) \
+		tests/webtools_parser.c src/vendor/cJSON.c \
+		$(WEBTOOLS_TEST_LDFLAGS) -o build/webtools-parser
+	build/webtools-parser
+
 # Host memory file fault injection plus model-driven integration coverage.
 test-memory: motiris
 	@mkdir -p build
@@ -178,12 +189,12 @@ test-docker:
 		motiris-test bash -c 'mkdir -p /tmp/home && make clean && make && sh tests/smoke.sh'
 
 clean:
-	rm -f motiris *.a build/memory-unit
+	rm -f motiris *.a build/memory-unit build/webtools-parser
 	rm -rf build/nofs
 	find src deps -name '*.o' -delete
 
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test test-shell test-memory test-vision test-tts test-core-nofs test-nofs \
-	test-persistence test-docker clean install
+.PHONY: test test-shell test-memory test-webtools-parser test-vision test-tts \
+	test-core-nofs test-nofs test-persistence test-docker clean install

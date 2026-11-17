@@ -96,6 +96,11 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- `web_search` validates every DDG row delimiter before pointer arithmetic or
+  copying. Malformed/truncated rows are skipped without NULL arithmetic or
+  out-of-bounds reads; normal titles and bounded 511/200-byte field prefixes
+  retain the 10-result cap. Direct parser regressions, including deterministic
+  malformed-input fuzzing, run under ASAN/UBSAN.
 - A singleton configured provider now uses its declared model, endpoint and
   key instead of silently falling back to the default provider. One-, two-
   and eight-entry offline routing tests verify selection and fallback order.

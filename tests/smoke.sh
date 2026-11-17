@@ -522,6 +522,7 @@ kill $M11PID 2>/dev/null
 wait $M11PID 2>/dev/null || true
 cd "$ROOT"
 rm -rf "$F11"
+make -s test-webtools-parser
 python3 tests/webtools.py
 python3 tests/shell.py
 make test-memory
