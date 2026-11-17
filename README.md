@@ -92,6 +92,7 @@ make test-nofs        # strict-C11 core + file/memory/shell backend cut test
 make test-persistence # full-CLI volatile-only checkpoint backend cut test
 make test-core-nofs   # core-only retention + memory snapshot round-trip
 make test-shell       # bounded shell execution integration tests
+make test-webtools-parser # malformed/truncated web_search parser regression
 make test-memory      # memory corruption/atomic-failure/replacement tests
 make test-vision      # clean optional-vision build + local mock integration
 make VISION_TOOLS=1   # opt in to the host-backed vision_analyze tool
@@ -283,7 +284,9 @@ Knowledge & delegation tools:
 - `web_fetch(url)` — libcurl GET, HTML stripped to text; retains at most
   64 KiB, drains/discards excess bytes and reports `"truncated": true`
 - `web_search(query)` — DuckDuckGo lite (keyless), titles+links; uses the
-  same 64 KiB response cap and truncation flag
+  same 64 KiB response cap and truncation flag. Malformed or incomplete result
+  rows are skipped. At most 10 results are returned; links and titles retain
+  bounded prefixes of at most 511 and 200 bytes respectively
 - `memory_set(key, value)` / `memory_get(key?)` — persistent JSON memory
   (`~/.local/share/motiris/memory.json`). Keys are limited to 256 bytes, values
   to 256 KiB and the file to 1 MiB. Only a missing file starts empty: empty,
@@ -445,6 +448,7 @@ make test          # 27 default offline smoke checks, no network/key needed
 make test-core-nofs # strict-C11 core + caller-owned memory snapshots
 make test-persistence # PERSISTENCE=0 fail-closed/volatile-only integration
 make test-shell    # shell dual-stream/cap/timeout/reaping regression cases
+make test-webtools-parser # malformed/truncated DDG row tests (also in smoke #11)
 make test-memory   # memory corruption/atomic faults + replacement coverage
 make test-vision   # optional vision build + 10 local-mock integration cases
 make test-tts      # optional TTS build + 8 fake-engine integration cases

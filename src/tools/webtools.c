@@ -204,36 +204,82 @@ static void urlencode(char *out, size_t outn, const char *in) {
 }
 
 /* crude but effective: grab <a rel="nofollow" href="...">title</a> rows */
-static void parse_ddg(const char *html, cJSON *out, int *count) {
-  const char *p = html;
-  while (*p && *count < 10) {
-    p = strstr(p, "rel=\"nofollow\"");
-    if (!p) break;
-    const char *href = strchr(p, '"');
-    href = href ? strchr(href + 1, '"') : NULL;
-    if (href) {
-      char link[512];
-      size_t n = (size_t)(strchr(href + 1, '"') - href - 1);
-      if (n >= sizeof link) n = sizeof link - 1;
-      memcpy(link, href + 1, n);
-      link[n] = '\0';
-      const char *t = href + n + 2;
-      const char *te = strstr(t, "</a>");
-      if (te) {
-        size_t tl = (size_t)(te - t);
-        if (tl > 200) tl = 200;
-        char title[256];
-        memcpy(title, t, tl);
-        title[tl] = '\0';
-        cJSON *m = cJSON_CreateObject();
-        cJSON_AddStringToObject(m, "title", title);
-        cJSON_AddStringToObject(m, "url", link);
-        cJSON_AddItemToArray(out, m);
-        (*count)++;
-        p = te;
+static const char ddg_rel[] = "rel=\"nofollow\"";
+
+static const char *find_ddg_candidate(const char *p) {
+  const char *anchor = NULL;
+  for (; *p; p++) {
+    if (*p == '>') {
+      anchor = NULL;
+      continue;
+    }
+    if (*p == '<') {
+      anchor = NULL;
+      if (p[1] == 'a') {
+        unsigned char after = (unsigned char)p[2];
+        if (after == ' ' || after == '\t' || after == '\r' ||
+            after == '\n' || after == '>')
+          anchor = p;
       }
     }
-    p = p ? p + 1 : NULL;
+    if (anchor && !strncmp(p, ddg_rel, sizeof ddg_rel - 1)) return anchor;
+  }
+  return NULL;
+}
+
+static const char *find_ddg_bytes(const char *p, const char *end,
+                                  const char *needle, size_t n) {
+  while (p < end && (size_t)(end - p) >= n) {
+    if (*p == *needle && !memcmp(p, needle, n)) return p;
+    p++;
+  }
+  return NULL;
+}
+
+static void parse_ddg(const char *html, cJSON *out, int *count) {
+  const char *end = html + strlen(html);
+  const char *p = html;
+  while (*p && *count < 10) {
+    const char *candidate = find_ddg_candidate(p);
+    if (!candidate) break;
+
+    /* Only a real row start bounds a bad row, not marker-like title text. */
+    const char *next = find_ddg_candidate(candidate + 2);
+    const char *limit = next ? next : end;
+    p = candidate + 2;
+    const char *rel = find_ddg_bytes(candidate + 2, limit,
+                                     ddg_rel, sizeof ddg_rel - 1);
+    if (!rel) continue;
+    const char *href = find_ddg_bytes(rel + sizeof ddg_rel - 1, limit,
+                                      "href=\"", sizeof "href=\"" - 1);
+    if (!href) continue;
+    href += 5; /* opening quote */
+    const char *href_end = memchr(href + 1, '"', (size_t)(limit - href - 1));
+    if (!href_end) continue;
+    const char *tag_end = memchr(href_end + 1, '>',
+                                 (size_t)(limit - href_end - 1));
+    if (!tag_end) continue;
+    const char *title = tag_end + 1;
+    const char *title_end = find_ddg_bytes(title, limit, "</a>", 4);
+    if (!title_end) continue;
+
+    char link[512];
+    size_t n = (size_t)(href_end - href - 1);
+    if (n >= sizeof link) n = sizeof link - 1;
+    memcpy(link, href + 1, n);
+    link[n] = '\0';
+
+    size_t tl = (size_t)(title_end - title);
+    if (tl > 200) tl = 200;
+    char title_text[256];
+    memcpy(title_text, title, tl);
+    title_text[tl] = '\0';
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "title", title_text);
+    cJSON_AddStringToObject(m, "url", link);
+    cJSON_AddItemToArray(out, m);
+    (*count)++;
+    p = title_end + 4;
   }
 }
 

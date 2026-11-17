@@ -36,6 +36,7 @@ make SHELL_TOOLS=0    # compile out and unregister host shell subprocesses
 make MEMORY_TOOLS=0   # optional persistent memory files -> no-I/O stubs
 make PERSISTENCE=0    # optional host checkpoint files -> volatile sessions
 make test-shell       # dual-stream, output cap, timeout and reaping tests
+make test-webtools-parser # malformed/truncated DDG response parser tests
 make test-memory      # memory corruption, atomic fault and replacement tests
 make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
 make test-persistence # full-CLI checkpoint-cut fail-closed/volatile tests
@@ -365,6 +366,46 @@ The integration test drives actual model tool-calls and local GETs through
 responses. It runs in smoke #11, including the ASAN/UBSAN tools job. These are
 host bounds and measurements only; no MCU/RTOS cross-toolchain, target
 Flash/RAM or hardware validation is available.
+
+### Safe DDG result-row parsing
+
+`web_search` validates the href opening/closing quotes, tag end and closing
+`</a>` before computing lengths or copying a result. Malformed and truncated
+candidates are skipped without consuming a later valid row. Candidate
+boundaries require an actual `<a ... rel="nofollow"` row start, so literal
+marker text inside a valid title is retained. Candidate discovery and all row
+delimiter searches use bounded candidate spans rather than repeated
+whole-suffix searches, avoiding quadratic malformed-input behavior. Title
+extraction starts after
+the validated `>` rather than at an offset derived from a truncated link. The parser still returns at most 10 results. Its fixed
+`link[512]` and `title_text[256]` arrays occupy 768 bytes per active parser
+invocation; each result retains at most 511 URL bytes and 200 title bytes plus
+bounded cJSON node/string-escaping overhead. The input remains the shared
+65,537-byte receive allocation, and no parser state survives the call.
+
+`make test-webtools-parser` includes the production C file in a direct test
+harness and uses exact-size heap responses. It covers the former missing-quote
+511-byte OOB read, malformed rows and recovery at the following valid row,
+every truncation prefix both alone and before a valid sentinel row, 1,000
+consecutive incomplete candidates before a valid row, literal marker text in a
+title, 1,000 deterministic random malformed inputs, 511/512/513/4096-byte
+links, long titles, normal rows and the 10-result cap. Smoke #11 runs it; the CI sanitizer job compiles the same harness with
+ASAN/UBSAN. No runtime, public tool schema/ABI, agent state or default core
+dependency changed, and the strict-C11 core-only probe still excludes web tools.
+
+Reference host measurements on 2026-11-18 (Linux x86_64, gcc, stripped;
+baseline `2b47713`) are:
+
+| Build / measurement | Baseline | Parser fix | Relative result |
+| --- | ---: | ---: | ---: |
+| Default full CLI | 174,336 bytes; text 165,968; data 3,048; BSS 169,040 | 178,432 bytes; text 166,496; data 3,048; BSS 169,040 | +4,096 file; +528 text; data/BSS unchanged |
+| Strict core-only nofs probe | 69,840 bytes unstripped; text 49,715; data 952; BSS 4,232 | 69,840 bytes; identical sections | unchanged; libc only, web tools absent |
+| `tests/webtools.py` max child RSS, including 1 MiB response | 21,920 KiB | 22,152 KiB | +232 KiB host run variation; full agent/provider/libcurl rounds |
+| `tests/perf.sh` cold / 5-step loop peak RSS | 9,164 / 9,156 KiB | 9,380 / 9,132 KiB | +216 / -24 KiB host run variation; guards pass |
+
+Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
+These are host binary/RSS measurements, not MCU Flash/RAM headroom. No
+MCU/RTOS cross-toolchain or hardware validation was performed.
 
 ### Bounded, failure-safe persistent memory files
 

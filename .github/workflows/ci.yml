@@ -172,6 +172,8 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          WEBTOOLS_TEST_CFLAGS: -O1 -g -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -fsanitize=address,undefined -fno-omit-frame-pointer
+          WEBTOOLS_TEST_LDFLAGS: -fsanitize=address,undefined -Wl,-l:libcurl.so.4
         run: |
           sh tests/smoke.sh core
           sh tests/smoke.sh tools
