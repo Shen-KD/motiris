@@ -20,6 +20,39 @@ def plain(data):
     return ANSI.sub("", data.decode("utf-8", "replace")).replace("\r", "")
 
 
+def terminal_lines(data):
+    """Render the ASCII screen updates used by the menu, preserving columns."""
+    rows = {}
+    row = col = i = 0
+    while i < len(data):
+        c = data[i]
+        if c == 0x1b and i + 1 < len(data) and data[i + 1] == ord("["):
+            match = re.match(rb"\x1b\[([0-9;?]*)([@-~])", data[i:])
+            if match:
+                params, final = match.groups()
+                amount = int(params.split(b";")[0] or b"1")
+                if final == ord("A"):
+                    row = max(0, row - amount)
+                elif final == ord("B"):
+                    row += amount
+                elif final == ord("C"):
+                    col += amount
+                elif final == ord("D"):
+                    col = max(0, col - amount)
+                i += len(match.group(0))
+                continue
+        if c == ord("\r"):
+            col = 0
+        elif c == ord("\n"):
+            row += 1
+        elif c >= 32:
+            rows.setdefault(row, {})[col] = chr(c)
+            col += 1
+        i += 1
+    return ["".join(rows[r].get(c, " ") for c in range(max(rows[r]) + 1))
+            for r in range(max(rows) + 1)] if rows else []
+
+
 class Repl:
     def __init__(self, home):
         env = {key: value for key, value in os.environ.items()
@@ -57,7 +90,8 @@ class Repl:
             while data.count(b"\x1b[6n") > answered_cursor_queries:
                 os.write(self.master, b"\x1b[1;1R")
                 answered_cursor_queries += 1
-            if token in plain(data):
+            if (token in data if isinstance(token, bytes)
+                    else token in plain(data)):
                 return bytes(data)
         raise AssertionError("PTY did not produce %r: %s" %
                              (token, plain(data)[-4000:]))
@@ -80,21 +114,49 @@ def main():
 
             # No Tab: one slash must immediately list every command.
             repl.send("/")
-            output = plain(repl.read_until("leave the repl"))
+            raw = repl.read_until("leave the repl")
+            output = plain(raw)
+            lines = terminal_lines(raw)
             for command in ("/help", "/new", "/tools", "/sessions",
-                            "/resume", "/skills", "/exit"):
+                            "/resume", "/skills", "/hotkey", "/exit"):
                 assert command in output, (command, output)
+                assert any(line.startswith("  " + command) for line in lines), (
+                    command, lines)
             assert "/quit" not in output, output
+            assert b"\x1b[7m  /help" in raw, raw
 
-            # Prefix searches repaint the list on each inserted character.
+            # Arrows move the highlight without changing the typed prefix.
+            repl.send("\x1b[B")
+            raw = repl.read_until("leave the repl")
+            assert b"\x1b[7m  /new" in raw, raw
+            assert b"\x1b[7m  /help" not in raw, raw
+
+            # Typing keeps the original prefix and resets to its first match.
             repl.send("s")
-            output = plain(repl.read_until("list available skills [TERM]"))
+            raw = repl.read_until("list available skills [TERM]")
+            output = plain(raw)
             assert "/sessions" in output, output
             assert "/skills" in output, output
             assert "/help" not in output, output
+            assert b"\x1b[7m  /sessions" in raw, raw
+
+            # Every edit, including transposition, resets the selected match.
+            repl.send("\x1b[B")
+            raw = repl.read_until("list available skills [TERM]")
+            assert b"\x1b[7m  /skills" in raw, raw
+            repl.send("\x1b[D")
+            repl.read_until("list available skills [TERM]")
+            repl.send("\x14")
+            repl.read_until(b"\x1b[J\x1b[1A\r\x1b[11C")
+            repl.send("\x1b[D")
+            repl.read_until(b"\r\x1b[10C")
+            repl.send("\x14")
+            raw = repl.read_until("list available skills [TERM]")
+            assert b"\x1b[7m  /sessions" in raw, raw
 
             repl.send("e")
-            output = plain(repl.read_until("review past session logs [TERM]"))
+            raw = repl.read_until("review past session logs [TERM]")
+            output = plain(raw)
             assert "/sessions" in output, output
             assert "/skills" not in output, output
 
@@ -107,7 +169,29 @@ def main():
             output = plain(repl.read_until("unknown command: /quit"))
             assert "echo round complete" not in output, output
 
-            repl.send("/exit\r")
+            # A no-match placeholder is not selectable: arrows still use history.
+            repl.send("/zzz")
+            repl.read_until(b"no matching commands (/help)\x1b[1A\r\x1b[13C")
+            repl.send("\x1b[A")
+            raw = repl.read_until(b"no matching commands (/help)\x1b[1A\r")
+            output = plain(raw)
+            assert "motiris> /quit" in output, output
+            repl.send("\x15")
+            repl.read_until("motiris> ")
+
+            repl.send("/hotkey\r")
+            output = plain(repl.read_until("clear the screen"))
+            for text in ("interactive keys", "select a command", "enter",
+                         "tab", "ctrl+c", "ctrl+d", "ctrl+u"):
+                assert text in output, (text, output)
+
+            # Up from the first item wraps to the last; Enter accepts it.
+            repl.send("/")
+            repl.read_until("leave the repl")
+            repl.send("\x1b[A")
+            raw = repl.read_until("leave the repl")
+            assert b"\x1b[7m  /exit" in raw, raw
+            repl.send("\r")
             repl.read_until("bye")
             assert repl.proc.wait(timeout=5) == 0
         finally:

@@ -70,6 +70,7 @@ struct linenoiseState {
     size_t oldrows;     /* Rows used by last refrehsed line (multiline mode) */
     int oldrpos;        /* Cursor row from last refresh (for multiline clearing). */
     int menu_rows;      /* Live menu rows below the input (single-line mode). */
+    int menu_index;     /* Zero-based live menu selection. */
     int history_index;  /* The history index we are currently editing. */
     int fold_count;    /* Number of folded ranges. */
     size_t fold_start[LINENOISE_MAX_FOLDS]; /* Folded range start offsets. */
@@ -96,13 +97,19 @@ void linenoiseFree(void *ptr);
 typedef void(linenoiseCompletionCallback)(const char *, linenoiseCompletions *);
 typedef char*(linenoiseHintsCallback)(const char *, int *color, int *bold);
 typedef void(linenoiseFreeHintsCallback)(void *);
-typedef char*(linenoiseMenuCallback)(const char *);
+typedef char*(linenoiseMenuCallback)(const char *, int selected);
+typedef char*(linenoiseMenuSelectCallback)(const char *, int selected);
 typedef void(linenoiseFreeMenuCallback)(void *);
 void linenoiseSetCompletionCallback(linenoiseCompletionCallback *);
 void linenoiseSetHintsCallback(linenoiseHintsCallback *);
 void linenoiseSetFreeHintsCallback(linenoiseFreeHintsCallback *);
-/* Return a newline-separated live menu, or NULL to hide it (single-line mode). */
+/* Return a newline-separated live menu, or NULL to hide it (single-line mode).
+ * selected is the zero-based row to highlight. Up/down navigate a visible menu. */
 void linenoiseSetMenuCallback(linenoiseMenuCallback *);
+/* Optionally return a stable input replacement for a selected row, or NULL.
+ * The callback is also queried before arrow navigation and must be side-effect
+ * free: NULL makes arrows fall back to history (for example, no menu matches). */
+void linenoiseSetMenuSelectCallback(linenoiseMenuSelectCallback *);
 void linenoiseSetFreeMenuCallback(linenoiseFreeMenuCallback *);
 void linenoiseAddCompletion(linenoiseCompletions *, const char *);
 
