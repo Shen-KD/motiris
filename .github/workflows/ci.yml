@@ -176,7 +176,7 @@ jobs:
           sh tests/smoke.sh core
           sh tests/smoke.sh tools
 
-      - name: memory replacement leak guard (LSan/ASAN/UBSAN)
+      - name: memory replacement and REPL leak guard (LSan/ASAN/UBSAN)
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
@@ -184,6 +184,7 @@ jobs:
           make test-memory \
             CFLAGS="-O1 -g -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -fsanitize=address,undefined -fno-omit-frame-pointer" \
             LDFLAGS="-fsanitize=address,undefined -Wl,-l:libcurl.so.4"
+          sh tests/smoke.sh repl
 
   # performance & resource guard: cold-start latency, peak RSS, agent-loop
   # overhead. Informational check (not required for merge).

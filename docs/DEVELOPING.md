@@ -463,8 +463,8 @@ with clang -Werror), `no-filesystem` (strict-C11 core, memory snapshots and opti
 file/memory/shell backend cuts), `vision` (optional local-mock integration and
 clang `-Werror`),
 `tts` (optional fake-engine integration and clang `-Werror`),
-and `sanitizers` (ASAN/UBSAN tools smoke plus leak-enabled memory fault and
-integration tests). The `no-filesystem` job also
+and `sanitizers` (ASAN/UBSAN tools smoke plus leak-enabled memory fault,
+integration and REPL interruption tests). The `no-filesystem` job also
 runs `make test-persistence` and a clang `-Werror` build/test for the full-CLI
 host-checkpoint cut.
 `perf` and `compat-matrix` are informational
@@ -573,8 +573,11 @@ lives in plugin.c and is shared with toolscan.
   eviction, restore-time limits and independent replay item/byte budgets run
   in `tests/history.py`; live overflow fails closed, and an over-budget replay
   active turn is rejected before transport. `make test-core-nofs` separately
-  verifies byte-exact caller-owned memory round-trip and fail-closed ownership
-  and digest checks under strict C11 without host file I/O. `make test-persistence`
+  verifies byte-exact caller-owned memory round-trip, fail-closed ownership
+  and digest checks, and cancellation after a tool result under strict C11
+  without host file I/O. The cancelled assistant/tool messages are removed,
+  the active user remains, and the same agent then completes a retry.
+  `make test-persistence`
   verifies the full-CLI `PERSISTENCE=0` cut: explicit operations fail closed,
   TTY auto-save is absent, gateway RAM history works but restarts are empty,
   reset does not unlink files. The checkpoint object/marker is absent and the
@@ -596,7 +599,10 @@ may still use its own atomic replacement.
 - Smoke #15: piped REPL commands plus real-PTY live slash menus. Typing `/`
   displays all commands without Tab, `/s` and `/se` filter to the expected
   subsets, Ctrl-U clears old rows, `/quit` fails locally without a model turn,
-  and `/exit` remains the single exit command.
+  and `/exit` remains the single exit command. A slow-SSE PTY case also sends
+  Ctrl+C during generation, verifies the REPL survives and returns its prompt,
+  then appends an instruction and checks that the next request has both user
+  messages but no partial assistant content.
 - Smoke #16: repl shows tool lines + token stats (streamed tool_calls
   + usage through the mock).
 - Smoke #17: plugin tool hook fires (needs examples/hello_plugin.so).

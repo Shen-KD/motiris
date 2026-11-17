@@ -14,6 +14,24 @@ const char *motiris_tool_schema(const char *name) {
   return NULL;
 }
 
+static int cancel_flag;
+static int cancel_requested(void *ud) {
+  (void)ud;
+  return cancel_flag;
+}
+static char *shell_result(const char *args, void *ud) {
+  (void)args; (void)ud;
+  const char result[] = "{\"ok\":true}";
+  char *copy = malloc(sizeof result);
+  if (copy) memcpy(copy, result, sizeof result);
+  return copy;
+}
+static void cancel_after_tool(const char *name, const char *args,
+                              const char *result, void *ud) {
+  (void)name; (void)args; (void)result; (void)ud;
+  cancel_flag = 1;
+}
+
 int main(void) {
   MotirisAgent *a = motiris_new();
   if (!a) return 1;
@@ -149,8 +167,39 @@ int main(void) {
   free(tampered);
   free(roundtrip);
   free(snapshot);
+
+  /* Cancellation after a completed tool call rolls back that call and its
+   * assistant message, but retains the active user instruction for a retry. */
+  MotirisAgent *d = motiris_new();
+  if (!d) { motiris_free(a); return 1; }
+  MotirisTool shell = { .name = "shell", .call = shell_result };
+  motiris_register_tool(d, &shell);
+  motiris_set_transport(d, "echo");
+  motiris_add_tool_hook(d, cancel_after_tool, NULL);
+  motiris_set_cancel_cb(d, cancel_requested, NULL);
+  cancel_flag = 0;
+  motiris_add_user(d, "retained interrupted instruction");
+  if (motiris_run(d) != MOTIRIS_RUN_CANCELLED ||
+      cJSON_GetArraySize(motiris_messages(d)) != 1 ||
+      strcmp(motiris_last_error(d), "cancelled")) {
+    fprintf(stderr, "core-nofs: interrupted run was not rolled back\n");
+    motiris_free(d);
+    motiris_free(a);
+    return 1;
+  }
+  motiris_set_cancel_cb(d, NULL, NULL);
+  int retry_rc = motiris_run(d);
+  int retry_messages = cJSON_GetArraySize(motiris_messages(d));
+  if (retry_rc != MOTIRIS_RUN_OK || retry_messages != 4) {
+    fprintf(stderr, "core-nofs: retry rc=%d messages=%d error=%s\n",
+            retry_rc, retry_messages, motiris_last_error(d));
+    motiris_free(d);
+    motiris_free(a);
+    return 1;
+  }
+  motiris_free(d);
   motiris_free(a);
-  puts("core-nofs: strict C11 echo, retention and memory snapshots passed");
+  puts("core-nofs: strict C11 echo, cancellation, retention and snapshots passed");
   return 0;
 
 fail:
