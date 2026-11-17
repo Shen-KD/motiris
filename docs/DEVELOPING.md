@@ -593,6 +593,10 @@ may still use its own atomic replacement.
   input/storage, atomic failure cleanup and leak-free repeated replacement;
   the dedicated sanitizer CI step enables LSan for both memory test layers.
 - Smoke #14: SSE delta aggregation (first-delta termination).
+- Smoke #15: piped REPL commands plus real-PTY live slash menus. Typing `/`
+  displays all commands without Tab, `/s` and `/se` filter to the expected
+  subsets, Ctrl-U clears old rows, `/quit` fails locally without a model turn,
+  and `/exit` remains the single exit command.
 - Smoke #16: repl shows tool lines + token stats (streamed tool_calls
   + usage through the mock).
 - Smoke #17: plugin tool hook fires (needs examples/hello_plugin.so).
