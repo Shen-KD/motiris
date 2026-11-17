@@ -33,7 +33,7 @@ unset MOTIRIS_API_KEY MOTIRIS_MODEL MOTIRIS_BASE_URL MOTIRIS_PLUGIN_DIR \
       MOTIRIS_SHELL_STDOUT_MAX MOTIRIS_SHELL_STDERR_MAX \
       MOTIRIS_SHELL_OUTPUT_MAX MOTIRIS_HISTORY_MAX_MESSAGES \
       MOTIRIS_HISTORY_MAX_BYTES MOTIRIS_REPLAY_MAX_MESSAGES \
-      MOTIRIS_REPLAY_MAX_BYTES 2>/dev/null || true
+      MOTIRIS_REPLAY_MAX_BYTES MOTIRIS_RESPONSE_MAX_BYTES 2>/dev/null || true
 
 make motiris examples/hello_plugin.so >/dev/null 2>&1
 
@@ -110,6 +110,7 @@ kill $MOCKPID 2>/dev/null
 rm -rf "$TH8"
 echo "$OUT" | grep -q 'fallback ok' || { echo "FAIL: $OUT"; exit 1; }
 echo "$OUT" | grep -q 'provider dead failed' || { echo "FAIL: dead not attempted"; exit 1; }
+python3 tests/provider.py
 
 fi
 if test_in 9; then
@@ -661,6 +662,7 @@ for _i in 1 2 3 4 5 6 7 8; do
 done
 O8=$(MOTIRIS_HOME="$F14/h" "$ROOT/motiris" -p hi --max-steps 1 --stream -k x 2>&1)
 echo "$O8" | grep -q 'hello world' || { echo "FAIL stream: $O8"; exit 1; }
+python3 tests/transport.py
 kill $M14PID 2>/dev/null
 wait $M14PID 2>/dev/null || true
 rm -rf "$F14"
@@ -674,6 +676,7 @@ echo "$O9" | grep -q '/help' || { echo "FAIL repl help: $O9"; exit 1; }
 echo "$O9" | grep -q 'bye' || { echo "FAIL repl exit: $O9"; exit 1; }
 python3 tests/repl_menu.py
 python3 tests/repl_cancel.py
+python3 tests/render.py
 
 fi
 if test_in 16; then

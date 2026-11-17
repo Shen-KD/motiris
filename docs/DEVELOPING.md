@@ -97,6 +97,66 @@ The no-filesystem switch does not make unrelated host tools, HTTP transports,
 plugins, sessions or gateway MCU-portable. A real target port still needs its
 own HAL/RTOS backends and measured RAM/Flash budget.
 
+### Provider routing, single rendering and bounded responses
+
+Every nonempty configured provider list, including a singleton, selects the
+entry's model/base_url/key in declaration order. The default provider is used
+only when the list is empty. A per-attempt forwarding callback records whether
+a streaming backend actually emitted nonempty text deltas. The agent suppresses
+its aggregated final print only for that case; echo, spawned-curl and other
+buffered fallback paths retain their one final print. Goal-check confirmation
+uses no delta sink, so only a non-`DONE` aggregate is rendered. Once visible
+deltas exist, a transport/parse/API failure ends that run rather than mixing a
+partial answer with fallback output. The flag is run/attempt local, not global
+agent or session state.
+
+`MOTIRIS_RESPONSE_MAX_BYTES` configures `C` from 1 through 16 MiB (default and
+hard maximum 16 MiB). Invalid values warn and use the default. Buffered
+libcurl and spawned-curl bodies, each SSE line, aggregate content and each
+tool-argument string retain at most `C` bytes plus a private NUL; total SSE
+wire input is at most `4*C` to include JSON/framing, and at most 256 tool calls
+are aggregated. Geometric allocation is below `2*(C+1)` per receive buffer.
+Checked subtraction precedes every addition/allocation, a temporary pointer
+preserves the original allocation on `realloc` failure, and limit/OOM paths
+free partial state and return bounded `response limit exceeded` /
+`response allocation failed` errors. Fallback may try the next entry only
+before visible deltas. Tool-call indices must be finite integers in `0..255`;
+missing, negative, fractional and huge indices return `invalid stream response`
+before any numeric cast. Authenticated spawned-curl argv storage includes its
+NULL terminator, and pipe/fork setup closes prior descriptors on failure.
+No thread, runtime, global state or direct dependency was added.
+
+The cJSON tree for a line/response and final serialization add phase-wise
+copies derived from those bounded inputs; exact libc/libcurl/cJSON node
+overhead is implementation-dependent. These are per-call application bounds,
+not a whole-process RSS guarantee or an MCU RAM budget. The host HTTP backends
+remain outside the strict-C11 nofs probe; its echo path does not read this
+setting. An RTOS/HAL network backend and target-specific smaller budgets still
+need real platform validation.
+
+`tests/provider.py` verifies 1/2/8-entry routing, model/key selection and
+fallback. `tests/transport.py` covers buffered, SSE wire/line/content/tool
+arguments, spawned curl, an exact-size body and echo. `tests/repl_cancel.py`
+also asserts one rendered copy of a successful streamed follow-up.
+`tests/render.py` covers streamed goal-check `DONE`, fail-after-delta fallback
+suppression, and stream-enabled echo/spawned-curl REPL rendering. All run in
+existing smoke groups and sanitizer CI jobs.
+
+Reference host measurements on 2026-11-17 (Linux x86_64, gcc `-O2`/component
+`-Os`, stripped; baseline `e570177`) are:
+
+| Build / measurement | Bytes / sections / RSS | Relative result |
+| --- | ---: | --- |
+| Baseline default full CLI | 174,328 bytes; text 162,897; data 3,048; BSS 169,040 | baseline |
+| Bounded provider full CLI | 174,328 bytes; text 164,576; data 3,040; BSS 169,040 | +0 file; +1,679 text; -8 data; BSS unchanged |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,276 / 9,168 KiB | baseline 9,140 / 9,072 KiB; 83 ms / 110 ms vs 50 ms / 50 ms; host variation, guards pass |
+| 16 MiB buffered response rejected at cap | 28,232 KiB peak CLI RSS | GNU `time`; local provider, raw response slightly over cap; not an MCU budget |
+| Strict core-only nofs probe | 69,840 bytes unstripped; text 49,715; data 952; BSS 4,232 | libc only; host receive-limit code compiled out |
+
+Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
+No MCU/RTOS cross-toolchain, target Flash/RAM or hardware validation is
+available; none of these host numbers is an MCU support claim.
+
 ### Optional vision bounds and measurements
 
 `VISION_TOOLS=1` compiles `src/tools/visiontools.c` and three agent getters;

@@ -143,6 +143,7 @@ def main():
         repl.send("second instruction\r")
         repl.read_until("continued-answer")
         repl.read_until("motiris> ", suffix=True)
+        assert repl.plain().count("continued-answer") == 1, repl.plain()
         repl.send("/exit\r")
         end = time.monotonic() + 10
         while time.monotonic() < end:

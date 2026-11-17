@@ -196,6 +196,20 @@ void motiris_set_cancel_cb(MotirisAgent *a, MotirisCancelCallback *cb, void *ud)
 static int run_cancelled(const MotirisAgent *a) {
   return a->cancel && a->cancel(a->cancel_ud);
 }
+
+typedef struct {
+  void (*cb)(const char *, void *);
+  void *ud;
+  int seen;
+} DeltaForward;
+
+/* Remember only deltas actually delivered by the streaming backend. Buffered
+ * fallback leaves seen=0, so the aggregated final answer is still printed. */
+static void forward_delta(const char *text, void *ud) {
+  DeltaForward *forward = ud;
+  if (text && *text) forward->seen = 1;
+  forward->cb(text, forward->ud);
+}
 void motiris_set_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud) {
   a->ntool_hooks = 0; /* replace any existing observers */
   motiris_add_tool_hook(a, cb, ud);
@@ -610,11 +624,12 @@ int motiris_run(MotirisAgent *a) {
     if (run_cancelled(a)) return cancel_run(a, run_tail, start_tok_in, start_tok_out);
     char *last_err = NULL;
     cJSON *j = NULL;
+    int delta_seen = 0;
 
     /* try providers in order; on transport/parse/api error, fail over */
     for (int pi = 0; pi < np; pi++) {
       const char *model, *url, *key;
-      if (np > 1) {
+      if (a->nproviders > 0) {
         model = a->providers[pi].model;
         url = a->providers[pi].base_url;
         key = a->providers[pi].api_key
@@ -626,7 +641,7 @@ int motiris_run(MotirisAgent *a) {
       }
       if (a->verbose)
         fprintf(stderr, "[motiris] step %d: %s via %s\n", step + 1, model,
-                np > 1 ? pname(a, pi) : "default provider");
+                a->nproviders > 0 ? pname(a, pi) : "default provider");
 
       char *body = build_request(a, model);
       if (!body) return 1;
@@ -640,12 +655,16 @@ int motiris_run(MotirisAgent *a) {
       }
 
       char *err = NULL;
+      DeltaForward forward = { a->on_delta, a->delta_ud, 0 };
       char *resp = a->stream
-          ? motiris_transport_send_stream(a->transport, url, authp, body,
-                                          a->on_delta, a->delta_ud,
-                                          a->cancel, a->cancel_ud, &err)
+          ? motiris_transport_send_stream(
+                a->transport, url, authp, body,
+                a->on_delta && !confirm_asked ? forward_delta : NULL,
+                a->on_delta && !confirm_asked ? &forward : NULL,
+                a->cancel, a->cancel_ud, &err)
           : motiris_transport_send(a->transport, url, authp, body,
                                    a->cancel, a->cancel_ud, &err);
+      delta_seen = forward.seen;
       free(body);
       if (run_cancelled(a)) {
         free(resp);
@@ -658,9 +677,11 @@ int motiris_run(MotirisAgent *a) {
         last_err = malloc((err ? strlen(err) : 0) + 32);
         sprintf(last_err, "transport error: %s", err ? err : "(unknown)");
         free(err);
-        if (a->verbose && np > 1)
+        if (a->verbose && a->nproviders > 0)
           fprintf(stderr, "[motiris] provider %s failed: %s\n",
                   pname(a, pi), last_err);
+        /* Already visible deltas cannot be mixed with another provider. */
+        if (delta_seen) break;
         continue;
       }
       if (a->verbose) {
@@ -673,6 +694,7 @@ int motiris_run(MotirisAgent *a) {
       if (!j) {
         free(last_err);
         last_err = sdup("cannot parse model response");
+        if (delta_seen) break;
         continue;
       }
       cJSON *errj = cJSON_GetObjectItemCaseSensitive(j, "error");
@@ -686,9 +708,10 @@ int motiris_run(MotirisAgent *a) {
         sprintf(last_err, "api error: %s", em ? em : "(unknown)");
         cJSON_Delete(j);
         j = NULL;
-        if (a->verbose && np > 1)
+        if (a->verbose && a->nproviders > 0)
           fprintf(stderr, "[motiris] provider %s failed: %s\n",
                   pname(a, pi), last_err);
+        if (delta_seen) break;
         continue;
       }
       /* accumulate usage/token stats from this response */
@@ -796,8 +819,9 @@ int motiris_run(MotirisAgent *a) {
       cJSON_Delete(j);
       return 0;
     }
-    if (content && *content) printf("%s\n", content);
-    else if (!finish || strcmp(finish, "stop"))
+    if (content && *content) {
+      if (!delta_seen) printf("%s\n", content);
+    } else if (!finish || strcmp(finish, "stop"))
       fprintf(stderr, "[motiris] warning: model stopped without output\n");
     if (a->goal_check && !confirm_asked) {
       /* one confirmation round: ask the model whether the goal is met;

@@ -8,6 +8,12 @@ published by `.github/workflows/release.yml`.
 
 ### Added
 
+- Configurable provider receive bounds (`MOTIRIS_RESPONSE_MAX_BYTES`, default
+  and hard maximum 16 MiB) cover buffered libcurl/spawned-curl bodies, SSE
+  wire/line/content/tool-argument growth and streamed tool-call count.
+  Overflow/allocation failures clean up partial state and return bounded
+  errors; offline tests cover exact boundaries, malformed oversize responses,
+  streaming fallback and the unchanged echo backend.
 - `motiris set config KEY VALUE` edits whitelisted scalar JSON settings
   without agent/provider startup. Strings are escaped, booleans and
   `max_steps` retain their JSON types, and unrelated/provider/MCP/extension
@@ -90,6 +96,19 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- A singleton configured provider now uses its declared model, endpoint and
+  key instead of silently falling back to the default provider. One-, two-
+  and eight-entry offline routing tests verify selection and fallback order.
+- Streamed REPL answers are no longer printed as both deltas and an aggregated
+  duplicate. Suppression is tied to deltas actually delivered by the selected
+  backend, so buffered/echo/spawned-curl fallback still prints exactly once.
+  Goal-check `DONE` remains silent over SSE, and a provider that fails after
+  visible deltas returns the error instead of mixing in a fallback answer.
+- Provider response buffers use checked geometric growth and configured hard
+  limits rather than unchecked, unbounded `realloc`; partial libcurl, SSE and
+  spawned-curl state is freed on limit/allocation failures. Streamed tool-call
+  indices are validated before casting, and authenticated spawned-curl argv /
+  pipe/fork setup no longer has terminator/descriptor cleanup defects.
 - REPL live slash-menu rows use carriage-return/newline pairs in raw terminal
   mode, keeping every command left-aligned instead of stair-stepping right.
 - Successful SSE response trees and temporary unknown/empty-tool JSON strings
