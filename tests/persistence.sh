@@ -5,8 +5,11 @@ cd "$(dirname "$0")/.."
 
 test ! -e src/harness/checkpoints.o
 test -f src/harness/checkpoints_nofs.o
-if nm -D motiris | grep -E '[[:space:]](fsync|rename)(@|$)'; then
-  echo "FAIL persistence cut still imports fsync/rename" >&2
+# The unrelated memory_json backend may legitimately use atomic rename.
+# Check the selected checkpoint stub itself rather than banning those symbols
+# from the whole binary.
+if nm src/harness/checkpoints_nofs.o | grep -E '[[:space:]](fsync|rename)$'; then
+  echo "FAIL persistence cut stub imports fsync/rename" >&2
   exit 1
 fi
 if strings motiris | grep -q '\.motiris-checkpoint-'; then

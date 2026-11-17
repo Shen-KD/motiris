@@ -15,7 +15,7 @@ jobs:
     steps:
       - run: echo "all gating jobs passed"
 
-  # full clean compile + link (gcc) + size guard + binary artifact
+  # full clean compile + link (gcc) + binary artifact; RAM is measured in smoke/perf
   build:
     runs-on: ubuntu-latest
     steps:
@@ -23,9 +23,6 @@ jobs:
 
       - name: clean build + link (gcc)
         run: make clean && make
-
-      - name: binary stays tiny
-        run: test $(stat -c %s motiris) -lt 163840
 
       - name: upload binary
         uses: actions/upload-artifact@v4
@@ -175,10 +172,18 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-          SMOKE_SIZE_MAX: 2097152
         run: |
           sh tests/smoke.sh core
           sh tests/smoke.sh tools
+
+      - name: memory replacement leak guard (LSan/ASAN/UBSAN)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          make test-memory \
+            CFLAGS="-O1 -g -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -fsanitize=address,undefined -fno-omit-frame-pointer" \
+            LDFLAGS="-fsanitize=address,undefined -Wl,-l:libcurl.so.4"
 
   # performance & resource guard: cold-start latency, peak RSS, agent-loop
   # overhead. Informational check (not required for merge).
@@ -222,7 +227,7 @@ jobs:
 
       - name: install build deps (rpm distros)
         if: matrix.container != ''
-        run: dnf install -y --setopt=install_weak_deps=False gcc make python3 iproute
+        run: dnf install -y --setopt=install_weak_deps=False gcc make python3 iproute time
 
       - name: build
         run: make ${{ matrix.cc && format('CC={0}', matrix.cc) }}

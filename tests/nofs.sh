@@ -5,6 +5,8 @@ cd "$(dirname "$0")/.."
 
 test ! -e src/tools/filetools.o
 test -f src/tools/filetools_nofs.o
+test ! -e src/tools/memorytools.o
+test -f src/tools/memorytools_nofs.o
 ROOT=$(pwd) python3 - <<'PY'
 import http.server
 import json
@@ -23,15 +25,22 @@ class Provider(http.server.BaseHTTPRequestHandler):
         msgs = req.get("messages", [])
         if msgs and msgs[-1].get("role") == "tool":
             result = json.loads(msgs[-1]["content"])
-            assert "file tools unavailable" in result["error"], result
+            expected = ("memory tools unavailable"
+                        if msgs[-1].get("tool_call_id") == "memory"
+                        else "file tools unavailable")
+            assert expected in result["error"], result
             reply = {"choices": [{"finish_reason": "stop", "message": {
                 "role": "assistant", "content": msgs[-1]["content"]}}]}
         else:
+            prompt = next(m.get("content") for m in reversed(msgs)
+                          if m.get("role") == "user")
+            memory = prompt == "memory"
             reply = {"choices": [{"finish_reason": "tool_calls", "message": {
                 "role": "assistant", "tool_calls": [{
-                    "id": "nofs", "type": "function", "function": {
-                        "name": "read_file",
-                        "arguments": json.dumps({"path": "secret"})}}]}}]}
+                    "id": "memory" if memory else "nofs", "type": "function",
+                    "function": {
+                        "name": "memory_get" if memory else "read_file",
+                        "arguments": json.dumps({} if memory else {"path": "secret"})}}]}}]}
         body = json.dumps(reply).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -53,6 +62,7 @@ try:
         }))
         env = os.environ.copy()
         env["MOTIRIS_HOME"] = str(home)
+        env["HOME"] = str(home / "user-home")
         env.pop("MOTIRIS_API_KEY", None)
         proc = subprocess.run(
             [str(root / "motiris"), "-p", "read", "-k", "x", "--max-steps", "3"],
@@ -65,9 +75,18 @@ try:
                       for tool in captures[0].get("tools", [])]
         assert "shell" not in tool_names, tool_names
         assert "time" in tool_names, tool_names
+        assert "memory_get" in tool_names, tool_names
+        assert "memory_set" in tool_names, tool_names
+        proc = subprocess.run(
+            [str(root / "motiris"), "-p", "memory", "-k", "x", "--max-steps", "3"],
+            env=env, text=True, capture_output=True, timeout=10)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        assert "memory tools unavailable" in proc.stdout, proc.stdout
+        assert len(captures) == 4, len(captures)
+        assert not (home / "user-home/.local/share/motiris/memory.json").exists()
 finally:
     server.shutdown()
     server.server_close()
     thread.join(timeout=5)
-print("nofs: file stub + shell backend cut passed")
+print("nofs: file/memory stubs + shell backend cut passed")
 PY
