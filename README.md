@@ -389,7 +389,7 @@ make test-docker   # default suite inside a throwaway debian container
                    # (clean HOME/ports/processes, mirrors CI)
 ```
 
-Test image: `gcc libc6-dev make libcurl4 python3 curl` on
+Test image: `gcc libc6-dev make libcurl4 python3 curl time` on
 debian:bookworm-slim — mock LLM/MCP servers run inside the container, so
 nothing leaks onto the host.
 
@@ -400,10 +400,11 @@ MIT. cJSON (vendored) is MIT (c) Dave Gamble et al.
 ## CI & branch protection
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR: gcc
-build, offline smoke tests, clang `-Werror` build, plugin example
-compile, binary size check, and uploads the signed binary as an
-artifact. The job is named `ci` — that exact name is the required status
-check on `main`.
+build, offline smoke tests with runtime RSS reporting, clang `-Werror`
+build, plugin example compile, and binary artifact upload. Binary size is
+not a CI gate; `tests/perf.sh` and the memory integration tests record RAM
+for ongoing optimization. The job is named `ci` — that exact name is the
+required status check on `main`.
 
 `main` is protected: PR-only (no direct pushes, no force push, no
 deletions), requires the `ci` check to pass. Solo developers can still

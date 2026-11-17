@@ -5,5 +5,5 @@
 #           motiris-test bash -c 'mkdir -p /tmp/home && make clean && make && sh tests/smoke.sh'
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc libc6-dev make libcurl4 python3 curl ca-certificates \
+        gcc libc6-dev make libcurl4 python3 curl ca-certificates time \
     && rm -rf /var/lib/apt/lists/*

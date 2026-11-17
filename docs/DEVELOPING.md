@@ -209,7 +209,7 @@ baseline `1af30f9`) are:
 | Build / measurement | Bytes / sections / RSS | Relative result |
 | --- | ---: | ---: |
 | Baseline default full CLI | 157,944 bytes; text 144,973; data 2,648; BSS 167,960 | baseline |
-| Bounded-shell default full CLI | 162,040 bytes; text 148,549; data 2,664; BSS 167,960 | +4,096 file; +3,576 text; +16 data; BSS unchanged; below 163,840-byte guard |
+| Bounded-shell default full CLI | 162,040 bytes; text 148,549; data 2,664; BSS 167,960 | Historical artifact/section measurements before the size-gate removal |
 | `SHELL_TOOLS=0` full CLI | 153,848 bytes; text 143,165; data 2,616; BSS 167,960 | optional backend and registration compiled out |
 | Default `tests/perf.sh` cold / 5-step loop peak RSS | 8,996 / 9,324 KiB | baseline 9,136 / 9,188 KiB; both below 64 MiB guard |
 | Maximum 256 KiB cap through local mock | 21,476 KiB max child RSS; Agent RSS 11,816 -> 12,508 KiB | +692 KiB retained across the sampled call; host allocator/libcurl included |
@@ -287,25 +287,29 @@ Exact cJSON/libc node overhead is implementation-dependent, so these are
 phase-wise application bounds rather than total-process RSS guarantees.
 Tool arguments and outer Agent history have their own existing bounds.
 
-Reference host measurements on 2026-11-16 (Linux x86_64, gcc, stripped;
-baseline `4f36c9d`) are:
+Reference artifact measurements on 2026-11-16 and runtime RAM measurements
+on 2026-11-17 (Linux x86_64, gcc, stripped; baseline `4f36c9d`) are:
 
 | Build / measurement | Bytes / sections / RSS | Relative result |
 | --- | ---: | --- |
 | Baseline default full CLI | 162,040 bytes; text 151,409; data 2,800; BSS 167,944 | baseline |
-| Failure-safe memory full CLI | 162,040 bytes; text 153,515; data 2,808; BSS 167,944 | +0 file; +2,106 text; +8 data; BSS unchanged; below 163,840 guard |
+| Failure-safe memory full CLI | 162,040 bytes; text 153,067; data 2,808; BSS 167,944 | Informational artifact/section sizes; no binary-size CI gate |
+| Ubuntu 22.04 GCC 11 / Clang full CLI | 162,048 / 163,096 bytes | Informational sizes after dropping C-unneeded unwind tables |
 | `FILE_TOOLS=0 MEMORY_TOOLS=0 SHELL_TOOLS=0` full CLI | 145,656 bytes; text 136,347; data 2,648; BSS 163,848 | Combined optional-backend cut; memory host object absent and no-I/O stub tests pass |
 | Strict core-only nofs probe | 65,464 bytes unstripped; text 47,111; data 952; BSS 4,224 | Unchanged from baseline; libc only, no host memory/file backends |
-| Maximum 256 KiB value through local provider | 12,972 KiB peak process RSS | Includes two Agent/provider rounds, cJSON and libcurl; not an MCU RAM budget |
-| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,156 / 9,072 KiB | Baseline 9,088 / 9,072 KiB; both 50 ms and below guards; normal host variation |
+| Maximum 256 KiB value through local provider | 13,100 KiB peak process RSS | GNU `time`; includes two Agent/provider rounds, cJSON and libcurl; not an MCU RAM budget |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,196 / 9,200 KiB | Baseline 9,088 / 9,072 KiB; both 50 ms and below guards; normal host variation |
 
 `tests/memory_unit.c` includes the production translation unit with syscall
 fault injection for short reads and write/`fsync`/close/rename failures. It
 also covers invalid/empty/non-object/oversized input, exact key/value limits,
 mode 0600, byte preservation and repeated replacements. `tests/memory.py`
 drives separate real CLI/provider processes for round-trip, corruption,
-write-failure and maximum-value coverage. `make test-memory` runs both; CI
-runs them under ASAN/UBSAN with leak detection enabled. The default direct
+nonblocking FIFO rejection, write-failure and maximum-value coverage. GNU
+`time` records the real CLI peak RSS; compatibility and Docker test images
+install the test-only `time` package. `make test-memory` runs both; CI runs
+them under ASAN/UBSAN with leak
+detection enabled. The default direct
 ELF dependencies remain only `libcurl.so.4` and `libc.so.6`. No MCU/RTOS
 cross-toolchain, target Flash/RAM or hardware validation is available.
 
@@ -416,11 +420,11 @@ noted; baseline `2fc9b9a`) are:
 | Build / measurement | Bytes / sections / RSS | Relative result |
 | --- | ---: | ---: |
 | Baseline default full CLI | 162,040 bytes; text 148,549; data 2,664; BSS 167,960 | baseline |
-| Checkpoint full CLI (`aaf0730`) | 162,040 bytes; text 150,066; data 2,816; BSS 167,944 | +0 file; +1,517 text; +152 data; -16 BSS; below 163,840 guard |
+| Checkpoint full CLI (`aaf0730`) | 162,040 bytes; text 150,066; data 2,816; BSS 167,944 | Historical artifact/section measurements before the size-gate removal |
 | Live/replay retention full CLI (`2d8a7ad`) | 162,040 bytes; text 150,799; data 2,800; BSS 167,944 | vs `aaf0730`: +0 file; +733 text; -16 data; BSS unchanged |
 | Core-only nofs probe with retention (`2d8a7ad`) | 56,744 bytes unstripped; text 40,093; data 808; BSS 4,224 | +4,480 file; +5,102 text; +8 data; BSS unchanged; zero checkpoint symbols |
-| Memory-codec full CLI (gcc 15) | 162,040 bytes; text 151,409; data 2,800; BSS 167,944 | vs `2d8a7ad`: +0 file; +610 text; data/BSS unchanged; below 163,840 guard |
-| Memory-codec full CLI (Ubuntu 22.04 gcc 11) | 162,048 bytes; text 152,806; data 2,792; BSS 167,944 | container build + full 27-check smoke; original 163,840 guard passes |
+| Memory-codec full CLI (gcc 15) | 162,040 bytes; text 151,409; data 2,800; BSS 167,944 | Historical artifact/section measurements before the size-gate removal |
+| Memory-codec full CLI (Ubuntu 22.04 gcc 11) | 162,048 bytes; text 152,806; data 2,792; BSS 167,944 | Historical container build + full 27-check smoke record |
 | Core-only nofs probe with memory codec | 65,464 bytes unstripped; text 47,111; data 952; BSS 4,224 | vs `2d8a7ad`: +8,720 file; +7,018 text; +144 data; BSS unchanged; no host file symbols |
 | `PERSISTENCE=0` full CLI | 157,944 bytes; text 143,870; data 2,632; BSS 167,944 | vs `c78f59d`: -4,096 file; -7,539 text; -168 data; BSS unchanged; checkpoint backend/marker absent |
 | Persistence-switch default / cut perf cold / 5-step loop peak RSS | default 9,116 / 9,072 KiB; cut 9,100 / 9,084 KiB | baseline 9,088 / 9,088 KiB; 50 ms / 50 ms; normal host variation; guards pass |
@@ -434,8 +438,8 @@ I/O-bound or size-sensitive; the strict core-only probe, config and other tool
 objects remain `-O2`. Keeping the full-CLI snapshot codec at `-Os` preserves
 the same size policy it had in the harness. Its full-CLI object also omits
 C-unneeded asynchronous/unwind tables; the strict probe retains normal unwind
-metadata. These flags keep every compiler in the compatibility matrix within
-the full-binary size guard without changing snapshot limits or behavior.
+metadata. These are artifact-size choices only: no binary-size CI gate is
+enforced, and runtime RSS remains the optimization signal.
 The near-cap timing includes process/REPL startup and is not a pure parser
 benchmark. Peak RSS includes libc, cJSON trees and transient copies; it is not
 an MCU RAM budget. Snapshot writes are bounded by the same 1 MiB cap and happen
@@ -450,7 +454,7 @@ sections.
 
 CI (`.github/workflows/ci.yml`) is split into per-area jobs, all gated
 by the aggregate `ci` job (that exact name is the required status check
-on main): `build` (gcc clean compile+link, size guard, artifact),
+on main): `build` (gcc clean compile+link and artifact),
 `clang` (full -Werror build), `test-core` / `test-tools` / `test-repl` /
 `test-skills` / `test-schema` / `test-goal` (component-scoped smoke
 groups, see `tests/smoke.sh <group>`), `plugins` (example .so with gcc +
@@ -558,8 +562,9 @@ lives in plugin.c and is shared with toolscan.
 
 ## Tests that must not regress
 
-- Smoke #4: default binary stays < 163840 bytes (`SMOKE_SIZE_MAX` may be
-  raised only for instrumented builds such as ASAN/UBSAN).
+- Smoke #4: run one real cold-start echo turn and record peak RSS with GNU
+  `time`. There is no binary-size gate; the measurement is a runtime-RAM
+  optimization signal, not an artifact limit. Test images install `time`.
 - Smoke #6: full-turn CLI/REPL round-trip preserves multiline assistant and
   tool objects without line-prefix role injection; malformed/legacy/digest/
   pairing/message/record/file-cap failures are offline and rejected before

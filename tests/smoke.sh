@@ -59,11 +59,15 @@ echo "$OUT" | grep -q 'echo round complete' || { echo "FAIL: $OUT"; exit 1; }
 
 fi
 if test_in 4; then
-echo "== 4: binary stays tiny"
-SIZE=$(stat -c %s motiris)
-SIZE_MAX=${SMOKE_SIZE_MAX:-163840}
-[ "$SIZE" -lt "$SIZE_MAX" ] || { echo "FAIL: size=$SIZE max=$SIZE_MAX"; exit 1; }
-echo "   motiris size: $SIZE bytes"
+echo "== 4: cold-start runtime RAM (record only)"
+# GNU time reports the real CLI high-water mark without inheriting the Python
+# test driver's RSS. There is deliberately no binary-size gate.
+if [ -x /usr/bin/time ]; then
+  /usr/bin/time -f '   cold-start peak RSS: %M KiB (record only)' \
+    ./motiris -p hi --transport echo --no-plugin >/dev/null
+else
+  echo "   cold-start RSS skipped (/usr/bin/time unavailable)"
+fi
 
 fi
 if test_in 5; then

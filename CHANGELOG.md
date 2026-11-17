@@ -59,6 +59,12 @@ published by `.github/workflows/release.yml`.
   timeout and process cleanup. Fake-engine tests cover fallback and bounds;
   default/core builds contain no adapter or audio dependency.
 
+### Changed
+
+- CI no longer enforces a binary-size ceiling. Smoke #4 records cold-start
+  peak RSS instead, and memory integration records maximum-value peak RSS
+  with GNU `time`; compatibility and Docker test images install the tool.
+
 ### Fixed
 
 - Session restore no longer trusts ambiguous U/A/T rows: multiline model/tool
@@ -74,8 +80,9 @@ published by `.github/workflows/release.yml`.
   oversized or incompletely read files. Only a missing file starts empty;
   updates use bounded 256-byte keys, 256 KiB values and 1 MiB files, complete
   mode-0600 temporary writes plus `fsync`/close checks and atomic rename.
-  Failures preserve the last valid bytes, and replaced cJSON values are fully
-  freed rather than leaking on every overwrite.
+  Failures preserve the last valid bytes, FIFOs and other non-regular files
+  are rejected without blocking, and replaced cJSON values are fully freed
+  rather than leaking on every overwrite.
 - `web_fetch` / `web_search` receive buffers now cover every full libcurl
   chunk without integer overflow, out-of-bounds writes or `realloc` loss.
   Bodies retain at most 64 KiB plus a private NUL byte; excess is drained
