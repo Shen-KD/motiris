@@ -69,6 +69,7 @@ struct linenoiseState {
     size_t cols;        /* Number of columns in terminal. */
     size_t oldrows;     /* Rows used by last refrehsed line (multiline mode) */
     int oldrpos;        /* Cursor row from last refresh (for multiline clearing). */
+    int menu_rows;      /* Live menu rows below the input (single-line mode). */
     int history_index;  /* The history index we are currently editing. */
     int fold_count;    /* Number of folded ranges. */
     size_t fold_start[LINENOISE_MAX_FOLDS]; /* Folded range start offsets. */
@@ -95,9 +96,14 @@ void linenoiseFree(void *ptr);
 typedef void(linenoiseCompletionCallback)(const char *, linenoiseCompletions *);
 typedef char*(linenoiseHintsCallback)(const char *, int *color, int *bold);
 typedef void(linenoiseFreeHintsCallback)(void *);
+typedef char*(linenoiseMenuCallback)(const char *);
+typedef void(linenoiseFreeMenuCallback)(void *);
 void linenoiseSetCompletionCallback(linenoiseCompletionCallback *);
 void linenoiseSetHintsCallback(linenoiseHintsCallback *);
 void linenoiseSetFreeHintsCallback(linenoiseFreeHintsCallback *);
+/* Return a newline-separated live menu, or NULL to hide it (single-line mode). */
+void linenoiseSetMenuCallback(linenoiseMenuCallback *);
+void linenoiseSetFreeMenuCallback(linenoiseFreeMenuCallback *);
 void linenoiseAddCompletion(linenoiseCompletions *, const char *);
 
 /* History API. */

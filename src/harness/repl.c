@@ -5,8 +5,8 @@
  * `motiris -i`. One agent instance is reused across turns so the model
  * keeps full context of the conversation.
  *
- * UI: tab completes /-commands (linenoise completion), typing `/<pre>`
- * shows a grey hint of the full command, model replies stream in cyan,
+ * UI: typing `/` opens a live command menu, typing `/<pre>` filters it
+ * and shows a grey hint; tab still completes commands, replies stream in cyan,
  * command output and errors get their own colors. The prompt itself
  * stays plain text on purpose: linenoise computes cursor width from
  * strlen(prompt), ANSI escapes would scramble it.
@@ -37,7 +37,7 @@
 #define C_YELLOW "\033[33m"
 
 static const char *const CMDS[] = { "/help", "/new", "/tools", "/sessions",
-                                    "/resume", "/skills", "/exit", "/quit" };
+                                    "/resume", "/skills", "/exit" };
 static const char *const CMDS_DESC[] = {
   "this help",
   "reset session context",
@@ -45,7 +45,6 @@ static const char *const CMDS_DESC[] = {
   "review past session logs [TERM]",
   "restore a full-turn snapshot FILE",
   "list available skills [TERM]",
-  "leave the repl",
   "leave the repl",
 };
 #define NCMDS (sizeof CMDS / sizeof CMDS[0])
@@ -134,15 +133,41 @@ static char *repl_hints(const char *line, int *color, int *bold) {
   return NULL;
 }
 
+/* Live newline-separated menu; no Tab keypress is required. */
+static char menu_buf[1024];
+static char *repl_menu(const char *line) {
+  size_t blen = strlen(line);
+  if (!blen || line[0] != '/' || strchr(line, ' ')) return NULL;
+
+  size_t used = 0;
+  int matches = 0;
+  menu_buf[0] = '\0';
+  for (size_t i = 0; i < NCMDS; i++) {
+    if (strncmp(line, CMDS[i], blen)) continue;
+    char row[160];
+    int n = snprintf(row, sizeof row, "  %-8s %s", CMDS[i], CMDS_DESC[i]);
+    if (n < 0 || (size_t)n >= sizeof row) continue;
+    size_t need = (size_t)n + (matches ? 1 : 0);
+    if (used + need >= sizeof menu_buf) break;
+    if (matches) menu_buf[used++] = '\n';
+    memcpy(menu_buf + used, row, (size_t)n + 1);
+    used += (size_t)n;
+    matches = 1;
+  }
+  if (!matches)
+    snprintf(menu_buf, sizeof menu_buf, "  no matching commands (/help)");
+  return menu_buf;
+}
+
 static void print_help(void) {
-  printf(C_BOLD "commands" C_RESET " (tab completes, hints while typing):\n");
+  printf(C_BOLD "commands" C_RESET " (/ shows a live list, tab completes):\n");
   for (size_t i = 0; i < NCMDS; i++)
     printf("  " C_GREEN "%-8s" C_RESET " %s\n", CMDS[i], CMDS_DESC[i]);
   printf("  multi-line input: end a line with two backslashes " C_DIM "\\\\" C_RESET "\n");
 }
 
 static int handle_command(MotirisAgent *a, const char *line) {
-  if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) return 1;
+  if (!strcmp(line, "/exit")) return 1;
   if (!strcmp(line, "/new")) {
     /* fresh session: drop all history messages */
     cJSON *msgs = motiris_messages(a);
@@ -206,6 +231,10 @@ static int handle_command(MotirisAgent *a, const char *line) {
     if (!shown) printf(C_DIM "no skills match\n" C_RESET);
     return 0;
   }
+  if (line[0] == '/') {
+    printf(C_RED "unknown command: %s (use /help)\n" C_RESET, line);
+    return 0;
+  }
   return -1; /* not a command */
 }
 
@@ -256,8 +285,8 @@ static void print_banner(MotirisAgent *a) {
 
   printf(C_DIM "─────────────────────────────────────────────────────────"
          "──────────\n" C_RESET);
-  printf("type " C_GREEN "/help" C_RESET " for commands, tab completes "
-         C_DIM "/-commands" C_RESET ", ctrl-d to quit\n");
+  printf("type " C_GREEN "/help" C_RESET " for commands, "
+         C_GREEN "/" C_RESET " lists commands, ctrl-d to quit\n");
   fflush(stdout);
 }
 
@@ -324,6 +353,7 @@ int motiris_repl(MotirisAgent *a) {
 
   linenoiseSetCompletionCallback(repl_completion);
   linenoiseSetHintsCallback(repl_hints);
+  linenoiseSetMenuCallback(repl_menu);
 
   char hist[1024];
   expand_home(hist, sizeof hist, hist_path());

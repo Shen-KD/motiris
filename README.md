@@ -136,7 +136,8 @@ motiris --gateway :8899                                 # HTTP gateway
 curl -X POST localhost:8899/v1/chat -d '{"chat_id":"dev","message":"hi"}'
 motiris --cron jobs.json --once                          # scheduled jobs
 motiris --sessions [TERM]                                # list/search logs
-# repl (-i) commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM]
+# repl (-i): type / for a live prefix-filtered command list; /exit to leave
+# commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM] /exit
 # interactive repl turns checkpoint to ~/.local/share/motiris/sessions/
 # token-protected: MOTIRIS_GATEWAY_TOKEN=sekret motiris --gateway :8899
 ```

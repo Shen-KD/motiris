@@ -128,6 +128,8 @@ static char *unsupported_term[] = {"dumb","cons25","emacs",NULL};
 static linenoiseCompletionCallback *completionCallback = NULL;
 static linenoiseHintsCallback *hintsCallback = NULL;
 static linenoiseFreeHintsCallback *freeHintsCallback = NULL;
+static linenoiseMenuCallback *menuCallback = NULL;
+static linenoiseFreeMenuCallback *freeMenuCallback = NULL;
 static char *linenoiseReadLine(FILE *fp, int *err);
 static char *linenoiseNoTTY(void);
 static void refreshLineWithCompletion(struct linenoiseState *ls, linenoiseCompletions *lc, int flags);
@@ -827,6 +829,14 @@ void linenoiseSetFreeHintsCallback(linenoiseFreeHintsCallback *fn) {
     freeHintsCallback = fn;
 }
 
+void linenoiseSetMenuCallback(linenoiseMenuCallback *fn) {
+    menuCallback = fn;
+}
+
+void linenoiseSetFreeMenuCallback(linenoiseFreeMenuCallback *fn) {
+    freeMenuCallback = fn;
+}
+
 /* This function is used by the callback function registered by the user
  * in order to add completion options given the input string when the
  * user typed <tab>. See the example.c source code for a very easy to
@@ -1211,6 +1221,36 @@ void refreshShowHints(struct abuf *ab, struct linenoiseState *l, int pwidth, siz
     }
 }
 
+/* Repaint a live menu below a single-line input. Relative cursor movement
+ * keeps the editing position stable even when printing at the screen bottom
+ * scrolls the terminal. The previous menu is always cleared below the input. */
+static void refreshShowMenu(struct abuf *ab, struct linenoiseState *l, int col) {
+    char *menu = menuCallback ? menuCallback(l->buf) : NULL;
+    size_t len = menu ? strlen(menu) : 0;
+    int rows = 0;
+
+    while (len && menu[len-1] == '\n') len--;
+    if (len) {
+        rows = 1;
+        for (size_t i = 0; i < len; i++)
+            if (menu[i] == '\n') rows++;
+    }
+    if (!rows && !l->menu_rows) goto out;
+
+    abAppend(ab,"\r\n\x1b[J",strlen("\r\n\x1b[J"));
+    if (rows) abAppend(ab,menu,len);
+    char seq[64];
+    snprintf(seq,sizeof(seq),"\x1b[%dA\r",rows ? rows : 1);
+    abAppend(ab,seq,strlen(seq));
+    if (col > 0) {
+        snprintf(seq,sizeof(seq),"\x1b[%dC",col);
+        abAppend(ab,seq,strlen(seq));
+    }
+    l->menu_rows = rows;
+out:
+    if (menu && freeMenuCallback) freeMenuCallback(menu);
+}
+
 /* Single line low level line refresh.
  *
  * Rewrite the currently edited line accordingly to the buffer content,
@@ -1294,6 +1334,9 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
         snprintf(seq,sizeof(seq),"\r\x1b[%dC", (int)(poscol+pwidth));
         abAppend(&ab,seq,strlen(seq));
     }
+
+    refreshShowMenu(&ab,l,
+        (flags & REFRESH_WRITE) ? (int)(poscol+pwidth) : 0);
 
     if (write(fd,ab.b,ab.len) == -1) {} /* Can't recover from write error. */
     abFree(&ab);
@@ -1513,7 +1556,7 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
                              memchr(c, '\r', clen) != NULL;
 
         if (linenoiseEditInsertNoRefresh(l,c,clen) == -1) return 0;
-        if (!needs_refresh && !mlmode && !hintsCallback &&
+        if (!needs_refresh && !mlmode && !hintsCallback && !menuCallback &&
             (maskmode || l->fold_count == 0))
         {
             size_t bufwidth = utf8StrWidth(l->buf,l->len);
@@ -1704,6 +1747,7 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->cols = getColumns(stdin_fd, stdout_fd);
     l->oldrows = 0;
     l->oldrpos = 1;  /* Cursor starts on row 1. */
+    l->menu_rows = 0;
     l->history_index = 0;
 
     /* Buffer starts empty. */
@@ -2083,6 +2127,12 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
  * is in the buffer, and we can restore the terminal in normal mode. */
 void linenoiseEditStop(struct linenoiseState *l) {
     if (!isatty(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return;
+    if (l->menu_rows && !mlmode) {
+        linenoiseMenuCallback *mc = menuCallback;
+        menuCallback = NULL;
+        refreshSingleLine(l,REFRESH_ALL);
+        menuCallback = mc;
+    }
     disableRawMode(l->ifd);
     printf("\n");
 }
