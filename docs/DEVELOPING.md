@@ -36,6 +36,7 @@ make SHELL_TOOLS=0    # compile out and unregister host shell subprocesses
 make MEMORY_TOOLS=0   # optional persistent memory files -> no-I/O stubs
 make PERSISTENCE=0    # optional host checkpoint files -> volatile sessions
 make test-shell       # dual-stream, output cap, timeout and reaping tests
+make test-browser-subagent # browser/subagent deadline and cleanup tests
 make test-webtools-parser # malformed/truncated DDG response parser tests
 make test-memory      # memory corruption, atomic fault and replacement tests
 make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
@@ -213,9 +214,67 @@ Reference host measurements on 2026-11-17 (Linux x86_64, gcc `-O2`/harness
 
 Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
 These are host application bounds and measurements, not total libcurl/libc
-RSS guarantees or MCU Flash/RAM headroom. Browser/subagent waits are separate
-remaining work. No MCU/RTOS cross-toolchain or hardware validation was
-performed.
+RSS guarantees or MCU Flash/RAM headroom. No MCU/RTOS cross-toolchain or
+hardware validation was performed.
+
+### Bounded browser/subagent child processes
+
+`src/tools/childproc.c` is a private host-tools runner shared by
+`browser_fetch` and `subagent`; it is not public API and is absent from the
+strict-C11 core probe. `MOTIRIS_BROWSER_TIMEOUT_S` defaults to 30 s and
+`MOTIRIS_SUBAGENT_TIMEOUT_S` to 120 s. Both accept only 1..120 and reject
+invalid values before `fork`. One absolute `CLOCK_MONOTONIC` deadline covers
+pipe/fork setup, combined stdout/stderr draining and normal exit. Nonblocking
+`poll`, partial reads and `EINTR` always recheck that deadline, so continuous
+output cannot extend it.
+
+The existing combined stdout/stderr contract is preserved. Browser retains at
+most 65,536 bytes and subagent 32,768 bytes, each plus a private NUL. Excess
+bytes are drained and discarded with `truncated=true`; the read scratch buffer
+is 4 KiB and deadline/poll/wait state is fixed-size. cJSON construction and
+Agent history add phase-wise copies derived from those caps, with additional
+bounded JSON escaping; these are application-owned per-call bounds, not total
+process RSS or MCU RAM guarantees. Results retain the original `text`/`output`
+fields and add `exit_code`, `signal`, `timed_out`, `truncated` and bounded
+`error` diagnostics. Tool input schemas and the plugin ABI are unchanged.
+
+The child calls `setsid`. Timeout, setup, poll/read/wait or allocation failure
+closes the parent pipe and signals the process group with TERM, allows one
+second of grace, then sends KILL and reaps the direct child. If the leader
+exits first, remaining group members are still killed, whether a descendant
+holds the output pipe or redirected it to DEVNULL. A successful leader return
+also kills remaining same-group background members. The post-KILL `waitpid`
+has the same uninterruptible-kernel-wait caveat as shell/MCP. This is bounded
+process-group cleanup, not a sandbox or general cancellation tree: descendants
+that deliberately create another session are outside the process-group kill
+guarantee. No thread, event library, queue, global Agent state or runtime
+dependency was added.
+
+`tests/browser_subagent.py` runs through the real provider/tool loop for both
+tools. It covers normal and nonzero exits, missing executables, a 192 KiB
+alternating stdout/stderr flood, silent and continuous-output children,
+TERM-ignoring leaders, pipe-holding and DEVNULL descendants, repeated timeouts
+followed by a healthy call, and invalid settings that must not fork. It checks
+leader reaping, descendant termination, steady parent fd/RSS samples and no
+remaining direct children. The test runs in smoke #13 and the ASAN/UBSAN tools
+job; existing smoke #12/#13 normal-path coverage remains.
+
+Reference host measurements on 2026-11-18 (Linux x86_64, gcc, stripped;
+baseline `285502d`) are:
+
+| Build / measurement | Baseline | Bounded child branch | Relative result |
+| --- | ---: | ---: | --- |
+| Default full CLI | 182,528 bytes | 186,624 bytes | +4,096 bytes |
+| ELF text / data / BSS | 169,962 / 3,056 / 169,040 | 173,042 / 3,048 / 169,040 | +3,080 / -8 / +0 bytes |
+| Strict core-only nofs probe | 69,840 bytes; text 49,715; data 952; BSS 4,232 | 69,840 bytes; identical sections | unchanged; host tools absent |
+| `tests/perf.sh` cold peak RSS | 9,288 KiB | 9,320 KiB | +32 KiB host variation; both 50 ms |
+| `tests/perf.sh` 5-step loop peak RSS | 9,256 KiB | 8,972 KiB | -284 KiB host variation; both 50 ms |
+| Three browser timeouts, parent fd/RSS samples | not bounded | fd 4 / 4 / 4; RSS 12,044 / 12,044 / 12,044 KiB | stable; later healthy call, no direct children |
+| Three subagent timeouts, parent fd/RSS samples | not bounded | fd 4 / 4 / 4; RSS 12,016 / 12,016 / 12,016 KiB | stable; later healthy call, no direct children |
+
+Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
+These are Linux host application bounds and measurements, not MCU Flash/RAM
+headroom. No MCU/RTOS cross-toolchain or hardware validation was performed.
 
 ### Bounded Gateway connection I/O
 

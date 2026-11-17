@@ -7,15 +7,15 @@
  * binary exists; MOTIRIS_BROWSER overrides the binary path.
  */
 #include "motiris.h"
+#include "childproc.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #define BRO_CAP (64 * 1024)
+#define BRO_DEFAULT_TIMEOUT_S 30L
 
 static char *err_json(const char *msg) {
   cJSON *e = cJSON_CreateObject();
@@ -77,42 +77,25 @@ static char *browser_fetch_call(const char *args_json, void *ud) {
   const char *browser = find_browser();
   if (!browser) { cJSON_Delete(args); return err_json("no headless browser"); }
 
-  int outpipe[2];
-  if (pipe(outpipe)) { cJSON_Delete(args); return err_json("pipe failed"); }
-  pid_t pid = fork();
-  if (pid < 0) { cJSON_Delete(args); return err_json("fork failed"); }
-  if (pid == 0) {
-    dup2(outpipe[1], 1);
-    dup2(outpipe[1], 2);
-    close(outpipe[0]);
-    close(outpipe[1]);
-    execlp(browser, browser, "--headless", "--disable-gpu",
-           "--no-sandbox", "--dump-dom", url, (char *)NULL);
-    _exit(127);
-  }
-  close(outpipe[1]);
-  size_t cap = 16384, len = 0;
-  char *buf = malloc(cap);
-  ssize_t n;
-  while ((n = read(outpipe[0], buf + len, cap - len - 1)) > 0) {
-    len += (size_t)n;
-    if (len + 1 >= cap) {
-      if (cap >= BRO_CAP) break;
-      cap *= 2;
-      buf = realloc(buf, cap);
-    }
-  }
-  close(outpipe[0]);
-  buf[len] = '\0';
-  int st;
-  while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-
-  strip_html(buf);
+  char *const child_argv[] = {
+    (char *)browser, "--headless", "--disable-gpu", "--no-sandbox",
+    "--dump-dom", url_copy, NULL
+  };
+  ChildProcResult child;
+  childproc_run("browser", child_argv, "MOTIRIS_BROWSER_TIMEOUT_S",
+                BRO_DEFAULT_TIMEOUT_S, BRO_CAP, &child);
   cJSON_Delete(args);
+
+  if (child.output) strip_html(child.output);
   cJSON *r = cJSON_CreateObject();
   cJSON_AddStringToObject(r, "url", url_copy);
-  cJSON_AddStringToObject(r, "text", buf);
-  free(buf);
+  cJSON_AddStringToObject(r, "text", child.output ? child.output : "");
+  cJSON_AddNumberToObject(r, "exit_code", child.exit_code);
+  cJSON_AddNumberToObject(r, "signal", child.signal_number);
+  cJSON_AddBoolToObject(r, "timed_out", child.timed_out);
+  cJSON_AddBoolToObject(r, "truncated", child.truncated);
+  if (child.error[0]) cJSON_AddStringToObject(r, "error", child.error);
+  childproc_free(&child);
   char *s = cJSON_PrintUnformatted(r);
   cJSON_Delete(r);
   return s;

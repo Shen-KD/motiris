@@ -70,6 +70,8 @@ HDR = include/motiris.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 src/harness/repl.o src/harness/tts.o: src/harness/tts.h
+src/tools/browser.o src/tools/subagent.o src/tools/childproc.o: \
+	src/tools/childproc.h
 # Full-CLI request/history/transport code is I/O-bound; compact host objects
 # remain a build choice, not a CI gate. The strict probe stays -O2.
 src/core/agent.o src/core/transport.o src/core/checkpoint.o \
@@ -108,6 +110,9 @@ test: motiris
 
 test-shell: motiris
 	python3 tests/shell.py
+
+test-browser-subagent: motiris
+	python3 tests/browser_subagent.py
 
 WEBTOOLS_TEST_CFLAGS ?= -O1 -g -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
 WEBTOOLS_TEST_LDFLAGS ?= -Wl,-l:libcurl.so.4
@@ -196,5 +201,6 @@ clean:
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test test-shell test-memory test-webtools-parser test-vision test-tts \
-	test-core-nofs test-nofs test-persistence test-docker clean install
+.PHONY: test test-shell test-browser-subagent test-memory \
+	test-webtools-parser test-vision test-tts test-core-nofs test-nofs \
+	test-persistence test-docker clean install

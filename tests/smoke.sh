@@ -29,7 +29,8 @@ trap 'for p in $MOCK_PIDS; do kill "$p" 2>/dev/null || true; done; true' EXIT
 # (shell-exported values intentionally override config.json)
 unset MOTIRIS_API_KEY MOTIRIS_MODEL MOTIRIS_BASE_URL MOTIRIS_PLUGIN_DIR \
       MOTIRIS_GATEWAY_TOKEN MOTIRIS_GATEWAY_IO_TIMEOUT_S \
-      MOTIRIS_MCP_TIMEOUT_S MOTIRIS_WORKSPACE MOTIRIS_TTS_CMD \
+      MOTIRIS_MCP_TIMEOUT_S MOTIRIS_BROWSER_TIMEOUT_S \
+      MOTIRIS_SUBAGENT_TIMEOUT_S MOTIRIS_WORKSPACE MOTIRIS_TTS_CMD \
       MOTIRIS_TTS_TIMEOUT_S MOTIRIS_SHELL_TIMEOUT_S \
       MOTIRIS_SHELL_STDOUT_MAX MOTIRIS_SHELL_STDERR_MAX \
       MOTIRIS_SHELL_OUTPUT_MAX MOTIRIS_HISTORY_MAX_MESSAGES \
@@ -631,6 +632,7 @@ printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18098/v1/chat/comple
 O7=$(PATH="$F13/bin:$PATH" MOTIRIS_BROWSER=chromium MOTIRIS_HOME="$F13/h" "$ROOT/motiris" -p hi --max-steps 3 -k x 2>&1)
 echo "$O7" | grep -q 'rendered by js' || { echo "FAIL browser: $O7"; exit 1; }
 python3 tests/mcp.py
+make test-browser-subagent
 kill $M13PID 2>/dev/null
 wait $M13PID 2>/dev/null || true
 rm -rf "$F13"
