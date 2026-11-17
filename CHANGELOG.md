@@ -139,6 +139,13 @@ published by `.github/workflows/release.yml`.
   malformed input gets `400`, headers over 16 KiB or bodies over 1 MiB
   get `413`, and receive-buffer allocation is bounded. Added segmented
   request regressions and an ASAN/UBSAN CI job.
+- Gateway connection I/O now has configurable monotonic deadlines
+  (`MOTIRIS_GATEWAY_IO_TIMEOUT_S`, default 30 s, range 1..120). Nonblocking
+  poll/read/write loops bound complete request receives and response sends
+  without resetting on trickle traffic or `EINTR`; receive expiry returns
+  `408`, write expiry closes/logs the connection, and later health checks
+  proceed. Half-open header/body, trickle, non-reading-client, repeated-cleanup
+  and invalid-setting regressions run in the existing tools/sanitizer jobs.
 - Gateway snapshots use injective hex filenames plus canonical `session_id`
   binding, preventing cross-chat history leaks after restart or eviction.
   Legacy sanitized/I-header logs are not guessed or merged; invalid ownership

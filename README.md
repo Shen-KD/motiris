@@ -151,7 +151,21 @@ restarts under `~/.local/share/motiris/gateway/`), exposes
 and optionally requires `Authorization: Bearer $MOTIRIS_GATEWAY_TOKEN`.
 Requests are limited to 16 KiB of headers and a 1 MiB body; malformed or
 incomplete requests get `400`, while oversized requests get `413` and the
-connection is closed. `chat_id` is limited to 120 UTF-8 bytes. Its snapshot
+connection is closed.
+
+`MOTIRIS_GATEWAY_IO_TIMEOUT_S` bounds connection I/O (default 30 s, allowed
+1..120; invalid values prevent startup). Request header+body receive uses one
+absolute monotonic deadline, and each complete response header+body send uses
+another. Accepted sockets are nonblocking and `poll` waits only for the
+remaining budget, so partial progress and `EINTR` cannot extend a deadline.
+A receive timeout returns `408` with `request timeout` and closes the
+connection; a response-write timeout is logged and closes it. In either case
+the sequential gateway accepts later healthy connections. Agent/provider
+execution has its own transport budgets and is not included in these socket
+I/O deadlines. This adds no thread, event library, queue or receive-buffer
+growth.
+
+`chat_id` is limited to 120 UTF-8 bytes. Its snapshot
 filename is the lowercase hex encoding of the complete ID (at most 244 bytes
 including `.log`), so punctuation, case, Unicode and long IDs cannot alias.
 Each snapshot also binds that encoded ID in `session_id`; mismatches fail
@@ -226,7 +240,8 @@ I/O. This is not durable storage by itself and is not an MCU hardware claim.
 
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
-`MOTIRIS_GATEWAY_TOKEN`, `MOTIRIS_VISION_MODEL`,
+`MOTIRIS_GATEWAY_TOKEN`, `MOTIRIS_GATEWAY_IO_TIMEOUT_S`,
+`MOTIRIS_VISION_MODEL`,
 `MOTIRIS_VISION_BASE_URL`, `MOTIRIS_VISION_API_KEY`,
 `MOTIRIS_VISION_MAX_BYTES`, `MOTIRIS_VISION_TIMEOUT_S`,
 `MOTIRIS_TTS_CMD`, `MOTIRIS_TTS_TIMEOUT_S`,

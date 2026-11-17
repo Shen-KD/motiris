@@ -3,8 +3,8 @@
  * Turns motiris into a resident service (like a message-platform
  * gateway, minus the platform): each chat_id gets its own agent
  * instance (its own context), so many conversations can run on one
- * process. Request handling is sequential (single-threaded, POSIX
- * poll-free accept loop) - fine for modest traffic, documented limit.
+ * process. Request handling is sequential (single-threaded accept loop
+ * with bounded nonblocking connection I/O) - fine for modest traffic.
  *
  *   GET  /health                 -> {"status":"ok"}
  *   POST /v1/chat                -> {"reply":"..."}
@@ -19,6 +19,8 @@
 #include "motiris.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +29,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_SESSIONS 64
@@ -34,6 +37,8 @@
 #define MAX_CHAT_ID_ENCODED (MAX_CHAT_ID_BYTES * 2)
 #define MAX_HEADER (16 * 1024)
 #define MAX_BODY (1 << 20)
+#define GATEWAY_DEFAULT_TIMEOUT_S 30L
+#define GATEWAY_MAX_TIMEOUT_S 120L
 
 /* ---------------- session table ---------------- */
 typedef struct Session {
@@ -47,6 +52,8 @@ static Session *sessions;
 static int n_sessions;
 static char *gw_token;
 static int gw_verbose;
+/* Process-wide immutable configuration, never per-Agent/session state. */
+static long gw_io_timeout_ms = GATEWAY_DEFAULT_TIMEOUT_S * 1000L;
 
 static Session *find_session(const char *chat_id) {
   for (Session *s = sessions; s; s = s->next)
@@ -158,6 +165,63 @@ fail:
 }
 
 /* ---------------- HTTP plumbing ---------------- */
+/* Return one absolute deadline. Each request receive and each complete
+ * response send gets its own budget; progress and EINTR never extend it. */
+static int gateway_deadline(struct timespec *deadline) {
+  if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0) return -1;
+  deadline->tv_sec += gw_io_timeout_ms / 1000L;
+  long ns = deadline->tv_nsec + (gw_io_timeout_ms % 1000L) * 1000000L;
+  deadline->tv_sec += ns / 1000000000L;
+  deadline->tv_nsec = ns % 1000000000L;
+  return 0;
+}
+
+/* 1 = ready, 0 = monotonic deadline expired, -1 = clock/poll failure. */
+static int gateway_wait(int fd, short events,
+                        const struct timespec *deadline) {
+  for (;;) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    time_t sec = deadline->tv_sec - now.tv_sec;
+    long nsec = deadline->tv_nsec - now.tv_nsec;
+    if (nsec < 0) { sec--; nsec += 1000000000L; }
+    if (sec < 0 || (sec == 0 && nsec <= 0)) {
+      errno = ETIMEDOUT;
+      return 0;
+    }
+    /* The configured maximum is 120 seconds, so this conversion is bounded. */
+    int wait_ms = (int)(sec * 1000L + (nsec + 999999L) / 1000000L);
+    struct pollfd pfd = { .fd = fd, .events = events, .revents = 0 };
+    int ready = poll(&pfd, 1, wait_ms);
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    if (!ready) {
+      errno = ETIMEDOUT;
+      return 0;
+    }
+    if (pfd.revents & POLLNVAL) { errno = EBADF; return -1; }
+    /* HUP/ERR are returned too: the following read/write obtains EOF/error. */
+    return 1;
+  }
+}
+
+static int gateway_write_all(int fd, const char *buf, size_t len,
+                             const struct timespec *deadline) {
+  size_t offset = 0;
+  while (offset < len) {
+    if (gateway_wait(fd, POLLOUT, deadline) <= 0) return -1;
+    ssize_t written = write(fd, buf + offset, len - offset);
+    if (written > 0) { offset += (size_t)written; continue; }
+    if (written < 0 && (errno == EINTR || errno == EAGAIN ||
+                        errno == EWOULDBLOCK)) continue;
+    if (!written) errno = EPIPE;
+    return -1;
+  }
+  return 0;
+}
+
 static void send_json(int fd, int code, cJSON *body) {
   char *s = cJSON_PrintUnformatted(body);
   cJSON_Delete(body);
@@ -165,15 +229,23 @@ static void send_json(int fd, int code, cJSON *body) {
   const char *reason = code == 200 ? "OK" :
                        code == 401 ? "Unauthorized" :
                        code == 404 ? "Not Found" :
+                       code == 408 ? "Request Timeout" :
                        code == 413 ? "Payload Too Large" :
                        code == 500 ? "Internal Server Error" : "Bad Request";
   snprintf(hdr, sizeof hdr,
            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
            "Content-Length: %zu\r\nConnection: close\r\n\r\n",
            code, reason, strlen(s));
-  ssize_t w1 = write(fd, hdr, strlen(hdr));
-  ssize_t w2 = write(fd, s, strlen(s));
-  (void)w1; (void)w2;
+  struct timespec deadline;
+  if (gateway_deadline(&deadline) != 0 ||
+      gateway_write_all(fd, hdr, strlen(hdr), &deadline) != 0 ||
+      gateway_write_all(fd, s, strlen(s), &deadline) != 0) {
+    if (errno == ETIMEDOUT)
+      fprintf(stderr, "motiris gateway: response write timed out\n");
+    else if (gw_verbose)
+      fprintf(stderr, "motiris gateway: response write failed: %s\n",
+              strerror(errno));
+  }
   free(s);
 }
 
@@ -239,8 +311,10 @@ static int parse_content_length(const char *req, size_t header_len,
  * MAX_HEADER + MAX_BODY + 1 bytes, including the trailing NUL. */
 static char *read_request(int fd, int *status) {
   size_t cap = 8192, len = 0, header_len = 0, body_len = 0, searched = 0;
-  char *buf = malloc(cap + 1);
+  struct timespec deadline;
   *status = 500;
+  if (gateway_deadline(&deadline) != 0) return NULL;
+  char *buf = malloc(cap + 1);
   if (!buf) return NULL;
   for (;;) {
     if (len == cap) {
@@ -252,9 +326,11 @@ static char *read_request(int fd, int *status) {
       buf = tmp;
       cap = next;
     }
+    int ready = gateway_wait(fd, POLLIN, &deadline);
+    if (ready <= 0) { *status = ready == 0 ? 408 : 500; goto fail; }
     ssize_t n = read(fd, buf + len, cap - len);
     if (n < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
       *status = 400;
       goto fail;
     }
@@ -333,11 +409,18 @@ static char *last_reply(MotirisAgent *a) {
 }
 
 static void handle_connection(int fd, int tools_on) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    close(fd);
+    return;
+  }
   int read_status = 0;
   char *req = read_request(fd, &read_status);
   if (!req) {
     const char *msg = read_status == 413 ? "request too large" :
-                      read_status == 500 ? "out of memory" : "malformed request";
+                      read_status == 408 ? "request timeout" :
+                      read_status == 500 ? "request processing failed" :
+                      "malformed request";
     send_err(fd, read_status, msg);
     close(fd);
     return;
@@ -451,6 +534,20 @@ out:
 
 int motiris_gateway_run(const char *listen_addr, const char *token,
                         int tools_on, int verbose) {
+  gw_io_timeout_ms = GATEWAY_DEFAULT_TIMEOUT_S * 1000L;
+  const char *raw_timeout = getenv("MOTIRIS_GATEWAY_IO_TIMEOUT_S");
+  if (raw_timeout && *raw_timeout) {
+    char *end = NULL;
+    errno = 0;
+    long timeout = strtol(raw_timeout, &end, 10);
+    if (errno || !end || *end || timeout < 1 ||
+        timeout > GATEWAY_MAX_TIMEOUT_S) {
+      fprintf(stderr, "motiris gateway: MOTIRIS_GATEWAY_IO_TIMEOUT_S must be 1..%ld\n",
+              GATEWAY_MAX_TIMEOUT_S);
+      return 1;
+    }
+    gw_io_timeout_ms = timeout * 1000L;
+  }
   gw_token = (token && *token) ? strdup(token) : NULL;
   gw_verbose = verbose;
 

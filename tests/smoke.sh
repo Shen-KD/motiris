@@ -28,7 +28,8 @@ trap 'for p in $MOCK_PIDS; do kill "$p" 2>/dev/null || true; done; true' EXIT
 # isolate from any developer MOTIRIS_* env that would leak into tests
 # (shell-exported values intentionally override config.json)
 unset MOTIRIS_API_KEY MOTIRIS_MODEL MOTIRIS_BASE_URL MOTIRIS_PLUGIN_DIR \
-      MOTIRIS_GATEWAY_TOKEN MOTIRIS_WORKSPACE MOTIRIS_TTS_CMD \
+      MOTIRIS_GATEWAY_TOKEN MOTIRIS_GATEWAY_IO_TIMEOUT_S \
+      MOTIRIS_WORKSPACE MOTIRIS_TTS_CMD \
       MOTIRIS_TTS_TIMEOUT_S MOTIRIS_SHELL_TIMEOUT_S \
       MOTIRIS_SHELL_STDOUT_MAX MOTIRIS_SHELL_STDERR_MAX \
       MOTIRIS_SHELL_OUTPUT_MAX MOTIRIS_HISTORY_MAX_MESSAGES \
@@ -202,6 +203,7 @@ PY9
   cat "$GW/gateway.log" >&2
   exit 1
 fi
+ROOT="$ROOT" python3 tests/gateway_io.py
 kill $GWPID 2>/dev/null
 wait $GWPID 2>/dev/null || true
 HOME="$GW/home" MOTIRIS_GATEWAY_TOKEN=sekret MOTIRIS_HOME="$GW" ./motiris --gateway 127.0.0.1:18090 --no-tools >/dev/null 2>&1 &
