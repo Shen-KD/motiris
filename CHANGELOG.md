@@ -8,6 +8,15 @@ published by `.github/workflows/release.yml`.
 
 ### Added
 
+- `motiris set config KEY VALUE` edits whitelisted scalar JSON settings
+  without agent/provider startup. Strings are escaped, booleans and
+  `max_steps` retain their JSON types, and unrelated/provider/MCP/extension
+  fields survive. Missing configs are created; valid updates use complete
+  mode-0600 temporary writes, `fsync`/close checks and atomic rename. Invalid
+  keys/values, malformed/empty/non-object/oversized/non-regular files and
+  write failures preserve the original without logging the value. Offline
+  tests cover escaping, concurrent readers, HOME fallback, FIFO rejection and
+  a real `RLIMIT_FSIZE` write failure.
 - REPL Ctrl+C now cooperatively cancels an in-flight generation without
   exiting or failing over to another provider. The active user instruction is
   retained, partial assistant/tool messages and token counts from that run are

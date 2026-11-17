@@ -85,6 +85,7 @@ if test_in 7; then
 echo "== 7: env config honored (MOTIRIS_MODEL)"
 OUT=$(MOTIRIS_MODEL=foo-model ./motiris -p hi --transport echo -v 2>&1)
 echo "$OUT" | grep -q 'foo-model via' || { echo FAIL; exit 1; }
+python3 tests/config_set.py
 
 fi
 if test_in 8; then

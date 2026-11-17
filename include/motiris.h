@@ -133,6 +133,9 @@ const char *motiris_transport_name(MotirisAgent *a);
 void motiris_load_env(void);                  /* call before new() */
 void motiris_apply_config(MotirisAgent *a);   /* defaults, CLI wins */
 int  motiris_init_config(void);               /* write templates */
+/* Atomically update one whitelisted scalar config.json key. Prints only the
+ * key/path on success, never the value. Returns 0 on success, nonzero on error. */
+int  motiris_set_config(const char *key, const char *value);
 
 /* ---- shell safety policy (issue #10) ---- */
 void motiris_set_shell_policy(const char *allow_csv, const char *deny_csv);
