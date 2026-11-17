@@ -138,6 +138,8 @@ motiris --cron jobs.json --once                          # scheduled jobs
 motiris --sessions [TERM]                                # list/search logs
 # repl (-i): type / for a live prefix-filtered command list; /exit to leave
 # commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM] /exit
+# Ctrl+C during a reply cancels generation, keeps the user instruction,
+# discards partial assistant/tool messages, and accepts a follow-up instruction
 # interactive repl turns checkpoint to ~/.local/share/motiris/sessions/
 # token-protected: MOTIRIS_GATEWAY_TOKEN=sekret motiris --gateway :8899
 ```

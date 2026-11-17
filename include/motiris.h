@@ -87,7 +87,17 @@ void motiris_set_verbose(MotirisAgent *a, int on);
 void motiris_set_stream(MotirisAgent *a, int on);      /* SSE streaming */
 void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                            void *ud);   /* per-token sink (default stdout) */
-int  motiris_run(MotirisAgent *a);   /* 0 on success */
+/* Optional cooperative cancellation for provider requests and agent steps.
+ * The callback runs in the calling thread and must be async-signal-safe when
+ * it reads a flag set by a host signal handler. */
+typedef int (MotirisCancelCallback)(void *ud);
+void motiris_set_cancel_cb(MotirisAgent *a, MotirisCancelCallback *cb, void *ud);
+enum MotirisRunResult {
+  MOTIRIS_RUN_OK = 0,
+  MOTIRIS_RUN_ERROR = 1,
+  MOTIRIS_RUN_CANCELLED = 2,
+};
+int  motiris_run(MotirisAgent *a);   /* MotirisRunResult */
 const char *motiris_last_error(MotirisAgent *a);
 
 void motiris_set_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud);

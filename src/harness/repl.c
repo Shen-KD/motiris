@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -51,6 +52,33 @@ static const char *const CMDS_DESC[] = {
 
 /* Automatic full-turn checkpoint id (tty only). */
 static char *sess_id = NULL;
+static volatile sig_atomic_t generation_interrupted;
+
+static void generation_sigint(int sig) {
+  (void)sig;
+  generation_interrupted = 1;
+}
+
+static int generation_cancelled(void *ud) {
+  (void)ud;
+  return generation_interrupted != 0;
+}
+
+/* Raw linenoise editing handles Ctrl+C itself. During a model run the
+ * terminal is back in canonical mode, so SIGINT becomes a scoped cancel flag
+ * instead of terminating the whole REPL. */
+static int run_interruptible(MotirisAgent *a) {
+  struct sigaction action = {0}, previous;
+  action.sa_handler = generation_sigint;
+  sigemptyset(&action.sa_mask);
+  generation_interrupted = 0;
+  if (sigaction(SIGINT, &action, &previous) != 0) return motiris_run(a);
+  motiris_set_cancel_cb(a, generation_cancelled, NULL);
+  int rc = motiris_run(a);
+  motiris_set_cancel_cb(a, NULL, NULL);
+  sigaction(SIGINT, &previous, NULL);
+  return rc;
+}
 
 static void delta_print(const char *text, void *ud) {
   (void)ud;
@@ -286,7 +314,8 @@ static void print_banner(MotirisAgent *a) {
   printf(C_DIM "─────────────────────────────────────────────────────────"
          "──────────\n" C_RESET);
   printf("type " C_GREEN "/help" C_RESET " for commands, "
-         C_GREEN "/" C_RESET " lists commands, ctrl-d to quit\n");
+         C_GREEN "/" C_RESET " lists commands, ctrl-c cancels a reply, "
+         "ctrl-d to quit\n");
   fflush(stdout);
 }
 
@@ -398,15 +427,18 @@ int motiris_repl(MotirisAgent *a) {
     long ti0 = motiris_tokens_in(a), to0 = motiris_tokens_out(a);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = motiris_run(a);
+    int rc = run_interruptible(a);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = (t1.tv_sec - t0.tv_sec) * 1000L
             + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
     long di = motiris_tokens_in(a) - ti0;
     long dout = motiris_tokens_out(a) - to0;
     if (color) printf(C_RESET "\n");
-    if (rc) fprintf(stderr, C_RED "motiris: %s" C_RESET "\n",
-                    motiris_last_error(a));
+    if (rc == MOTIRIS_RUN_CANCELLED)
+      fprintf(stderr, C_YELLOW "generation cancelled; enter a new instruction"
+              C_RESET "\n");
+    else if (rc) fprintf(stderr, C_RED "motiris: %s" C_RESET "\n",
+                         motiris_last_error(a));
 #ifdef MOTIRIS_TTS_TOOLS
     if (!rc) tts_new_reply(a);
 #endif

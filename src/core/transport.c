@@ -20,15 +20,36 @@
 #include <curl/curl.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <poll.h>
+#include <errno.h>
+#include <signal.h>
 #endif
 
-typedef struct { char *data; size_t len; } Buf;
+typedef struct {
+  MotirisCancelCallback *cb;
+  void *ud;
+} CancelCtx;
+
+typedef struct { char *data; size_t len; CancelCtx *cancel; } Buf;
+
+static int cancel_requested(const CancelCtx *cancel) {
+  return cancel && cancel->cb && cancel->cb(cancel->ud);
+}
 
 #ifndef MOTIRIS_NO_FILESYSTEM
+
+/* libcurl invokes this even while a response is stalled. Returning nonzero
+ * aborts the transfer; stream_write_cb also checks on every incoming chunk. */
+static int curl_progress_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
+                            curl_off_t ultotal, curl_off_t ulnow) {
+  (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+  return cancel_requested(ud) ? 1 : 0;
+}
 /* incremental stream sink: called with each SSE chunk while streaming */
 typedef struct {
   void (*on_delta)(const char *text, void *ud);
   void *ud;
+  CancelCtx *cancel;
   Buf buf;              /* last complete JSON object (for parsing) */
   char *line; size_t lcap, llen;   /* line buffer for SSE framing */
   /* aggregated final message (SSE deltas -> one complete message) */
@@ -129,6 +150,7 @@ static void stream_feed(StreamCtx *s, const char *p, size_t n) {
 static size_t curl_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
   Buf *b = ud;
   size_t n = sz * nm;
+  if (cancel_requested(b->cancel)) return 0;
   b->data = realloc(b->data, b->len + n + 1);
   memcpy(b->data + b->len, ptr, n);
   b->len += n;
@@ -137,7 +159,8 @@ static size_t curl_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
 }
 
 static char *libcurl_send(const char *url, const char *auth,
-                          const char *body, char **err) {
+                          const char *body, MotirisCancelCallback *cancel_cb,
+                          void *cancel_ud, char **err) {
   CURL *c = curl_easy_init();
   if (!c) { if (err) *err = strdup("libcurl init failed"); return NULL; }
 
@@ -146,7 +169,8 @@ static char *libcurl_send(const char *url, const char *auth,
   hdrs = curl_slist_append(hdrs, "Accept: application/json");
   if (auth) hdrs = curl_slist_append(hdrs, auth);
 
-  Buf out = {0};
+  CancelCtx cancel = { cancel_cb, cancel_ud };
+  Buf out = { .cancel = &cancel };
   curl_easy_setopt(c, CURLOPT_URL, url);
   curl_easy_setopt(c, CURLOPT_POST, 1L);
   curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
@@ -154,6 +178,9 @@ static char *libcurl_send(const char *url, const char *auth,
   curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
   curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
   curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+  curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, curl_progress_cb);
+  curl_easy_setopt(c, CURLOPT_XFERINFODATA, &cancel);
   curl_easy_setopt(c, CURLOPT_TIMEOUT, 120L);
   curl_easy_setopt(c, CURLOPT_USERAGENT, "motiris/0.1");
 
@@ -165,10 +192,14 @@ static char *libcurl_send(const char *url, const char *auth,
 
   if (rc != CURLE_OK) {
     if (err) {
-      size_t n = strlen(curl_easy_strerror(rc)) + 32;
-      char *m = malloc(n);
-      snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
-      *err = m;
+      if (cancel_requested(&cancel)) {
+        *err = strdup("cancelled");
+      } else {
+        size_t n = strlen(curl_easy_strerror(rc)) + 32;
+        char *m = malloc(n);
+        snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
+        *err = m;
+      }
     }
     free(out.data);
     return NULL;
@@ -190,6 +221,7 @@ static char *libcurl_send(const char *url, const char *auth,
 /* curl write-callback adapter: feed raw bytes into the SSE line buffer */
 static size_t stream_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
   StreamCtx *s = ud;
+  if (cancel_requested(s->cancel)) return 0;
   stream_feed(s, ptr, sz * nm);
   return sz * nm;
 }
@@ -198,7 +230,8 @@ static size_t stream_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
 static char *libcurl_send_stream(const char *url, const char *auth,
                                  const char *body,
                                  void (*on_delta)(const char *, void *),
-                                 void *ud, char **err) {
+                                 void *ud, MotirisCancelCallback *cancel_cb,
+                                 void *cancel_ud, char **err) {
   CURL *c = curl_easy_init();
   if (!c) { if (err) *err = strdup("libcurl init failed"); return NULL; }
 
@@ -207,7 +240,8 @@ static char *libcurl_send_stream(const char *url, const char *auth,
   hdrs = curl_slist_append(hdrs, "Accept: text/event-stream");
   if (auth) hdrs = curl_slist_append(hdrs, auth);
 
-  StreamCtx s = { .on_delta = on_delta, .ud = ud };
+  CancelCtx cancel = { cancel_cb, cancel_ud };
+  StreamCtx s = { .on_delta = on_delta, .ud = ud, .cancel = &cancel };
   curl_easy_setopt(c, CURLOPT_URL, url);
   curl_easy_setopt(c, CURLOPT_POST, 1L);
   curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
@@ -215,6 +249,9 @@ static char *libcurl_send_stream(const char *url, const char *auth,
   curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
   curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, stream_write_cb);
   curl_easy_setopt(c, CURLOPT_WRITEDATA, &s);
+  curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, curl_progress_cb);
+  curl_easy_setopt(c, CURLOPT_XFERINFODATA, &cancel);
   curl_easy_setopt(c, CURLOPT_TIMEOUT, 180L);
   curl_easy_setopt(c, CURLOPT_USERAGENT, "motiris/0.1");
 
@@ -226,10 +263,14 @@ static char *libcurl_send_stream(const char *url, const char *auth,
 
   if (rc != CURLE_OK) {
     if (err) {
-      size_t n = strlen(curl_easy_strerror(rc)) + 32;
-      char *m = malloc(n);
-      snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
-      *err = m;
+      if (cancel_requested(&cancel)) {
+        *err = strdup("cancelled");
+      } else {
+        size_t n = strlen(curl_easy_strerror(rc)) + 32;
+        char *m = malloc(n);
+        snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
+        *err = m;
+      }
     }
     free(s.content); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
     free(s.line);
@@ -264,7 +305,9 @@ static char *libcurl_send_stream(const char *url, const char *auth,
   if (s.usage) cJSON_AddItemToObject(resp, "usage", s.usage);
   free(s.content);
   free(s.line);
-  return cJSON_PrintUnformatted(resp);
+  char *printed = cJSON_PrintUnformatted(resp);
+  cJSON_Delete(resp);
+  return printed;
 }
 
 /* ---------------- curl child backend ---------------- */
@@ -273,13 +316,24 @@ static const char *find_curl(void) {
   return (c && *c) ? c : "curl";
 }
 
-static char *read_all(int fd) {
+static char *read_all(int fd, pid_t pid, CancelCtx *cancel, int *cancelled) {
   size_t cap = 65536, len = 0;
   char *buf = malloc(cap);
-  ssize_t n;
-  while ((n = read(fd, buf + len, cap - len - 1)) > 0) {
-    len += (size_t)n;
+  for (;;) {
+    if (!*cancelled && cancel_requested(cancel)) {
+      *cancelled = 1;
+      kill(pid, SIGKILL);  /* bounded cancellation; waitpid below reaps it */
+    }
     if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+    struct pollfd pfd = { .fd = fd, .events = POLLIN | POLLHUP };
+    int ready = poll(&pfd, 1, 100);
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready < 0) break;
+    if (!ready) continue;
+    ssize_t n = read(fd, buf + len, cap - len - 1);
+    if (n > 0) { len += (size_t)n; continue; }
+    if (!n) break;
+    if (errno != EINTR) break;
   }
   buf[len] = '\0';
   return buf;
@@ -296,7 +350,13 @@ static int write_all(int fd, const char *s) {
 }
 
 static char *spawn_curl(const char *url, const char *auth,
-                        const char *body, char **err) {
+                        const char *body, MotirisCancelCallback *cancel_cb,
+                        void *cancel_ud, char **err) {
+  CancelCtx cancel = { cancel_cb, cancel_ud };
+  if (cancel_requested(&cancel)) {
+    if (err) *err = strdup("cancelled");
+    return NULL;
+  }
   int inpipe[2], outpipe[2];
   if (pipe(inpipe) || pipe(outpipe)) return NULL;
 
@@ -330,11 +390,17 @@ static char *spawn_curl(const char *url, const char *auth,
   int wr = write_all(inpipe[1], body);
   close(inpipe[1]);
 
-  char *out = read_all(outpipe[0]);
+  int cancelled = 0;
+  char *out = read_all(outpipe[0], pid, &cancel, &cancelled);
   close(outpipe[0]);
 
   int st = 0;
-  waitpid(pid, &st, 0);
+  while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+  if (cancelled || cancel_requested(&cancel)) {
+    if (err) *err = strdup("cancelled");
+    free(out);
+    return NULL;
+  }
   if (wr < 0) { free(out); return NULL; }
   if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || !*out) {
     if (err) {
@@ -396,21 +462,26 @@ static char *echo_response(const char *body) {
 
 /* ---------------- dispatch ---------------- */
 char *motiris_transport_send(const char *backend, const char *url,
-                             const char *auth, const char *body, char **err);
+                             const char *auth, const char *body,
+                             MotirisCancelCallback *cancel, void *cancel_ud,
+                             char **err);
 char *motiris_transport_send_stream(const char *backend, const char *url,
                                     const char *auth, const char *body,
                                     void (*on_delta)(const char *, void *),
-                                    void *ud, char **err) {
+                                    void *ud, MotirisCancelCallback *cancel,
+                                    void *cancel_ud, char **err) {
   if (err) *err = NULL;
 #ifndef MOTIRIS_NO_FILESYSTEM
   if (!backend || !strcmp(backend, "auto") || !strcmp(backend, "libcurl"))
-    return libcurl_send_stream(url, auth, body, on_delta, ud, err);
+    return libcurl_send_stream(url, auth, body, on_delta, ud,
+                               cancel, cancel_ud, err);
 #else
   (void)on_delta;
   (void)ud;
 #endif
   /* other backends: fall back to buffered send (aggregation identical) */
-  return motiris_transport_send(backend, url, auth, body, err);
+  return motiris_transport_send(backend, url, auth, body,
+                                cancel, cancel_ud, err);
 }
 
 static char *transport_error(const char *msg) {
@@ -421,16 +492,25 @@ static char *transport_error(const char *msg) {
 }
 
 char *motiris_transport_send(const char *backend, const char *url,
-                             const char *auth, const char *body, char **err) {
+                             const char *auth, const char *body,
+                             MotirisCancelCallback *cancel_cb, void *cancel_ud,
+                             char **err) {
   if (err) *err = NULL;
+  CancelCtx initial_cancel = { cancel_cb, cancel_ud };
+  if (cancel_requested(&initial_cancel)) {
+    if (err) *err = transport_error("cancelled");
+    return NULL;
+  }
 #ifndef MOTIRIS_NO_FILESYSTEM
   if (!backend || !strcmp(backend, "auto") || !strcmp(backend, "libcurl"))
-    return libcurl_send(url, auth, body, err);
+    return libcurl_send(url, auth, body, cancel_cb, cancel_ud, err);
   if (!strcmp(backend, "curl"))
-    return spawn_curl(url, auth, body, err);
+    return spawn_curl(url, auth, body, cancel_cb, cancel_ud, err);
 #else
   (void)url;
   (void)auth;
+  (void)cancel_cb;
+  (void)cancel_ud;
 #endif
   if (backend && !strcmp(backend, "echo")) {
     cJSON *j = cJSON_Parse(body);

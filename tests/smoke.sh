@@ -672,6 +672,7 @@ echo "$O9" | grep -q 'echo round complete' || { echo "FAIL repl run: $O9"; exit 
 echo "$O9" | grep -q '/help' || { echo "FAIL repl help: $O9"; exit 1; }
 echo "$O9" | grep -q 'bye' || { echo "FAIL repl exit: $O9"; exit 1; }
 python3 tests/repl_menu.py
+python3 tests/repl_cancel.py
 
 fi
 if test_in 16; then

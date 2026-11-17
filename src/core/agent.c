@@ -35,6 +35,8 @@ struct MotirisAgent {
   int stream;
   void (*on_delta)(const char *, void *);
   void *delta_ud;
+  MotirisCancelCallback *cancel;
+  void *cancel_ud;
   int tools_on, plugins_on;
   int goal_check;
   char *plugin_dir;
@@ -54,11 +56,14 @@ struct MotirisAgent {
 
 /* transport.c */
 char *motiris_transport_send(const char *backend, const char *url,
-                             const char *auth, const char *body, char **err);
+                             const char *auth, const char *body,
+                             MotirisCancelCallback *cancel, void *cancel_ud,
+                             char **err);
 char *motiris_transport_send_stream(const char *backend, const char *url,
                                     const char *auth, const char *body,
                                     void (*on_delta)(const char *, void *),
-                                    void *ud, char **err);
+                                    void *ud, MotirisCancelCallback *cancel,
+                                    void *cancel_ud, char **err);
 
 /* tools.c */
 int motiris_register_core_tools_count(void);
@@ -184,6 +189,13 @@ const char *motiris_transport_name(MotirisAgent *a) { return a->transport; }
 void motiris_set_stream(MotirisAgent *a, int on) { a->stream = !!on; }
 void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                            void *ud) { a->on_delta = cb; a->delta_ud = ud; }
+void motiris_set_cancel_cb(MotirisAgent *a, MotirisCancelCallback *cb, void *ud) {
+  a->cancel = cb;
+  a->cancel_ud = ud;
+}
+static int run_cancelled(const MotirisAgent *a) {
+  return a->cancel && a->cancel(a->cancel_ud);
+}
 void motiris_set_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud) {
   a->ntool_hooks = 0; /* replace any existing observers */
   motiris_add_tool_hook(a, cb, ud);
@@ -542,6 +554,13 @@ static char *build_request(MotirisAgent *a, const char *model) {
 }
 
 /* ---------------- response handling ---------------- */
+static char *string_result(const char *text) {
+  cJSON *j = cJSON_CreateString(text);
+  char *printed = cJSON_PrintUnformatted(j);
+  cJSON_Delete(j);
+  return printed;
+}
+
 static int push_tool_message(MotirisAgent *a, const char *call_id,
                              const char *content) {
   cJSON *m = cJSON_CreateObject();
@@ -552,18 +571,43 @@ static int push_tool_message(MotirisAgent *a, const char *call_id,
   return 0;
 }
 
+/* Keep the history that existed at run entry (including the active user
+ * instruction), but discard every assistant/tool/synthetic message from an
+ * interrupted run. This also leaves a valid prefix for the next instruction. */
+static int cancel_run(MotirisAgent *a, cJSON *run_tail,
+                      long tok_in, long tok_out) {
+  cJSON *m = run_tail ? run_tail->next : a->messages->child;
+  while (m) {
+    cJSON *next = m->next;
+    cJSON_DetachItemViaPointer(a->messages, m);
+    cJSON_Delete(m);
+    m = next;
+  }
+  a->tok_in = tok_in;
+  a->tok_out = tok_out;
+  set_error(a, "%s", "cancelled");
+  return MOTIRIS_RUN_CANCELLED;
+}
+
 int motiris_run(MotirisAgent *a) {
   if (a->history_error) return 1;
+  free(a->last_error);
+  a->last_error = NULL;
   a->run_start = NULL;
   for (cJSON *m = a->messages->child; m; m = m->next)
     if (!strcmp(message_role(m), "user")) a->run_start = m;
   if (history_retain(a, a->run_start)) return 1;
+  cJSON *run_tail = a->messages->child;
+  if (run_tail) while (run_tail->next) run_tail = run_tail->next;
+  long start_tok_in = a->tok_in, start_tok_out = a->tok_out;
+  if (run_cancelled(a)) return cancel_run(a, run_tail, start_tok_in, start_tok_out);
   const char *env_key = getenv("MOTIRIS_API_KEY");
   const char *fallback_key = a->api_key ? a->api_key : (env_key ? env_key : NULL);
   int np = a->nproviders > 0 ? a->nproviders : 1;
   int confirm_asked = 0;   /* goal-check: one confirmation round, per run */
 
   for (int step = 0; step < a->max_steps; step++) {
+    if (run_cancelled(a)) return cancel_run(a, run_tail, start_tok_in, start_tok_out);
     char *last_err = NULL;
     cJSON *j = NULL;
 
@@ -598,9 +642,17 @@ int motiris_run(MotirisAgent *a) {
       char *err = NULL;
       char *resp = a->stream
           ? motiris_transport_send_stream(a->transport, url, authp, body,
-                                          a->on_delta, a->delta_ud, &err)
-          : motiris_transport_send(a->transport, url, authp, body, &err);
+                                          a->on_delta, a->delta_ud,
+                                          a->cancel, a->cancel_ud, &err)
+          : motiris_transport_send(a->transport, url, authp, body,
+                                   a->cancel, a->cancel_ud, &err);
       free(body);
+      if (run_cancelled(a)) {
+        free(resp);
+        free(err);
+        free(last_err);
+        return cancel_run(a, run_tail, start_tok_in, start_tok_out);
+      }
       if (!resp) {
         free(last_err);
         last_err = malloc((err ? strlen(err) : 0) + 32);
@@ -655,6 +707,8 @@ int motiris_run(MotirisAgent *a) {
       free(last_err);
       return 1;
     }
+    free(last_err);
+    last_err = NULL;
 
     cJSON *choice = cJSON_GetArrayItem(
         cJSON_GetObjectItemCaseSensitive(j, "choices"), 0);
@@ -668,6 +722,12 @@ int motiris_run(MotirisAgent *a) {
       set_error(a, "response message missing", NULL);
       cJSON_Delete(j);
       return 1;
+    }
+
+    if (run_cancelled(a)) {
+      free(last_err);
+      cJSON_Delete(j);
+      return cancel_run(a, run_tail, start_tok_in, start_tok_out);
     }
 
     /* keep assistant message in history (may carry tool_calls) */
@@ -684,6 +744,11 @@ int motiris_run(MotirisAgent *a) {
 
     if (cJSON_IsArray(calls) && cJSON_GetArraySize(calls) > 0) {
       for (cJSON *tc = calls->child; tc; tc = tc->next) {
+        if (run_cancelled(a)) {
+          free(last_err);
+          cJSON_Delete(j);
+          return cancel_run(a, run_tail, start_tok_in, start_tok_out);
+        }
         cJSON *fn = cJSON_GetObjectItemCaseSensitive(tc, "function");
         const char *name = cJSON_GetStringValue(
             cJSON_GetObjectItemCaseSensitive(fn, "name"));
@@ -696,14 +761,13 @@ int motiris_run(MotirisAgent *a) {
         const MotirisTool *t = find_tool(a, name);
         char *result;
         if (!t) {
-          result = cJSON_PrintUnformatted(cJSON_CreateString(
-              "error: unknown tool (not registered)"));
+          result = string_result("error: unknown tool (not registered)");
         } else {
           if (a->verbose) fprintf(stderr, "[motiris] tool call: %s(%s)\n",
                                           name, args ? args : "");
                   result = t->call(args ? args : "{}", t->ud);
-                  if (!result) result = cJSON_PrintUnformatted(
-                      cJSON_CreateString("error: tool returned nothing"));
+                  if (!result) result = string_result(
+                      "error: tool returned nothing");
                   for (int hi = 0; hi < a->ntool_hooks; hi++)
                     a->tool_hooks[hi].cb(name, args ? args : "{}", result,
                                          a->tool_hooks[hi].ud);
@@ -716,6 +780,10 @@ int motiris_run(MotirisAgent *a) {
         free(result);
       }
       cJSON_Delete(j);
+      if (run_cancelled(a)) {
+        free(last_err);
+        return cancel_run(a, run_tail, start_tok_in, start_tok_out);
+      }
       continue; /* next round */
     }
 
@@ -749,10 +817,17 @@ int motiris_run(MotirisAgent *a) {
       cJSON_Delete(j);
       continue;
     }
+    if (run_cancelled(a)) {
+      free(last_err);
+      cJSON_Delete(j);
+      return cancel_run(a, run_tail, start_tok_in, start_tok_out);
+    }
     cJSON_Delete(j);
+    free(last_err);
     return 0;
   }
 
+  if (run_cancelled(a)) return cancel_run(a, run_tail, start_tok_in, start_tok_out);
   set_error(a, "max steps reached", NULL);
   return 1;
 }

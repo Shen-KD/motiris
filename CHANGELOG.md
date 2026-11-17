@@ -8,6 +8,13 @@ published by `.github/workflows/release.yml`.
 
 ### Added
 
+- REPL Ctrl+C now cooperatively cancels an in-flight generation without
+  exiting or failing over to another provider. The active user instruction is
+  retained, partial assistant/tool messages and token counts from that run are
+  rolled back, and the next instruction continues the same agent. The public
+  cancel callback and `MOTIRIS_RUN_CANCELLED` result cover libcurl, spawned
+  curl and strict-C11 echo transports; real-PTY and nofs tests cover stream
+  interruption, history rollback and a successful follow-up.
 - REPL slash commands show a live description list as soon as `/` is typed
   and filter it on every prefix edit, while Tab completion and inline hints
   remain available. `/exit` is the single exit command; unknown commands fail
@@ -72,6 +79,9 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- Successful SSE response trees and temporary unknown/empty-tool JSON strings
+  are now freed after serialization. Leak-enabled ASAN runs cover both the
+  interrupted-stream/follow-up path and the strict-C11 core retry path.
 - Session restore no longer trusts ambiguous U/A/T rows: multiline model/tool
   content cannot forge later user turns, and assistant/tool state survives
   CLI/REPL/gateway restoration. Legacy, corrupt, oversized, mismatched and
