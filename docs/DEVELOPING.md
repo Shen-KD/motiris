@@ -157,6 +157,52 @@ Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
 No MCU/RTOS cross-toolchain, target Flash/RAM or hardware validation is
 available; none of these host numbers is an MCU support claim.
 
+### Bounded Gateway connection I/O
+
+`src/harness/gateway.c` keeps the sequential, single-threaded accept loop but
+sets each accepted socket nonblocking. `MOTIRIS_GATEWAY_IO_TIMEOUT_S` selects
+a 1..120-second budget (default 30); malformed or out-of-range values fail
+before the listening socket is created. One absolute `CLOCK_MONOTONIC`
+deadline covers the complete header+body receive, and a fresh one covers each
+complete response header+body send. `poll` always waits only for the remaining
+interval. Byte progress, partial writes, `EAGAIN` and `EINTR` recheck rather
+than extend that interval, so half-open and continuously trickling clients
+cannot hold the only connection handler indefinitely. Agent/provider execution
+is outside these socket-I/O budgets and retains its own transport bounds.
+
+Receive expiry returns HTTP `408` with a bounded `request timeout` error.
+Response-write expiry emits `response write timed out` to stderr. Either path
+closes only the current socket and resumes `accept`, so subsequent health and
+chat requests remain available. Header/body write failures and short writes
+are handled instead of discarded. No threads, event library, waiting queue or
+new runtime dependency is introduced. The only added per-connection state is
+fixed-size stack storage for deadlines, one `pollfd` and offsets; the
+process-wide timeout setting is immutable after startup and contains no
+Agent/session data. The existing receive allocation remains at most 16 KiB + 1 MiB + 1 byte,
+and response strings retain their existing bounded producer/history limits.
+
+Reference host measurements on 2026-11-17 (Linux x86_64, gcc `-O2`/harness
+`-Os`, stripped; baseline `57d3122`) are:
+
+| Build / measurement | Baseline | Gateway deadline branch | Relative result |
+| --- | ---: | ---: | --- |
+| Default full CLI | 174,328 bytes | 174,336 bytes | +8 bytes |
+| ELF text / data / BSS | 164,576 / 3,040 / 169,040 | 165,888 / 3,048 / 169,040 | +1,312 / +8 / +0 bytes |
+| Strict core-only nofs probe | 69,840 bytes unstripped | 69,840 bytes; text 49,715; data 952; BSS 4,232 | unchanged; libc only |
+| `tests/perf.sh` cold peak RSS | 9,188 KiB | 9,204 KiB | +16 KiB; both 50 ms, normal host variation |
+| `tests/perf.sh` 5-step loop peak RSS | 9,360 KiB | 9,280 KiB | -80 KiB; both 50 ms, normal host variation |
+| Five receive expiries + health checks | 8,792 KiB; 4 fds | 8,796 KiB; 4 fds | no fd growth; +4 KiB host-noise RSS |
+
+Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
+The strict core probe does not compile Gateway and remains unchanged. The
+optional host checkpoint cut uses the same bounded socket path; no new
+core/optional switch or dependency was added. `tests/gateway_io.py` covers
+half-open headers and bodies, continuous trickle input, a non-reading client
+with a 12 MiB local-provider reply, repeated expiry/fd stability, subsequent
+health checks and invalid configuration. It runs in smoke #9, including the
+ASAN/UBSAN tools job. These are Linux host measurements, not MCU Flash/RAM
+headroom; no MCU/RTOS cross-toolchain or hardware validation is available.
+
 ### Optional vision bounds and measurements
 
 `VISION_TOOLS=1` compiles `src/tools/visiontools.c` and three agent getters;
@@ -653,6 +699,9 @@ may still use its own atomic replacement.
 - Smoke #9: gateway health/auth plus partial, byte-segmented, malformed
   and oversized requests. Headers are capped at 16 KiB and bodies at
   1 MiB; the receive allocation is capped at their sum plus one NUL byte.
+  Half-open/trickling receives and a non-reading response client expire within
+  the configured monotonic deadline, later health checks succeed, repeated
+  timeouts leave fd counts unchanged, and invalid timeout settings fail closed.
   Gateway session regressions cover colliding punctuation, case, Unicode,
   120-byte IDs, full assistant restoration after restart and 64-session
   eviction, legacy/ownership/digest fail-closed behavior, and exact-ID reset.
