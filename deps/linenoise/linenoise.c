@@ -129,6 +129,7 @@ static linenoiseCompletionCallback *completionCallback = NULL;
 static linenoiseHintsCallback *hintsCallback = NULL;
 static linenoiseFreeHintsCallback *freeHintsCallback = NULL;
 static linenoiseMenuCallback *menuCallback = NULL;
+static linenoiseMenuSelectCallback *menuSelectCallback = NULL;
 static linenoiseFreeMenuCallback *freeMenuCallback = NULL;
 static char *linenoiseReadLine(FILE *fp, int *err);
 static char *linenoiseNoTTY(void);
@@ -794,6 +795,7 @@ static int completeLine(struct linenoiseState *ls, int keypressed) {
                     nwritten = snprintf(ls->buf,ls->buflen,"%s",
                         lc.cvec[ls->completion_idx]);
                     ls->len = ls->pos = nwritten;
+                    ls->menu_index = 0;
                     linenoiseFoldClear(ls);
                 }
                 ls->in_completion = 0;
@@ -831,6 +833,10 @@ void linenoiseSetFreeHintsCallback(linenoiseFreeHintsCallback *fn) {
 
 void linenoiseSetMenuCallback(linenoiseMenuCallback *fn) {
     menuCallback = fn;
+}
+
+void linenoiseSetMenuSelectCallback(linenoiseMenuSelectCallback *fn) {
+    menuSelectCallback = fn;
 }
 
 void linenoiseSetFreeMenuCallback(linenoiseFreeMenuCallback *fn) {
@@ -1225,7 +1231,7 @@ void refreshShowHints(struct abuf *ab, struct linenoiseState *l, int pwidth, siz
  * keeps the editing position stable even when printing at the screen bottom
  * scrolls the terminal. The previous menu is always cleared below the input. */
 static void refreshShowMenu(struct abuf *ab, struct linenoiseState *l, int col) {
-    char *menu = menuCallback ? menuCallback(l->buf) : NULL;
+    char *menu = menuCallback ? menuCallback(l->buf,l->menu_index) : NULL;
     size_t len = menu ? strlen(menu) : 0;
     int rows = 0;
 
@@ -1238,7 +1244,15 @@ static void refreshShowMenu(struct abuf *ab, struct linenoiseState *l, int col) 
     if (!rows && !l->menu_rows) goto out;
 
     abAppend(ab,"\r\n\x1b[J",strlen("\r\n\x1b[J"));
-    if (rows) abAppend(ab,menu,len);
+    if (rows) {
+        size_t start = 0;
+        for (size_t i = 0; i <= len; i++) {
+            if (i != len && menu[i] != '\n') continue;
+            abAppend(ab,menu+start,i-start);
+            if (i < len) abAppend(ab,"\r\n",2);
+            start = i+1;
+        }
+    }
     char seq[64];
     snprintf(seq,sizeof(seq),"\x1b[%dA\r",rows ? rows : 1);
     abAppend(ab,seq,strlen(seq));
@@ -1474,6 +1488,20 @@ static void refreshLine(struct linenoiseState *l) {
     refreshLineWithFlags(l,REFRESH_ALL);
 }
 
+static int linenoiseMenuHasSelection(struct linenoiseState *l) {
+    if (l->menu_rows <= 0 || !menuCallback) return 0;
+    if (!menuSelectCallback) return 1;
+    return menuSelectCallback(l->buf,l->menu_index) != NULL;
+}
+
+static void linenoiseMenuMove(struct linenoiseState *l, int dir) {
+    int rows = l->menu_rows;
+    if (rows <= 0) return;
+    if (l->menu_index < 0 || l->menu_index >= rows) l->menu_index = 0;
+    l->menu_index = (l->menu_index + dir + rows) % rows;
+    refreshLine(l);
+}
+
 /* Hide the current line, when using the multiplexing API. */
 void linenoiseHide(struct linenoiseState *l) {
     if (mlmode)
@@ -1542,6 +1570,7 @@ static int linenoiseEditInsertNoRefresh(struct linenoiseState *l, const char *c,
     l->pos += clen;
     l->len += clen;
     l->buf[l->len] = '\0';
+    l->menu_index = 0;
     linenoiseAdjustFoldsAfterInsert(l,insert_pos,clen);
     return 0;
 }
@@ -1644,6 +1673,7 @@ void linenoiseEditHistoryNext(struct linenoiseState *l, int dir) {
         memcpy(l->buf,src,len);
         l->buf[len] = '\0';
         l->len = l->pos = len;
+        l->menu_index = 0;
         linenoiseFoldClear(l);
 
         /* History stores the real text, but not the original paste ranges.
@@ -1665,6 +1695,7 @@ void linenoiseEditDelete(struct linenoiseState *l) {
         memmove(l->buf+l->pos, l->buf+l->pos+clen, l->len-l->pos-clen);
         l->len -= clen;
         l->buf[l->len] = '\0';
+        l->menu_index = 0;
         refreshLine(l);
     }
 }
@@ -1678,6 +1709,7 @@ void linenoiseEditBackspace(struct linenoiseState *l) {
         l->pos -= clen;
         l->len -= clen;
         l->buf[l->len] = '\0';
+        l->menu_index = 0;
         refreshLine(l);
     }
 }
@@ -1698,6 +1730,7 @@ void linenoiseEditDeletePrevWord(struct linenoiseState *l) {
     linenoiseAdjustFoldsAfterDelete(l,l->pos,diff);
     memmove(l->buf+l->pos, l->buf+old_pos, l->len-old_pos+1);
     l->len -= diff;
+    l->menu_index = 0;
     refreshLine(l);
 }
 
@@ -1748,6 +1781,7 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->oldrows = 0;
     l->oldrpos = 1;  /* Cursor starts on row 1. */
     l->menu_rows = 0;
+    l->menu_index = 0;
     l->history_index = 0;
 
     /* Buffer starts empty. */
@@ -1944,6 +1978,17 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
 
     switch(c) {
     case ENTER:    /* enter */
+        if (l->menu_rows > 0 && menuSelectCallback) {
+            char *selected = menuSelectCallback(l->buf,l->menu_index);
+            if (selected) {
+                size_t len = strlen(selected);
+                if (linenoiseEditGrow(l,len) == 0) {
+                    memmove(l->buf,selected,len+1);
+                    l->len = l->pos = len;
+                    linenoiseFoldClear(l);
+                }
+            }
+        }
         history_len--;
         free(history[history_len]);
         if (mlmode) linenoiseEditMoveEnd(l);
@@ -1991,6 +2036,7 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
             memmove(l->buf + prevstart + currlen, l->buf + prevstart, prevlen);
             memcpy(l->buf + prevstart, tmp, currlen);
             if (l->pos + currlen <= l->len) l->pos += currlen;
+            l->menu_index = 0;
             refreshLine(l);
         }
         break;
@@ -2041,10 +2087,16 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
             } else {
                 switch(seq[1]) {
                 case 'A': /* Up */
-                    linenoiseEditHistoryNext(l, LINENOISE_HISTORY_PREV);
+                    if (linenoiseMenuHasSelection(l))
+                        linenoiseMenuMove(l,-1);
+                    else
+                        linenoiseEditHistoryNext(l, LINENOISE_HISTORY_PREV);
                     break;
                 case 'B': /* Down */
-                    linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
+                    if (linenoiseMenuHasSelection(l))
+                        linenoiseMenuMove(l,1);
+                    else
+                        linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
                     break;
                 case 'C': /* Right */
                     linenoiseEditMoveRight(l);
@@ -2095,6 +2147,7 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
     case CTRL_U: /* Ctrl+u, delete the whole line. */
         l->buf[0] = '\0';
         l->pos = l->len = 0;
+        l->menu_index = 0;
         linenoiseFoldClear(l);
         refreshLine(l);
         break;
@@ -2102,6 +2155,7 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         linenoiseAdjustFoldsAfterDelete(l,l->pos,l->len-l->pos);
         l->buf[l->pos] = '\0';
         l->len = l->pos;
+        l->menu_index = 0;
         refreshLine(l);
         break;
     case CTRL_A: /* Ctrl+a, go to the start of the line */

@@ -35,10 +35,11 @@
 #define C_RED   "\033[31m"
 #define C_DIM   "\033[2m"
 #define C_BOLD  "\033[1m"
+#define C_REVERSE "\033[7m"
 #define C_YELLOW "\033[33m"
 
 static const char *const CMDS[] = { "/help", "/new", "/tools", "/sessions",
-                                    "/resume", "/skills", "/exit" };
+                                    "/resume", "/skills", "/hotkey", "/exit" };
 static const char *const CMDS_DESC[] = {
   "this help",
   "reset session context",
@@ -46,6 +47,7 @@ static const char *const CMDS_DESC[] = {
   "review past session logs [TERM]",
   "restore a full-turn snapshot FILE",
   "list available skills [TERM]",
+  "show interactive key bindings",
   "leave the repl",
 };
 #define NCMDS (sizeof CMDS / sizeof CMDS[0])
@@ -163,7 +165,7 @@ static char *repl_hints(const char *line, int *color, int *bold) {
 
 /* Live newline-separated menu; no Tab keypress is required. */
 static char menu_buf[1024];
-static char *repl_menu(const char *line) {
+static char *repl_menu(const char *line, int selected) {
   size_t blen = strlen(line);
   if (!blen || line[0] != '/' || strchr(line, ' ')) return NULL;
 
@@ -173,18 +175,36 @@ static char *repl_menu(const char *line) {
   for (size_t i = 0; i < NCMDS; i++) {
     if (strncmp(line, CMDS[i], blen)) continue;
     char row[160];
-    int n = snprintf(row, sizeof row, "  %-8s %s", CMDS[i], CMDS_DESC[i]);
+    int n = matches == selected
+          ? snprintf(row, sizeof row, C_REVERSE "  %-8s %s" C_RESET,
+                     CMDS[i], CMDS_DESC[i])
+          : snprintf(row, sizeof row, "  %-8s %s", CMDS[i], CMDS_DESC[i]);
     if (n < 0 || (size_t)n >= sizeof row) continue;
     size_t need = (size_t)n + (matches ? 1 : 0);
     if (used + need >= sizeof menu_buf) break;
     if (matches) menu_buf[used++] = '\n';
     memcpy(menu_buf + used, row, (size_t)n + 1);
     used += (size_t)n;
-    matches = 1;
+    matches++;
   }
   if (!matches)
     snprintf(menu_buf, sizeof menu_buf, "  no matching commands (/help)");
   return menu_buf;
+}
+
+static char menu_select_buf[32];
+static char *repl_menu_select(const char *line, int selected) {
+  size_t blen = strlen(line);
+  if (!blen || line[0] != '/' || strchr(line, ' ')) return NULL;
+  int match = 0;
+  for (size_t i = 0; i < NCMDS; i++) {
+    if (strncmp(line, CMDS[i], blen)) continue;
+    if (match++ == selected) {
+      snprintf(menu_select_buf, sizeof menu_select_buf, "%s", CMDS[i]);
+      return menu_select_buf;
+    }
+  }
+  return NULL;
 }
 
 static void print_help(void) {
@@ -194,8 +214,27 @@ static void print_help(void) {
   printf("  multi-line input: end a line with two backslashes " C_DIM "\\\\" C_RESET "\n");
 }
 
+static void print_hotkeys(void) {
+  printf(C_BOLD "interactive keys" C_RESET "\n");
+  printf("  " C_GREEN "↑ / ↓" C_RESET
+         "      select a command in the / menu; browse history otherwise\n");
+  printf("  " C_GREEN "enter" C_RESET
+         "      submit input or run the selected command\n");
+  printf("  " C_GREEN "tab" C_RESET
+         "        complete a /-command\n");
+  printf("  " C_GREEN "ctrl+c" C_RESET
+         "     cancel a running reply\n");
+  printf("  " C_GREEN "ctrl+d" C_RESET
+         "     quit at an empty prompt\n");
+  printf("  " C_GREEN "ctrl+u" C_RESET
+         "     clear the current input\n");
+  printf("  " C_GREEN "ctrl+l" C_RESET
+         "     clear the screen\n");
+}
+
 static int handle_command(MotirisAgent *a, const char *line) {
   if (!strcmp(line, "/exit")) return 1;
+  if (!strcmp(line, "/hotkey")) { print_hotkeys(); return 0; }
   if (!strcmp(line, "/new")) {
     /* fresh session: drop all history messages */
     cJSON *msgs = motiris_messages(a);
@@ -383,6 +422,7 @@ int motiris_repl(MotirisAgent *a) {
   linenoiseSetCompletionCallback(repl_completion);
   linenoiseSetHintsCallback(repl_hints);
   linenoiseSetMenuCallback(repl_menu);
+  linenoiseSetMenuSelectCallback(repl_menu_select);
 
   char hist[1024];
   expand_home(hist, sizeof hist, hist_path());

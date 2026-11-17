@@ -604,9 +604,11 @@ may still use its own atomic replacement.
   the dedicated sanitizer CI step enables LSan for both memory test layers.
 - Smoke #14: SSE delta aggregation (first-delta termination).
 - Smoke #15: piped REPL commands plus real-PTY live slash menus. Typing `/`
-  displays all commands without Tab, `/s` and `/se` filter to the expected
-  subsets, Ctrl-U clears old rows, `/quit` fails locally without a model turn,
-  and `/exit` remains the single exit command. A slow-SSE PTY case also sends
+  displays all commands in aligned columns without Tab, `/s` and `/se` filter
+  to the expected subsets, up/down move a wrapping reverse-video selection and
+  Enter accepts it. No-match rows leave arrows on history navigation.
+  `/hotkey` prints interactive key bindings, Ctrl-U clears old rows, `/quit`
+  fails locally without a model turn, and `/exit` remains the single exit command. A slow-SSE PTY case also sends
   Ctrl+C during generation, verifies the REPL survives and returns its prompt,
   then appends an instruction and checks that the next request has both user
   messages but no partial assistant content.

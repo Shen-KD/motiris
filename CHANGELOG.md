@@ -26,9 +26,11 @@ published by `.github/workflows/release.yml`.
   interruption, history rollback and a successful follow-up.
 - REPL slash commands show a live description list as soon as `/` is typed
   and filter it on every prefix edit, while Tab completion and inline hints
-  remain available. `/exit` is the single exit command; unknown commands fail
-  locally instead of becoming model turns. Real-PTY coverage checks filtering,
-  menu cleanup and the removed `/quit` alias.
+  remain available. Up/down highlight and cyclically select rows, Enter runs
+  the selection, and `/hotkey` lists interactive key bindings. `/exit` is the
+  single exit command; unknown commands fail locally instead of becoming model
+  turns. Real-PTY coverage checks alignment, filtering, selection, menu cleanup
+  and the removed `/quit` alias.
 - REPL startup banner shows model / skills / tools with aligned
   colored labels; per-turn status footer (tokens, elapsed ms, model);
   first-run command hints.
@@ -88,6 +90,8 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- REPL live slash-menu rows use carriage-return/newline pairs in raw terminal
+  mode, keeping every command left-aligned instead of stair-stepping right.
 - Successful SSE response trees and temporary unknown/empty-tool JSON strings
   are now freed after serialization. Leak-enabled ASAN runs cover both the
   interrupted-stream/follow-up path and the strict-C11 core retry path.

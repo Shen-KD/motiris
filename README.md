@@ -136,8 +136,9 @@ motiris --gateway :8899                                 # HTTP gateway
 curl -X POST localhost:8899/v1/chat -d '{"chat_id":"dev","message":"hi"}'
 motiris --cron jobs.json --once                          # scheduled jobs
 motiris --sessions [TERM]                                # list/search logs
-# repl (-i): type / for a live prefix-filtered command list; /exit to leave
-# commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM] /exit
+# repl (-i): / lists commands; ↑/↓ select, Enter runs, /exit leaves
+# commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM]
+#           /hotkey (interactive key bindings) /exit
 # Ctrl+C during a reply cancels generation, keeps the user instruction,
 # discards partial assistant/tool messages, and accepts a follow-up instruction
 # interactive repl turns checkpoint to ~/.local/share/motiris/sessions/
