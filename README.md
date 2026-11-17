@@ -242,7 +242,7 @@ I/O. This is not durable storage by itself and is not an MCU hardware claim.
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
 `MOTIRIS_GATEWAY_TOKEN`, `MOTIRIS_GATEWAY_IO_TIMEOUT_S`,
-`MOTIRIS_VISION_MODEL`,
+`MOTIRIS_MCP_TIMEOUT_S`, `MOTIRIS_VISION_MODEL`,
 `MOTIRIS_VISION_BASE_URL`, `MOTIRIS_VISION_API_KEY`,
 `MOTIRIS_VISION_MAX_BYTES`, `MOTIRIS_VISION_TIMEOUT_S`,
 `MOTIRIS_TTS_CMD`, `MOTIRIS_TTS_TIMEOUT_S`,
@@ -362,7 +362,17 @@ in the mode-0600 env file and reference them with `api_key_env`.
 
 MCP servers (`"mcp_servers": [{"name","cmd","args":[]}]` in config.json)
 register each remote tool as `<server>:<tool>`; `tools/call` is bridged
-over stdio JSON-RPC.
+over stdio JSON-RPC. `MOTIRIS_MCP_TIMEOUT_S` gives each initialize,
+tools/list, tools/call and initialized-notification write a 10-second default
+budget (allowed 1..120; invalid values reject that server). One monotonic
+deadline covers nonblocking request writes and response reads, including
+partial I/O and `EINTR`; request/response lines are capped at 1 MiB. A fatal
+I/O failure closes both pipes and terminally disables that connection, so a
+later tool call returns the same bounded error immediately. Cleanup signals
+the server process group with SIGTERM, allows a one-second grace period, then
+uses SIGKILL and reaps the direct child. A server exiting early cannot kill
+motiris with SIGPIPE. These POSIX process/pipe operations remain in the
+optional host MCP harness; the strict-C11 core does not include them.
 
 Shell safety policy: config `"shell_allow": "git,ls"` /
 `"shell_deny": "rm,sudo"` (prefix match, deny wins) is enforced in the
