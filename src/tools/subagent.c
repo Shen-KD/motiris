@@ -7,15 +7,15 @@
  * override binary with MOTIRIS_BIN.
  */
 #include "motiris.h"
+#include "childproc.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #define SUB_OUT_CAP (32 * 1024)
+#define SUB_DEFAULT_TIMEOUT_S 120L
 
 static char *err_json(const char *msg) {
   cJSON *e = cJSON_CreateObject();
@@ -43,54 +43,24 @@ static char *subagent_call(const char *args_json, void *ud) {
   if (!task || !*task) { cJSON_Delete(args); return err_json("task required"); }
 
   char *bin = own_bin();
-
-  int outpipe[2];
-  if (pipe(outpipe)) {
-    free(bin); cJSON_Delete(args);
-    return err_json("pipe failed");
-  }
-
-  pid_t pid = fork();
-  if (pid < 0) {
-    free(bin); cJSON_Delete(args);
-    return err_json("fork failed");
-  }
-  if (pid == 0) {
-    /* child: motiris -p <task> --no-tools [--max-steps 3] */
-    dup2(outpipe[1], 1);
-    dup2(outpipe[1], 2);
-    close(outpipe[0]);
-    close(outpipe[1]);
-    execl(bin, bin, "-p", task, "--no-tools", "--max-steps", "3",
-          (char *)NULL);
-    _exit(127);
-  }
-
-  close(outpipe[1]);
-  size_t cap = 8192, len = 0;
-  char *buf = malloc(cap);
-  ssize_t n;
-  while ((n = read(outpipe[0], buf + len, cap - len - 1)) > 0) {
-    len += (size_t)n;
-    if (len + 1 >= cap) {
-      if (cap >= SUB_OUT_CAP) break;
-      cap *= 2;
-      buf = realloc(buf, cap);
-    }
-  }
-  close(outpipe[0]);
-  buf[len] = '\0';
-
-  int wstatus = 0;
-  while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) {}
-  int rc = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
-
+  if (!bin) { cJSON_Delete(args); return err_json("subagent path allocation failed"); }
+  char *const child_argv[] = {
+    bin, "-p", (char *)task, "--no-tools", "--max-steps", "3", NULL
+  };
+  ChildProcResult child;
+  childproc_run("subagent", child_argv, "MOTIRIS_SUBAGENT_TIMEOUT_S",
+                SUB_DEFAULT_TIMEOUT_S, SUB_OUT_CAP, &child);
   cJSON_Delete(args);
   free(bin);
+
   cJSON *r = cJSON_CreateObject();
-  cJSON_AddStringToObject(r, "output", buf);
-  cJSON_AddNumberToObject(r, "exit_code", (double)rc);
-  free(buf);
+  cJSON_AddStringToObject(r, "output", child.output ? child.output : "");
+  cJSON_AddNumberToObject(r, "exit_code", child.exit_code);
+  cJSON_AddNumberToObject(r, "signal", child.signal_number);
+  cJSON_AddBoolToObject(r, "timed_out", child.timed_out);
+  cJSON_AddBoolToObject(r, "truncated", child.truncated);
+  if (child.error[0]) cJSON_AddStringToObject(r, "error", child.error);
+  childproc_free(&child);
   char *s = cJSON_PrintUnformatted(r);
   cJSON_Delete(r);
   return s;

@@ -96,6 +96,17 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- `browser_fetch` and `subagent` now share bounded host-child execution:
+  `MOTIRIS_BROWSER_TIMEOUT_S` (default 30 s) and
+  `MOTIRIS_SUBAGENT_TIMEOUT_S` (default 120 s), each range 1..120, apply one
+  monotonic deadline to setup, output draining and exit. Combined output is
+  drained/discarded after 64 KiB (browser) or 32 KiB (subagent), with exit,
+  signal, timeout, truncation and bounded error metadata. Process-group
+  TERM/grace/KILL/reap handles timeout and I/O failure, including leaders that
+  exit before pipe-holding descendants; normal return also cleans same-group
+  background members. Offline tests cover floods, continuous output, silent
+  and TERM-ignoring children, descendant cleanup, repeated-call fd/RSS
+  stability, invalid settings and successful calls after timeout.
 - MCP stdio initialize/list/call and notification writes now share bounded
   monotonic request deadlines (`MOTIRIS_MCP_TIMEOUT_S`, default 10 s, range
   1..120). Nonblocking `poll` handles partial I/O and early server exit;

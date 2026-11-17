@@ -92,6 +92,7 @@ make test-nofs        # strict-C11 core + file/memory/shell backend cut test
 make test-persistence # full-CLI volatile-only checkpoint backend cut test
 make test-core-nofs   # core-only retention + memory snapshot round-trip
 make test-shell       # bounded shell execution integration tests
+make test-browser-subagent # bounded browser/subagent process tests
 make test-webtools-parser # malformed/truncated web_search parser regression
 make test-memory      # memory corruption/atomic-failure/replacement tests
 make test-vision      # clean optional-vision build + local mock integration
@@ -242,7 +243,8 @@ I/O. This is not durable storage by itself and is not an MCU hardware claim.
 Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_PLUGIN_DIR`, `MOTIRIS_TOOLS_DIR`, `MOTIRIS_CURL`,
 `MOTIRIS_GATEWAY_TOKEN`, `MOTIRIS_GATEWAY_IO_TIMEOUT_S`,
-`MOTIRIS_MCP_TIMEOUT_S`, `MOTIRIS_VISION_MODEL`,
+`MOTIRIS_MCP_TIMEOUT_S`, `MOTIRIS_BROWSER_TIMEOUT_S`,
+`MOTIRIS_SUBAGENT_TIMEOUT_S`, `MOTIRIS_VISION_MODEL`,
 `MOTIRIS_VISION_BASE_URL`, `MOTIRIS_VISION_API_KEY`,
 `MOTIRIS_VISION_MAX_BYTES`, `MOTIRIS_VISION_TIMEOUT_S`,
 `MOTIRIS_TTS_CMD`, `MOTIRIS_TTS_TIMEOUT_S`,
@@ -303,6 +305,20 @@ Knowledge & delegation tools:
 - `subagent(task)` — run a fresh `motiris` child (no tools, isolated)
 - `browser_fetch(url)` — render via headless chromium (`--dump-dom`),
   needs a chromium binary; `MOTIRIS_BROWSER` overrides
+
+Both host-only child tools use one monotonic deadline for process setup,
+combined stdout/stderr draining and exit. `MOTIRIS_SUBAGENT_TIMEOUT_S`
+defaults to 120 s and `MOTIRIS_BROWSER_TIMEOUT_S` to 30 s; each accepts
+1..120 and invalid values fail before `fork`. Subagent retains at most 32 KiB
+and browser 64 KiB of combined output, draining and discarding excess instead
+of deadlocking on a full pipe. Results expose `exit_code`, `signal`,
+`timed_out`, `truncated` and bounded `error` diagnostics where applicable.
+Each child starts a process group; timeout/setup/I/O failure closes the pipe,
+then uses TERM, a one-second grace, KILL and direct-child reap. Normal leader
+exit also kills remaining same-group background members. This is process-group
+cleanup, not a sandbox or arbitrary cross-session cancellation tree; a child
+in an uninterruptible kernel wait is outside the userspace deadline guarantee.
+These POSIX process operations remain outside the strict-C11 core.
 
 Optional host-backed tool (only with `VISION_TOOLS=1`):
 
@@ -437,6 +453,7 @@ src/memorytools.c      persistent memory tools
 src/skilltools.c       SKILL.md index + on-demand load
 src/subagent.c         child-agent delegation tool
 src/browser.c          headless chromium fetch
+src/tools/childproc.c  shared bounded host-child runner
 src/tools/visiontools.c optional bounded vision provider tool
 src/mcp.c              MCP stdio client (JSON-RPC)
 src/gateway.c          embedded HTTP gateway (session-per-chat_id)
@@ -458,6 +475,7 @@ make test          # 27 default offline smoke checks, no network/key needed
 make test-core-nofs # strict-C11 core + caller-owned memory snapshots
 make test-persistence # PERSISTENCE=0 fail-closed/volatile-only integration
 make test-shell    # shell dual-stream/cap/timeout/reaping regression cases
+make test-browser-subagent # browser/subagent deadline/flood/cleanup cases
 make test-webtools-parser # malformed/truncated DDG row tests (also in smoke #11)
 make test-memory   # memory corruption/atomic faults + replacement coverage
 make test-vision   # optional vision build + 10 local-mock integration cases
