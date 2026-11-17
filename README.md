@@ -177,6 +177,27 @@ replay budget does not delete live or persisted history; an over-budget active
 turn fails before any provider request. Restore applies the live limits before
 reporting the number of retained messages.
 
+Configured `providers` are used for every list length, including a singleton;
+each entry selects its own model, endpoint and key before any fallback. REPL
+streaming prints a final answer once: the agent suppresses the aggregated copy
+only when the selected backend actually delivered text deltas, while buffered,
+echo and spawned-curl fallback still print their final message. Goal-check
+confirmation deltas are staged silently so a streamed `DONE` is not exposed.
+If a provider fails after emitting text, the run returns the error instead of
+mixing that partial text with another provider's answer.
+
+Provider receives are bounded independently of history/replay retention.
+`MOTIRIS_RESPONSE_MAX_BYTES` defaults to 16 MiB and accepts 1..16 MiB. Let `C`
+be that setting: buffered libcurl and spawned-curl bodies, each SSE line,
+aggregated SSE content and each streamed tool-argument string are capped at
+`C`; total SSE wire input is capped at `4*C` for JSON/framing overhead, with at
+most 256 streamed tool calls. Growth is checked for overflow/allocation
+failure. Exceeding a limit stops the transfer, frees partial receive state and
+returns `response limit exceeded` (fallback may run only before visible text).
+Malformed streamed tool-call indices fail as `invalid stream response`. These are
+per-call allocation bounds, not total-process RSS or MCU RAM guarantees; an
+embedded port should choose and measure a smaller target-specific limit.
+
 CLI `--save`, interactive REPL turns and gateway turns atomically replace one
 latest snapshot per session. The host backend limits files to 1 MiB, snapshots
 to 256 messages and 256 tool calls, and each serialized message to 256 KiB.
@@ -212,7 +233,8 @@ Environment: `MOTIRIS_API_KEY`, `MOTIRIS_MODEL`, `MOTIRIS_BASE_URL`,
 `MOTIRIS_SHELL_TIMEOUT_S`, `MOTIRIS_SHELL_STDOUT_MAX`,
 `MOTIRIS_SHELL_STDERR_MAX`, `MOTIRIS_SHELL_OUTPUT_MAX`,
 `MOTIRIS_HISTORY_MAX_MESSAGES`, `MOTIRIS_HISTORY_MAX_BYTES`,
-`MOTIRIS_REPLAY_MAX_MESSAGES`, `MOTIRIS_REPLAY_MAX_BYTES`. Default endpoint:
+`MOTIRIS_REPLAY_MAX_MESSAGES`, `MOTIRIS_REPLAY_MAX_BYTES`,
+`MOTIRIS_RESPONSE_MAX_BYTES`. Default endpoint:
 `https://api.openai.com/v1/chat/completions`.
 
 Built-in tools (disable with `--no-tools`):

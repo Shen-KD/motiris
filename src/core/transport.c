@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #ifndef MOTIRIS_NO_FILESYSTEM
 #include <curl/curl.h>
 #include <unistd.h>
@@ -30,13 +31,74 @@ typedef struct {
   void *ud;
 } CancelCtx;
 
-typedef struct { char *data; size_t len; CancelCtx *cancel; } Buf;
+typedef struct {
+  char *data;
+  size_t len, cap, limit;
+  CancelCtx *cancel;
+  int failed;                 /* 1 = configured limit, 2 = allocation */
+} Buf;
 
 static int cancel_requested(const CancelCtx *cancel) {
   return cancel && cancel->cb && cancel->cb(cancel->ud);
 }
 
 #ifndef MOTIRIS_NO_FILESYSTEM
+
+#define RESPONSE_MAX_BYTES (16u * 1024u * 1024u)
+#define STREAM_MAX_TOOL_CALLS 256
+#define STREAM_WIRE_OVERHEAD 4u
+
+/* One configurable ceiling applies independently to each receive/aggregate
+ * buffer. It is an allocation ceiling, never a preallocation. */
+static size_t response_limit(void) {
+  const char *s = getenv("MOTIRIS_RESPONSE_MAX_BYTES");
+  if (!s || !*s) return RESPONSE_MAX_BYTES;
+  char *end = NULL;
+  unsigned long value = strtoul(s, &end, 10);
+  if (!end || *end || end == s || !value || value > RESPONSE_MAX_BYTES) {
+    fprintf(stderr,
+            "motiris: invalid MOTIRIS_RESPONSE_MAX_BYTES=%s; using %u\n",
+            s, RESPONSE_MAX_BYTES);
+    return RESPONSE_MAX_BYTES;
+  }
+  return (size_t)value;
+}
+
+static const char *buffer_error(int failed) {
+  if (failed == 1) return "response limit exceeded";
+  if (failed == 2) return "response allocation failed";
+  return "invalid stream response";
+}
+
+static int buf_append(Buf *b, const char *p, size_t n) {
+  if (b->failed) return -1;
+  if (b->len > b->limit || n > b->limit - b->len) {
+    b->failed = 1;
+    return -1;
+  }
+  size_t need = b->len + n + 1;
+  if (need > b->cap) {
+    size_t maximum = b->limit + 1;
+    size_t cap = b->cap ? b->cap : 1024;
+    if (cap > maximum) cap = maximum;
+    while (cap < need) {
+      if (cap > maximum / 2) { cap = maximum; break; }
+      cap *= 2;
+    }
+    if (cap < need) cap = need;
+    char *grown = realloc(b->data, cap);
+    if (!grown) {
+      b->failed = 2;
+      return -1;
+    }
+    b->data = grown;
+    b->cap = cap;
+  }
+  if (n) memcpy(b->data + b->len, p, n);
+  b->len += n;
+  b->data[b->len] = '\0';
+  return 0;
+}
 
 /* libcurl invokes this even while a response is stalled. Returning nonzero
  * aborts the transfer; stream_write_cb also checks on every incoming chunk. */
@@ -50,18 +112,18 @@ typedef struct {
   void (*on_delta)(const char *text, void *ud);
   void *ud;
   CancelCtx *cancel;
-  Buf buf;              /* last complete JSON object (for parsing) */
-  char *line; size_t lcap, llen;   /* line buffer for SSE framing */
-  /* aggregated final message (SSE deltas -> one complete message) */
-  char *content;                    /* concatenated delta.content */
-  cJSON *tool_calls;                /* array of {id,type,function} */
-  cJSON *usage;                     /* last-chunk usage, if provided */
+  Buf line;                       /* one SSE line, including bounded NUL */
+  Buf content;                    /* concatenated delta.content */
+  size_t received, wire_limit;    /* bounded JSON/SSE framing as well */
+  int failed;
+  cJSON *tool_calls;              /* array of {id,type,function} */
+  cJSON *usage;                   /* last-chunk usage, if provided */
 } StreamCtx;
 
 /* parse one "data: {json}" payload: extract delta and aggregate */
-static void stream_handle_data(StreamCtx *s, const char *payload) {
+static int stream_handle_data(StreamCtx *s, const char *payload) {
   cJSON *j = cJSON_Parse(payload);
-  if (!j) return;
+  if (!j) return 0;
   cJSON *use = cJSON_GetObjectItemCaseSensitive(j, "usage");
   if (cJSON_IsObject(use)) {
     cJSON_Delete(s->usage);
@@ -70,16 +132,16 @@ static void stream_handle_data(StreamCtx *s, const char *payload) {
   cJSON *choice = cJSON_GetArrayItem(
       cJSON_GetObjectItemCaseSensitive(j, "choices"), 0);
   cJSON *delta = choice ? cJSON_GetObjectItemCaseSensitive(choice, "delta") : NULL;
-  if (!delta) { cJSON_Delete(j); return; }
+  if (!delta) { cJSON_Delete(j); return 0; }
 
   const char *dc = cJSON_GetStringValue(
       cJSON_GetObjectItemCaseSensitive(delta, "content"));
   if (dc && *dc) {
-    size_t n = strlen(dc);
-    size_t cur = s->content ? strlen(s->content) : 0;
-    s->content = realloc(s->content, cur + n + 1);
-    if (!cur) s->content[0] = '\0';   /* first delta: terminate before strcat */
-    strcat(s->content, dc);
+    if (buf_append(&s->content, dc, strlen(dc))) {
+      s->failed = s->content.failed;
+      cJSON_Delete(j);
+      return -1;
+    }
     if (s->on_delta) s->on_delta(dc, s->ud);
   }
 
@@ -87,10 +149,27 @@ static void stream_handle_data(StreamCtx *s, const char *payload) {
   if (cJSON_IsArray(tcs)) {
     if (!s->tool_calls) s->tool_calls = cJSON_CreateArray();
     for (cJSON *tc = tcs->child; tc; tc = tc->next) {
-      int idx = (int)cJSON_GetNumberValue(
-          cJSON_GetObjectItemCaseSensitive(tc, "index"));
+      cJSON *index = cJSON_GetObjectItemCaseSensitive(tc, "index");
+      double number = cJSON_GetNumberValue(index);
+      if (!cJSON_IsNumber(index) || number != number ||
+          number < 0 || number >= STREAM_MAX_TOOL_CALLS) {
+        s->failed = 3;
+        cJSON_Delete(j);
+        return -1;
+      }
+      int idx = (int)number;
+      if ((double)idx != number) {
+        s->failed = 3;
+        cJSON_Delete(j);
+        return -1;
+      }
       cJSON *slot = cJSON_GetArrayItem(s->tool_calls, idx);
       if (!slot) {
+        if (cJSON_GetArraySize(s->tool_calls) >= STREAM_MAX_TOOL_CALLS) {
+          s->failed = 1;
+          cJSON_Delete(j);
+          return -1;
+        }
         slot = cJSON_CreateObject();
         cJSON *fn = cJSON_CreateObject();
         cJSON_AddItemToObject(fn, "name", cJSON_CreateString(""));
@@ -102,59 +181,84 @@ static void stream_handle_data(StreamCtx *s, const char *payload) {
       cJSON *d_fn = cJSON_GetObjectItemCaseSensitive(tc, "function");
       cJSON *id = cJSON_GetObjectItemCaseSensitive(tc, "id");
       cJSON *slot_fn = cJSON_GetObjectItemCaseSensitive(slot, "function");
-      if (cJSON_IsString(id) && id->valuestring)
-        cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(slot, "id")
-            ? cJSON_GetObjectItemCaseSensitive(slot, "id")
-            : cJSON_AddStringToObject(slot, "id", ""), id->valuestring);
+      if (cJSON_IsString(id) && id->valuestring) {
+        cJSON *current_id = cJSON_GetObjectItemCaseSensitive(slot, "id");
+        if (!current_id) current_id = cJSON_AddStringToObject(slot, "id", "");
+        if (!current_id || !cJSON_SetValuestring(current_id, id->valuestring)) {
+          s->failed = 2;
+          cJSON_Delete(j);
+          return -1;
+        }
+      }
       if (d_fn) {
         cJSON *dn = cJSON_GetObjectItemCaseSensitive(d_fn, "name");
-        if (cJSON_IsString(dn) && dn->valuestring && *dn->valuestring)
-          cJSON_SetValuestring(
-              cJSON_GetObjectItemCaseSensitive(slot_fn, "name"),
-              dn->valuestring);
+        if (cJSON_IsString(dn) && dn->valuestring && *dn->valuestring &&
+            !cJSON_SetValuestring(
+                cJSON_GetObjectItemCaseSensitive(slot_fn, "name"),
+                dn->valuestring)) {
+          s->failed = 2;
+          cJSON_Delete(j);
+          return -1;
+        }
         cJSON *da = cJSON_GetObjectItemCaseSensitive(d_fn, "arguments");
         if (cJSON_IsString(da) && da->valuestring) {
           cJSON *cur = cJSON_GetObjectItemCaseSensitive(slot_fn, "arguments");
           size_t cc = strlen(cur->valuestring), nn = strlen(da->valuestring);
+          if (cc > s->content.limit || nn > s->content.limit - cc) {
+            s->failed = 1;
+            cJSON_Delete(j);
+            return -1;
+          }
           char *merged = malloc(cc + nn + 1);
+          if (!merged) {
+            s->failed = 2;
+            cJSON_Delete(j);
+            return -1;
+          }
           memcpy(merged, cur->valuestring, cc);
           memcpy(merged + cc, da->valuestring, nn + 1);
-          cJSON_SetValuestring(cur, merged);
+          if (!cJSON_SetValuestring(cur, merged)) {
+            free(merged);
+            s->failed = 2;
+            cJSON_Delete(j);
+            return -1;
+          }
           free(merged);
         }
       }
     }
   }
   cJSON_Delete(j);
+  return 0;
 }
 
-static void stream_feed(StreamCtx *s, const char *p, size_t n) {
+static int stream_feed(StreamCtx *s, const char *p, size_t n) {
   for (size_t i = 0; i < n; i++) {
     char c = p[i];
     if (c == '\n') {
-      s->line[s->llen] = '\0';
-      if (!strncmp(s->line, "data:", 5)) {
-        char *payload = s->line + 5;
+      const char *line = s->line.data ? s->line.data : "";
+      if (!strncmp(line, "data:", 5)) {
+        const char *payload = line + 5;
         while (*payload == ' ') payload++;
-        if (strcmp(payload, "[DONE]") && *payload)
-          stream_handle_data(s, payload);
+        if (strcmp(payload, "[DONE]") && *payload &&
+            stream_handle_data(s, payload))
+          return -1;
       }
-      s->llen = 0;
-    } else {
-      if (s->llen + 2 >= s->lcap) { s->lcap = s->lcap ? s->lcap * 2 : 1024; s->line = realloc(s->line, s->lcap); }
-      s->line[s->llen++] = c;
+      s->line.len = 0;
+      if (s->line.data) s->line.data[0] = '\0';
+    } else if (buf_append(&s->line, &c, 1)) {
+      s->failed = s->line.failed;
+      return -1;
     }
   }
+  return 0;
 }
 
 static size_t curl_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
   Buf *b = ud;
+  if ((sz && nm > SIZE_MAX / sz) || cancel_requested(b->cancel)) return 0;
   size_t n = sz * nm;
-  if (cancel_requested(b->cancel)) return 0;
-  b->data = realloc(b->data, b->len + n + 1);
-  memcpy(b->data + b->len, ptr, n);
-  b->len += n;
-  b->data[b->len] = '\0';
+  if (buf_append(b, ptr, n)) return 0;
   return n;
 }
 
@@ -170,7 +274,7 @@ static char *libcurl_send(const char *url, const char *auth,
   if (auth) hdrs = curl_slist_append(hdrs, auth);
 
   CancelCtx cancel = { cancel_cb, cancel_ud };
-  Buf out = { .cancel = &cancel };
+  Buf out = { .cancel = &cancel, .limit = response_limit() };
   curl_easy_setopt(c, CURLOPT_URL, url);
   curl_easy_setopt(c, CURLOPT_POST, 1L);
   curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
@@ -194,6 +298,8 @@ static char *libcurl_send(const char *url, const char *auth,
     if (err) {
       if (cancel_requested(&cancel)) {
         *err = strdup("cancelled");
+      } else if (out.failed) {
+        *err = strdup(buffer_error(out.failed));
       } else {
         size_t n = strlen(curl_easy_strerror(rc)) + 32;
         char *m = malloc(n);
@@ -221,9 +327,15 @@ static char *libcurl_send(const char *url, const char *auth,
 /* curl write-callback adapter: feed raw bytes into the SSE line buffer */
 static size_t stream_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
   StreamCtx *s = ud;
-  if (cancel_requested(s->cancel)) return 0;
-  stream_feed(s, ptr, sz * nm);
-  return sz * nm;
+  if ((sz && nm > SIZE_MAX / sz) || cancel_requested(s->cancel)) return 0;
+  size_t n = sz * nm;
+  if (s->received > s->wire_limit || n > s->wire_limit - s->received) {
+    s->failed = 1;
+    return 0;
+  }
+  s->received += n;
+  if (stream_feed(s, ptr, n)) return 0;
+  return n;
 }
 
 /* streamed variant: SSE chunks -> aggregated message via StreamCtx */
@@ -241,7 +353,12 @@ static char *libcurl_send_stream(const char *url, const char *auth,
   if (auth) hdrs = curl_slist_append(hdrs, auth);
 
   CancelCtx cancel = { cancel_cb, cancel_ud };
-  StreamCtx s = { .on_delta = on_delta, .ud = ud, .cancel = &cancel };
+  size_t limit = response_limit();
+  StreamCtx s = {
+    .on_delta = on_delta, .ud = ud, .cancel = &cancel,
+    .line = { .limit = limit }, .content = { .limit = limit },
+    .wire_limit = limit * STREAM_WIRE_OVERHEAD,
+  };
   curl_easy_setopt(c, CURLOPT_URL, url);
   curl_easy_setopt(c, CURLOPT_POST, 1L);
   curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
@@ -265,6 +382,8 @@ static char *libcurl_send_stream(const char *url, const char *auth,
     if (err) {
       if (cancel_requested(&cancel)) {
         *err = strdup("cancelled");
+      } else if (s.failed) {
+        *err = strdup(buffer_error(s.failed));
       } else {
         size_t n = strlen(curl_easy_strerror(rc)) + 32;
         char *m = malloc(n);
@@ -272,8 +391,8 @@ static char *libcurl_send_stream(const char *url, const char *auth,
         *err = m;
       }
     }
-    free(s.content); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
-    free(s.line);
+    free(s.content.data); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
+    free(s.line.data);
     return NULL;
   }
   if (http != 200) {
@@ -282,8 +401,8 @@ static char *libcurl_send_stream(const char *url, const char *auth,
       snprintf(m, 96, "http status %ld (stream)", http);
       *err = m;
     }
-    free(s.content); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
-    free(s.line);
+    free(s.content.data); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
+    free(s.line.data);
     return NULL;
   }
 
@@ -293,18 +412,20 @@ static char *libcurl_send_stream(const char *url, const char *auth,
   cJSON *choice = cJSON_CreateObject();
   cJSON *msg = cJSON_CreateObject();
   cJSON_AddStringToObject(msg, "role", "assistant");
-  cJSON_AddStringToObject(msg, "content", s.content ? s.content : "");
-  if (s.tool_calls && cJSON_GetArraySize(s.tool_calls) > 0)
+  cJSON_AddStringToObject(msg, "content",
+                          s.content.data ? s.content.data : "");
+  int has_tool_calls = s.tool_calls && cJSON_GetArraySize(s.tool_calls) > 0;
+  if (has_tool_calls)
     cJSON_AddItemToObject(msg, "tool_calls", s.tool_calls);
   else cJSON_Delete(s.tool_calls);
   cJSON_AddItemToObject(choice, "message", msg);
   cJSON_AddItemToObject(choice, "finish_reason",
-      cJSON_CreateString(s.tool_calls ? "tool_calls" : "stop"));
+      cJSON_CreateString(has_tool_calls ? "tool_calls" : "stop"));
   cJSON_AddItemToArray(choices, choice);
   cJSON_AddItemToObject(resp, "choices", choices);
   if (s.usage) cJSON_AddItemToObject(resp, "usage", s.usage);
-  free(s.content);
-  free(s.line);
+  free(s.content.data);
+  free(s.line.data);
   char *printed = cJSON_PrintUnformatted(resp);
   cJSON_Delete(resp);
   return printed;
@@ -316,27 +437,34 @@ static const char *find_curl(void) {
   return (c && *c) ? c : "curl";
 }
 
-static char *read_all(int fd, pid_t pid, CancelCtx *cancel, int *cancelled) {
-  size_t cap = 65536, len = 0;
-  char *buf = malloc(cap);
+static char *read_all(int fd, pid_t pid, CancelCtx *cancel, int *cancelled,
+                      size_t limit, int *failed) {
+  Buf out = { .limit = limit };
+  char chunk[4096];
   for (;;) {
     if (!*cancelled && cancel_requested(cancel)) {
       *cancelled = 1;
       kill(pid, SIGKILL);  /* bounded cancellation; waitpid below reaps it */
     }
-    if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
     struct pollfd pfd = { .fd = fd, .events = POLLIN | POLLHUP };
     int ready = poll(&pfd, 1, 100);
     if (ready < 0 && errno == EINTR) continue;
     if (ready < 0) break;
     if (!ready) continue;
-    ssize_t n = read(fd, buf + len, cap - len - 1);
-    if (n > 0) { len += (size_t)n; continue; }
+    ssize_t n = read(fd, chunk, sizeof chunk);
+    if (n > 0) {
+      if (buf_append(&out, chunk, (size_t)n)) {
+        kill(pid, SIGKILL);
+        break;
+      }
+      continue;
+    }
     if (!n) break;
     if (errno != EINTR) break;
   }
-  buf[len] = '\0';
-  return buf;
+  if (!out.failed && buf_append(&out, "", 0)) kill(pid, SIGKILL);
+  *failed = out.failed;
+  return out.data;
 }
 
 static int write_all(int fd, const char *s) {
@@ -358,10 +486,23 @@ static char *spawn_curl(const char *url, const char *auth,
     return NULL;
   }
   int inpipe[2], outpipe[2];
-  if (pipe(inpipe) || pipe(outpipe)) return NULL;
+  if (pipe(inpipe)) {
+    if (err) *err = strdup("curl pipe setup failed");
+    return NULL;
+  }
+  if (pipe(outpipe)) {
+    close(inpipe[0]); close(inpipe[1]);
+    if (err) *err = strdup("curl pipe setup failed");
+    return NULL;
+  }
 
   pid_t pid = fork();
-  if (pid < 0) return NULL;
+  if (pid < 0) {
+    close(inpipe[0]); close(inpipe[1]);
+    close(outpipe[0]); close(outpipe[1]);
+    if (err) *err = strdup("curl fork failed");
+    return NULL;
+  }
 
   if (pid == 0) { /* child */
     dup2(inpipe[0], 0);
@@ -370,7 +511,7 @@ static char *spawn_curl(const char *url, const char *auth,
     close(outpipe[0]); close(outpipe[1]);
     /* build argv dynamically: no -H auth header when there is no key */
     const char *curl = find_curl();
-    char *argv[16];
+    char *argv[18];
     int ai = 0;
     argv[ai++] = (char *)curl;
     argv[ai++] = "-sS"; argv[ai++] = "-L";
@@ -391,13 +532,20 @@ static char *spawn_curl(const char *url, const char *auth,
   close(inpipe[1]);
 
   int cancelled = 0;
-  char *out = read_all(outpipe[0], pid, &cancel, &cancelled);
+  int read_failed = 0;
+  char *out = read_all(outpipe[0], pid, &cancel, &cancelled,
+                       response_limit(), &read_failed);
   close(outpipe[0]);
 
   int st = 0;
   while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
   if (cancelled || cancel_requested(&cancel)) {
     if (err) *err = strdup("cancelled");
+    free(out);
+    return NULL;
+  }
+  if (read_failed) {
+    if (err) *err = strdup(buffer_error(read_failed));
     free(out);
     return NULL;
   }
