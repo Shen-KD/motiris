@@ -464,7 +464,7 @@ file/memory/shell backend cuts), `vision` (optional local-mock integration and
 clang `-Werror`),
 `tts` (optional fake-engine integration and clang `-Werror`),
 and `sanitizers` (ASAN/UBSAN tools smoke plus leak-enabled memory fault,
-integration and REPL interruption tests). The `no-filesystem` job also
+config-update and REPL interruption tests). The `no-filesystem` job also
 runs `make test-persistence` and a clang `-Werror` build/test for the full-CLI
 host-checkpoint cut.
 `perf` and `compat-matrix` are informational
@@ -492,8 +492,9 @@ container / clang).
    `bash .github/scripts/admin-merge.sh <PR>`
    which re-applies branch protection afterwards.
 5. `git checkout main && git pull --rebase`.
-6. If the merge changes the binary: `make install PREFIX=$HOME`
-   (installs to ~/bin/motiris, the dev machine's live copy).
+6. After every merge to `main`, rebuild from a clean tree and overwrite the
+   dev machine's live copy: `make clean && make install PREFIX="$HOME"`, then
+   verify `"$HOME/bin/motiris" --version`.
 
 Never `git add -A` blindly after a build: it sweeps .o/.a artifacts
 into the index. `.gitignore` covers `*.o`/`*.a` now, but previously
@@ -583,6 +584,12 @@ lives in plugin.c and is shared with toolscan.
   reset does not unlink files. The checkpoint object/marker is absent and the
 selected stub has no `fsync`/`rename` imports; the unrelated memory backend
 may still use its own atomic replacement.
+- Smoke #7: exported env precedence plus `set config` typed scalar updates.
+  The offline integration checks JSON escaping, provider/MCP/extension field
+  preservation, mode 0600, HOME fallback, concurrent readers during atomic
+  rename, invalid/malformed/non-object/oversized input preservation, FIFO
+  rejection without blocking, and cleanup after an actual `RLIMIT_FSIZE`
+  temporary-write failure. No provider or plaintext `api_key` is involved.
 - Smoke #9: gateway health/auth plus partial, byte-segmented, malformed
   and oversized requests. Headers are capped at 16 KiB and bodies at
   1 MiB; the receive allocation is capped at their sum plus one NUL byte.

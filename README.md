@@ -297,6 +297,28 @@ Optional host-only REPL speech output (only with `TTS_TOOLS=1`):
   processes. This is REPL-only, not STT, streaming/full-duplex audio, local
   neural inference, gateway audio, or MCU/RTOS support.
 
+Edit scalar JSON config without a text editor:
+
+```sh
+motiris set config model glm-5.3
+motiris set config stream false       # JSON boolean, not a string
+motiris set config max_steps 20       # JSON integer
+motiris set config api_key_env MOTIRIS_API_KEY
+```
+
+The command updates `$MOTIRIS_HOME/config.json` (default
+`~/.motiris/config.json`) without starting an agent or contacting a provider.
+String keys are `model`, `base_url`, `api_key_env`, `transport`, `system`,
+`plugin_dir`, `shell_allow` and `shell_deny`; boolean keys are `stream`,
+`tools`, `plugins` and `goal_check` (`true`/`false`). `max_steps` must be a
+positive integer. Other fields, including `providers`, `mcp_servers` and
+extension fields, are preserved. Writes use a complete mode-0600 temporary
+file plus `fsync` and atomic rename. Empty, malformed, non-object, oversized
+or non-regular input is rejected without resetting the original; invalid
+keys/values and failed writes also leave it unchanged. Values are not printed.
+There is deliberately no plaintext `api_key` key: store secrets separately
+in the mode-0600 env file and reference them with `api_key_env`.
+
 MCP servers (`"mcp_servers": [{"name","cmd","args":[]}]` in config.json)
 register each remote tool as `<server>:<tool>`; `tools/call` is bridged
 over stdio JSON-RPC.

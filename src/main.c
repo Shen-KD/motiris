@@ -33,6 +33,7 @@ static void usage(FILE *f) {
 "      --stream          stream tokens as they arrive (once-run mode)\n"
 "      --version         print version and exit\n"
 "      --init            write $HOME/.motiris/{env,config.json} templates\n"
+"  set config KEY VALUE  atomically update one scalar config.json value\n"
 "      --sessions [TERM] list session logs (grep TERM if given)\n"
 "      --cron [FILE]     run scheduled jobs (JSON array); --once = run\n"
 "                        due jobs once and exit\n"
@@ -88,6 +89,14 @@ int main(int argc, char **argv) {
   int interactive = 0, stream = 0, gateway_mode = 0, goal_check = 0;
   int cron_mode = 0, cron_once = 0;
   const char *cron_file = NULL;
+
+  /* Configuration editing is deliberately independent of agent/env startup. */
+  if (argc > 1 && !strcmp(argv[1], "set")) {
+    if (argc == 5 && !strcmp(argv[2], "config"))
+      return motiris_set_config(argv[3], argv[4]) ? 2 : 0;
+    fprintf(stderr, "usage: motiris set config KEY VALUE\n");
+    return 2;
+  }
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
