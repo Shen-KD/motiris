@@ -158,6 +158,65 @@ Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
 No MCU/RTOS cross-toolchain, target Flash/RAM or hardware validation is
 available; none of these host numbers is an MCU support claim.
 
+### Bounded MCP stdio I/O
+
+`MOTIRIS_MCP_TIMEOUT_S` selects a 1..120-second request budget (default 10);
+invalid values reject that MCP server before `fork`. Each initialize,
+tools/list, tools/call and initialized-notification write gets one absolute
+`CLOCK_MONOTONIC` deadline. Nonblocking `poll` covers partial writes, read
+read-ahead, `EINTR` and early EOF without resetting that budget. Request and
+response lines retain at most 1 MiB plus a private NUL. A blocked request write
+and a silent response read have distinct bounded diagnostics. SIGPIPE is
+ignored only around the single-threaded pipe write and restored afterward.
+
+A fatal request failure closes both fds and marks the connection failed. The
+small connection object remains alive for registered tool userdata, so later
+calls free their argument tree and return the existing error immediately
+without use-after-free or another wait. `mcp_request` takes ownership of
+`params` on every path. The server calls `setsid`; cleanup signals the process
+group before reaping its leader, allows one second of TERM grace, then sends
+KILL and reaps the direct child. If the leader exits first, the group still
+receives KILL so surviving descendants cannot escape cleanup. The terminal
+post-KILL `waitpid` follows the existing shell/TTS reap contract: a task stuck
+in an uninterruptible kernel wait is outside the userspace deadline guarantee.
+
+Each configured server owns one fixed 4 KiB read-ahead array, a 192-byte
+error buffer and fixed poll/deadline/process state. Dynamic request/response
+lines are separately capped at 1 MiB; cJSON parsing/serialization creates
+phase-wise copies derived from those caps. There is no request queue,
+background thread, event library or idle polling. These allocations and POSIX
+pipe/process operations remain in `src/harness/mcp.c`, outside the strict-C11
+core-only probe; no new runtime or direct ELF dependency was added.
+
+`tests/mcp.py` runs in smoke #13 and under the existing ASAN/UBSAN tools job.
+It covers three initialize timeouts in one CLI, silent tools/list and
+tools/call, an exactly-1-MiB request whose newline cannot fit a full pipe,
+response overflow, deterministic EPIPE/SIGPIPE, TERM-ignoring direct children,
+a TERM-ignoring descendant whose leader exits first, failed-connection retry,
+and invalid configuration. The servers sample their motiris parent's live
+`/proc` fd/RSS state at each repeated start and the test checks every direct
+child/descendant is gone. The write test requires the explicit write-timeout
+diagnostic, so a read-only timeout implementation cannot produce a false pass.
+
+Reference host measurements on 2026-11-17 (Linux x86_64, gcc `-O2`/harness
+`-Os`, stripped; baseline `00bf5d3`) are:
+
+| Build / measurement | Baseline | MCP deadline branch | Relative result |
+| --- | ---: | ---: | --- |
+| Default full CLI | 178,432 bytes | 182,528 bytes | +4,096 bytes |
+| ELF text / data / BSS | 166,496 / 3,048 / 169,040 | 169,962 / 3,056 / 169,040 | +3,466 / +8 / +0 bytes |
+| Strict core-only nofs probe | 69,840 bytes; text 49,715; data 952; BSS 4,232 | 69,840 bytes; identical sections | unchanged; MCP harness absent |
+| `tests/perf.sh` cold peak RSS | 9,184 KiB | 9,288 KiB | +104 KiB; both 50 ms, host variation |
+| `tests/perf.sh` 5-step loop peak RSS | 9,372 KiB | 9,280 KiB | -92 KiB; 50 -> 100 ms, below 3 s guard |
+| Three repeated initialize failures | fd/RSS sampled per server | fd 5 / 5 / 5; RSS 8,632 / 8,696 / 8,696 KiB | stable fds; +64 KiB then flat RSS |
+| Full MCP failure-path integration | not present | 27,112 KiB max direct-child RSS | Python test driver high-water mark, including 1 MiB request/provider cases |
+
+Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
+These are host application bounds and measurements, not total libcurl/libc
+RSS guarantees or MCU Flash/RAM headroom. Browser/subagent waits are separate
+remaining work. No MCU/RTOS cross-toolchain or hardware validation was
+performed.
+
 ### Bounded Gateway connection I/O
 
 `src/harness/gateway.c` keeps the sequential, single-threaded accept loop but

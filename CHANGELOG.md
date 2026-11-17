@@ -96,6 +96,14 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- MCP stdio initialize/list/call and notification writes now share bounded
+  monotonic request deadlines (`MOTIRIS_MCP_TIMEOUT_S`, default 10 s, range
+  1..120). Nonblocking `poll` handles partial I/O and early server exit;
+  oversized lines and JSON-RPC/transport failures return bounded diagnostics.
+  Fatal failures close the connection without repeated waiting, while process
+  cleanup uses a process-group TERM, one-second grace, KILL and direct-child
+  reap. Offline tests cover silent initialization/list/call, blocked large
+  writes, response caps, SIGPIPE, repeated cleanup and invalid configuration.
 - `web_search` validates every DDG row delimiter before pointer arithmetic or
   copying. Malformed/truncated rows are skipped without NULL arithmetic or
   out-of-bounds reads; normal titles and bounded 511/200-byte field prefixes
