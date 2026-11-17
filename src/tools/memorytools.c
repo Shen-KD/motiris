@@ -89,7 +89,9 @@ static cJSON *load_memory(const char **error) {
   char *path = memory_path(0, error);
   if (!path) return NULL;
 
-  int fd = open(path, O_RDONLY | O_NOFOLLOW);
+  /* O_NONBLOCK prevents FIFOs and other non-regular files from hanging in
+   * open before fstat can reject them. It has no effect on regular files. */
+  int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   int open_errno = errno;
   free(path);
   if (fd < 0) {

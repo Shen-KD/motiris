@@ -55,8 +55,12 @@ def main():
                             server.server_address[1],
             }))
             memory = home / ".local/share/motiris/memory.json"
+            time_binary = ("/usr/bin/time"
+                           if os.path.isfile("/usr/bin/time") and
+                           os.access("/usr/bin/time", os.X_OK) else None)
 
-            def invoke(name, arguments, file_limit=False, measure=False):
+            def invoke(name, arguments, file_limit=False, measure=False,
+                       timeout=30):
                 ACTIONS.append((name, arguments))
                 env = os.environ.copy()
                 for key in list(env):
@@ -66,8 +70,8 @@ def main():
                 command = [str(ROOT / "motiris"), "-p", "memory", "-k", "x",
                            "--max-steps", "3", "--no-plugin"]
                 timing = base / "timing"
-                if measure:
-                    command = ["/usr/bin/time", "-f", "%M", "-o", str(timing)] + command
+                if measure and time_binary:
+                    command = [time_binary, "-f", "%M", "-o", str(timing)] + command
 
                 def limits():
                     if file_limit:
@@ -75,15 +79,17 @@ def main():
                         resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
 
                 proc = subprocess.run(
-                    command, env=env, text=True, capture_output=True, timeout=30,
-                    preexec_fn=limits if file_limit else None)
+                    command, env=env, text=True, capture_output=True,
+                    timeout=timeout, preexec_fn=limits if file_limit else None)
                 assert proc.returncode == 0, (proc.stdout, proc.stderr)
                 lines = proc.stdout.strip().splitlines()
                 assert lines, (proc.stdout, proc.stderr)
                 result = json.loads(lines[-1])
-                if measure:
+                if measure and time_binary:
                     print("memory: maximum-value integration peak RSS = %s KiB" %
                           timing.read_text().strip())
+                elif measure:
+                    print("memory: peak RSS skipped (/usr/bin/time unavailable)")
                 return result
 
             assert invoke("memory_get", {}) == {"keys": {}}
@@ -104,6 +110,16 @@ def main():
                 assert "error" in invoke("memory_set", {"key": "new", "value": "v"})
                 assert memory.read_bytes() == invalid
 
+            # A FIFO must be rejected by fstat, not hang in open while waiting
+            # for a writer. Keep the subprocess timeout as a regression guard.
+            memory.unlink()
+            os.mkfifo(memory)
+            assert "error" in invoke("memory_get", {}, timeout=10)
+            assert "error" in invoke(
+                "memory_set", {"key": "new", "value": "v"}, timeout=10)
+            assert memory.is_fifo()
+            memory.unlink()
+
             original = b'{"important":"keep"}'
             memory.write_bytes(original)
             result = invoke("memory_set", {"key": "new", "value": "v"},
@@ -117,7 +133,7 @@ def main():
                           measure=True) == {"ok": "stored"}
             assert invoke("memory_get", {"key": "maximum"}) == {"value": maximum}
             assert memory.stat().st_size <= 1024 * 1024
-            print("memory: offline round-trip, corruption preservation, write failure and bounds passed")
+            print("memory: round-trip, corruption/nonregular preservation, write failure, RAM and bounds passed")
     finally:
         server.shutdown()
         server.server_close()
