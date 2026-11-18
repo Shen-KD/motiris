@@ -195,9 +195,16 @@ turn fails before any provider request. Restore applies the live limits before
 reporting the number of retained messages.
 
 Configured `providers` are used for every list length, including a singleton;
-each entry selects its own model, endpoint and key before any fallback. REPL
-streaming prints a final answer once: the agent suppresses the aggregated copy
-only when the selected backend actually delivered text deltas, while buffered,
+each entry selects its own model, endpoint and key before any fallback. An
+entry whose `api_key_env` is omitted or unresolved is explicitly keyless and
+never inherits the default Agent/`MOTIRIS_API_KEY` credential; that default is
+used only when no provider list is configured. The fixed 512-byte
+`Authorization` header buffer holds at most 489 key bytes plus the Bearer
+prefix and NUL. Longer keys fail with a bounded error before any network I/O
+instead of silently sending an unauthenticated request.
+
+REPL streaming prints a final answer once: the agent suppresses the aggregated
+copy only when the selected backend actually delivered text deltas, while buffered,
 echo and spawned-curl fallback still print their final message. Goal-check
 confirmation deltas are staged silently so a streamed `DONE` is not exposed.
 If a provider fails after emitting text, the run returns the error instead of

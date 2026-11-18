@@ -46,7 +46,7 @@ typedef struct MotirisProvider {
   const char *name;
   const char *model;
   const char *base_url;
-  const char *api_key;   /* resolved key, or NULL for keyless */
+  const char *api_key;   /* NULL is keyless; never inherits the Agent key */
 } MotirisProvider;
 void motiris_add_provider(MotirisAgent *a, const MotirisProvider *p); /* copied */
 int  motiris_provider_count(MotirisAgent *a);

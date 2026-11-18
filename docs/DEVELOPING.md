@@ -104,7 +104,16 @@ own HAL/RTOS backends and measured RAM/Flash budget.
 
 Every nonempty configured provider list, including a singleton, selects the
 entry's model/base_url/key in declaration order. The default provider is used
-only when the list is empty. A per-attempt forwarding callback records whether
+only when the list is empty. An omitted or unresolved entry `api_key_env`
+resolves to NULL and is explicitly keyless: it never inherits the Agent or
+`MOTIRIS_API_KEY` default credential. Authentication uses the existing fixed
+512-byte stack buffer (22-byte `Authorization: Bearer ` prefix, at most 489
+key bytes and a NUL), with no header allocation. The complete selected
+provider chain is preflighted before any request; an overlong key returns
+`authorization header too long` before network I/O and is never logged or
+silently replaced with an unauthenticated request.
+
+A per-attempt forwarding callback records whether
 a streaming backend actually emitted nonempty text deltas. The agent suppresses
 its aggregated final print only for that case; echo, spawned-curl and other
 buffered fallback paths retain their one final print. Goal-check confirmation
@@ -137,9 +146,14 @@ remain outside the strict-C11 nofs probe; its echo path does not read this
 setting. An RTOS/HAL network backend and target-specific smaller budgets still
 need real platform validation.
 
-`tests/provider.py` verifies 1/2/8-entry routing, model/key selection and
-fallback. `tests/transport.py` covers buffered, SSE wire/line/content/tool
-arguments, spawned curl, an exact-size body and echo. `tests/repl_cancel.py`
+`tests/provider.py` verifies 1/2/8-entry routing, independent and keyless
+entries, omitted/missing key environments, mixed-chain credential isolation,
+default-provider authentication, real fallback order, exactly zero/one
+Authorization headers per request, and default/entry 489/490-byte boundaries.
+A later overlong entry rejects the whole chain before an earlier healthy
+provider can perform I/O, without leaking the key. `tests/transport.py`
+covers buffered, SSE wire/line/content/tool arguments, spawned curl, an
+exact-size body and echo. `tests/repl_cancel.py`
 also asserts one rendered copy of a successful streamed follow-up.
 `tests/render.py` covers streamed goal-check `DONE`, fail-after-delta fallback
 suppression, and stream-enabled echo/spawned-curl REPL rendering. All run in
@@ -156,7 +170,19 @@ Reference host measurements on 2026-11-17 (Linux x86_64, gcc `-O2`/component
 | 16 MiB buffered response rejected at cap | 28,232 KiB peak CLI RSS | GNU `time`; local provider, raw response slightly over cap; not an MCU budget |
 | Strict core-only nofs probe | 69,840 bytes unstripped; text 49,715; data 952; BSS 4,232 | libc only; host receive-limit code compiled out |
 
-Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
+Keyless/auth-preflight reference measurements on 2026-11-18 (Linux x86_64,
+gcc `-O2`/component `-Os`, stripped except the core probe; baseline `235a4de`)
+are:
+
+| Build / measurement | Bytes / sections / RSS | Relative result |
+| --- | ---: | --- |
+| Default full CLI | 186,624 bytes; text 174,882; data 3,048; BSS 169,040 | +0 file; +128 text; data/BSS unchanged |
+| Strict core-only nofs probe | 69,840 bytes unstripped; text 50,115; data 952; BSS 4,232 | +0 file; +400 text; data/BSS unchanged; libc only |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,180 / 8,972 KiB | baseline 9,088 / 9,072 KiB; both 50 ms before/after; host variation, guards pass |
+
+Authentication still uses one fixed 512-byte stack buffer per provider attempt;
+preflight adds no retained allocation, Agent state, thread or idle work. Default
+direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
 No MCU/RTOS cross-toolchain, target Flash/RAM or hardware validation is
 available; none of these host numbers is an MCU support claim.
 

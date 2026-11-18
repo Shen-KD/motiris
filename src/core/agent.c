@@ -20,6 +20,9 @@
  * an allocation ceiling, not a preallocation; MCU embedders can set it lower. */
 #define HISTORY_MAX_BYTES (16 * 1024 * 1024)
 #define DEF_BASE_URL "https://api.openai.com/v1/chat/completions"
+#define AUTH_HEADER_SIZE 512
+#define AUTH_HEADER_PREFIX "Authorization: Bearer "
+#define AUTH_MAX_KEY_BYTES (AUTH_HEADER_SIZE - sizeof(AUTH_HEADER_PREFIX))
 
 struct MotirisAgent {
   char *model;
@@ -616,9 +619,19 @@ int motiris_run(MotirisAgent *a) {
   long start_tok_in = a->tok_in, start_tok_out = a->tok_out;
   if (run_cancelled(a)) return cancel_run(a, run_tail, start_tok_in, start_tok_out);
   const char *env_key = getenv("MOTIRIS_API_KEY");
-  const char *fallback_key = a->api_key ? a->api_key : (env_key ? env_key : NULL);
+  const char *default_key = a->api_key ? a->api_key : (env_key ? env_key : NULL);
   int np = a->nproviders > 0 ? a->nproviders : 1;
   int confirm_asked = 0;   /* goal-check: one confirmation round, per run */
+
+  /* Reject the whole invalid chain before any provider can perform I/O. */
+  for (int pi = 0; pi < np; pi++) {
+    const char *key = a->nproviders > 0
+        ? a->providers[pi].api_key : default_key;
+    if (key && strlen(key) > AUTH_MAX_KEY_BYTES) {
+      set_error(a, "authorization header too long", NULL);
+      return 1;
+    }
+  }
 
   for (int step = 0; step < a->max_steps; step++) {
     if (run_cancelled(a)) return cancel_run(a, run_tail, start_tok_in, start_tok_out);
@@ -632,12 +645,12 @@ int motiris_run(MotirisAgent *a) {
       if (a->nproviders > 0) {
         model = a->providers[pi].model;
         url = a->providers[pi].base_url;
-        key = a->providers[pi].api_key
-            ? a->providers[pi].api_key : fallback_key;
+        /* A NULL entry key is explicitly keyless: never inherit the default. */
+        key = a->providers[pi].api_key;
       } else {
         model = a->model;
         url = a->base_url;
-        key = fallback_key;
+        key = default_key;
       }
       if (a->verbose)
         fprintf(stderr, "[motiris] step %d: %s via %s\n", step + 1, model,
@@ -646,12 +659,18 @@ int motiris_run(MotirisAgent *a) {
       char *body = build_request(a, model);
       if (!body) return 1;
 
-      char auth[512];
+      char auth[AUTH_HEADER_SIZE];
       char *authp = NULL;
       if (key) {
-        size_t n = snprintf(auth, sizeof auth,
-                            "Authorization: Bearer %s", key);
-        if (n < sizeof auth) authp = auth;
+        int n = snprintf(auth, sizeof auth, AUTH_HEADER_PREFIX "%s", key);
+        if (n < 0 || (size_t)n >= sizeof auth) {
+          free(body);
+          free(last_err);
+          set_error(a, n < 0 ? "cannot construct authorization header"
+                             : "authorization header too long", NULL);
+          return 1;
+        }
+        authp = auth;
       }
 
       char *err = NULL;
