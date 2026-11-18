@@ -488,6 +488,7 @@ static McpConn *mcp_connect(const char *name, const char *cmd,
 
 int motiris_register_mcp_server(MotirisAgent *a, const char *name,
                                 const char *cmd, const char *const *args) {
+  if (!motiris_tools_enabled(a)) return 0;
   McpConn *conn = mcp_connect(name, cmd, args);
   if (!conn) {
     fprintf(stderr, "motiris mcp: cannot start %s (%s)\n", name, cmd);

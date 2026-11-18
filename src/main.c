@@ -4,9 +4,11 @@
  */
 #include "motiris.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static void usage(FILE *f) {
@@ -22,7 +24,7 @@ static void usage(FILE *f) {
 "  -s, --system TEXT     system prompt\n"
 "  -S, --skill-dir DIR   read *.md files here, inject as system prompt\n"
 "  -p, --prompt TEXT     user prompt (default: read stdin)\n"
-"      --no-tools        do not register built-in tools\n"
+"      --no-tools        disable all tools and tool backend initialization\n"
 "      --transport NAME  curl (default) | echo (offline test)\n"
 "      --max-steps N     agent loop bound (default 10)\n"
 "      --goal-check      confirm the goal is met (one extra round)\n"
@@ -59,23 +61,87 @@ static char *read_stdin(void) {
   return buf;
 }
 
-/* read all *.md files from a directory into one system prompt */
-static char *load_skill_dir(const char *dir) {
-  char cmd[1024];
-  snprintf(cmd, sizeof cmd,
-           "for f in %s/*.md; do [ -f \"$f\" ] && { echo \"# $f\"; "
-           "cat \"$f\"; echo; }; done", dir);
-  FILE *p = popen(cmd, "r");
-  if (!p) return NULL;
-  size_t cap = 8192, len = 0;
-  char *buf = malloc(cap);
-  size_t n;
-  while ((n = fread(buf + len, 1, cap - len - 1, p)) > 0) {
-    len += n;
-    if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+/* Text-only --no-tools skill injection: bounded direct file I/O, no shell. */
+#define SKILL_TEXT_MAX_FILES 128
+#define SKILL_TEXT_MAX_ENTRIES 4096
+#define SKILL_TEXT_MAX_BYTES (1024 * 1024)
+
+static int skill_text_append(char **buf, size_t *len, size_t *cap,
+                             const char *text, size_t n) {
+  if (*len >= SKILL_TEXT_MAX_BYTES ||
+      n > SKILL_TEXT_MAX_BYTES - *len - 1)
+    return -1;
+  size_t needed = *len + n + 1;
+  if (needed > *cap) {
+    size_t next = *cap;
+    while (next < needed) {
+      if (next > SKILL_TEXT_MAX_BYTES / 2) {
+        next = SKILL_TEXT_MAX_BYTES + 1;
+        break;
+      }
+      next *= 2;
+    }
+    char *grown = realloc(*buf, next);
+    if (!grown) return -1;
+    *buf = grown;
+    *cap = next;
   }
-  buf[len] = '\0';
-  pclose(p);
+  memcpy(*buf + *len, text, n);
+  *len += n;
+  (*buf)[*len] = '\0';
+  return 0;
+}
+
+static char *load_skill_dir(const char *dir) {
+  if (!dir || !*dir || strlen(dir) > 4096) return NULL;
+  DIR *d = opendir(dir);
+  if (!d) return NULL;
+  size_t cap = 8192, len = 0, count = 0, entries = 0;
+  char *buf = malloc(cap);
+  if (!buf) { closedir(d); return NULL; }
+  buf[0] = '\0';
+
+  struct dirent *e;
+  while (count < SKILL_TEXT_MAX_FILES && entries < SKILL_TEXT_MAX_ENTRIES &&
+         (e = readdir(d)) != NULL) {
+    entries++;
+    size_t name_len = strlen(e->d_name);
+    if (e->d_name[0] == '.' || name_len < 4 ||
+        strcmp(e->d_name + name_len - 3, ".md"))
+      continue;
+    size_t path_size = strlen(dir) + name_len + 2;
+    char *path = malloc(path_size);
+    if (!path) break;
+    snprintf(path, path_size, "%s/%s", dir, e->d_name);
+    struct stat st;
+    if (stat(path, &st) || !S_ISREG(st.st_mode)) {
+      free(path);
+      continue;
+    }
+    FILE *f = fopen(path, "r");
+    if (!f) { free(path); continue; }
+
+    size_t saved = len;
+    int failed = skill_text_append(&buf, &len, &cap, "# ", 2) ||
+                 skill_text_append(&buf, &len, &cap, path, strlen(path)) ||
+                 skill_text_append(&buf, &len, &cap, "\n", 1);
+    char chunk[8192];
+    size_t n;
+    while (!failed && (n = fread(chunk, 1, sizeof chunk, f)) > 0)
+      failed = skill_text_append(&buf, &len, &cap, chunk, n) != 0;
+    if (ferror(f)) failed = 1;
+    if (!failed)
+      failed = skill_text_append(&buf, &len, &cap, "\n", 1) != 0;
+    fclose(f);
+    free(path);
+    if (failed) {
+      len = saved;
+      buf[len] = '\0';
+      break;
+    }
+    count++;
+  }
+  closedir(d);
   return buf;
 }
 
@@ -220,11 +286,14 @@ int main(int argc, char **argv) {
       snprintf(def, sizeof def, "%s/.config/motiris/cron.json", h);
       file = def;
     }
-    return motiris_cron_run(file, cron_once, verbose) ? 1 : 0;
+    return motiris_cron_run_with_tools(file, cron_once, verbose,
+                                       !no_tools) ? 1 : 0;
   }
 
   MotirisAgent *ag = motiris_new();
-  motiris_apply_config(ag);   /* config.json defaults (CLI flags win below) */
+  /* Apply the CLI execution-policy override before config can initialize MCP. */
+  if (no_tools) motiris_set_tools_enabled(ag, 0);
+  motiris_apply_config(ag);   /* config.json defaults; CLI overrides win */
   if (model) motiris_set_model(ag, model);
   if (base_url) motiris_set_base_url(ag, base_url);
   if (key) motiris_set_api_key(ag, key);
@@ -234,10 +303,10 @@ int main(int argc, char **argv) {
   if (goal_check) motiris_set_goal_check(ag, 1);
   motiris_set_verbose(ag, verbose);
   if (stream) motiris_set_stream(ag, 1);
-  if (no_tools) motiris_set_tools_enabled(ag, 0);
   if (no_plugin) motiris_set_plugins_enabled(ag, 0);
   if (plugin_dir) motiris_set_plugin_dir(ag, plugin_dir);
-  motiris_tool_scan(plugin_dir);   /* index <dir>/<name>/<name>.json schemas first */
+  if (motiris_tools_enabled(ag))
+    motiris_tool_scan(plugin_dir); /* index <dir>/<name>/<name>.json schemas */
   motiris_register_core_tools(ag);
   if (motiris_tools_enabled(ag)) {
     motiris_register_file_tools(ag);

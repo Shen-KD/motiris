@@ -120,8 +120,10 @@ static int jbool(const cJSON *o, const char *key, int dflt) {
   return v ? cJSON_IsTrue(v) : dflt;
 }
 
-/* apply ~/.motiris/config.json defaults onto an agent (CLI overrides later) */
+/* Apply config defaults without overriding a pre-disabled tools policy.
+ * CLI/embedders can disable tools before this call to suppress MCP startup. */
 void motiris_apply_config(MotirisAgent *a) {
+  int tools_forced_off = !motiris_tools_enabled(a);
   char *d = config_dir();
   size_t n = strlen(d) + 32;
   char *p = malloc(n);
@@ -157,7 +159,7 @@ void motiris_apply_config(MotirisAgent *a) {
         cJSON_GetObjectItemCaseSensitive(j, "max_steps")));
   if (cJSON_GetObjectItemCaseSensitive(j, "stream"))
     motiris_set_stream(a, jbool(j, "stream", 0));
-  if (cJSON_GetObjectItemCaseSensitive(j, "tools"))
+  if (!tools_forced_off && cJSON_GetObjectItemCaseSensitive(j, "tools"))
     motiris_set_tools_enabled(a, jbool(j, "tools", 1));
   if (cJSON_GetObjectItemCaseSensitive(j, "plugins"))
     motiris_set_plugins_enabled(a, jbool(j, "plugins", 1));
@@ -169,7 +171,7 @@ void motiris_apply_config(MotirisAgent *a) {
 
   /* MCP servers: [{name, cmd, args: []}] -> register remote tools */
   cJSON *mcps = cJSON_GetObjectItemCaseSensitive(j, "mcp_servers");
-  if (cJSON_IsArray(mcps)) {
+  if (motiris_tools_enabled(a) && cJSON_IsArray(mcps)) {
     cJSON *srv;
     cJSON_ArrayForEach(srv, mcps) {
       const char *nm = jstr(srv, "name");

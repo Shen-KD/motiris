@@ -96,6 +96,16 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- `--no-tools` now fails closed across CLI, cron, Gateway, direct C API and
+  real subagents: configured Plugin/MCP initialization, Skill tools, provider
+  tool schemas and dispatch are all suppressed even when config says
+  `tools:true` or a tool was registered before disabling. Text-only Skill
+  injection no longer invokes a shell and has entry/file/byte bounds. Gateway
+  and optional TTS terminal-reply selection no longer loops on empty/missing
+  content, reuses older/intermediate replies, or exposes goal-check `DONE`
+  after tool-mediated confirmation. The new const `motiris_turn_start`
+  accessor provides the per-run boundary; cron retains its original API and
+  adds a CLI-policy variant.
 - Successful turns with provider assistant metadata (`refusal`, `annotations`
   and other extensions) now save and resume through a canonical
   `role`/`content`/`tool_calls` representation with strict tool-call/function

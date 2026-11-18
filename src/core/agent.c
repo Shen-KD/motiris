@@ -406,7 +406,7 @@ void motiris_add_user(MotirisAgent *a, const char *msg) {
 }
 
 void motiris_register_tool(MotirisAgent *a, const MotirisTool *t) {
-  if (!t || !t->name || a->ntools >= MAX_TOOLS) return;
+  if (!a || !a->tools_on || !t || !t->name || a->ntools >= MAX_TOOLS) return;
   a->tools[a->ntools++] = *t;
   /* external per-tool schema (toolscan.c) replaces the embedded one */
   const char *ext = motiris_tool_schema(t->name);
@@ -425,6 +425,9 @@ void motiris_unregister_tool(MotirisAgent *a, const char *name) {
 }
 
 cJSON *motiris_messages(MotirisAgent *a) { return a->messages; }
+const cJSON *motiris_turn_start(MotirisAgent *a) {
+  return a ? a->run_start : NULL;
+}
 
 static const MotirisTool *find_tool(MotirisAgent *a, const char *name) {
   for (int i = 0; i < a->ntools; i++)
@@ -542,8 +545,8 @@ static char *build_request(MotirisAgent *a, const char *model) {
     cJSON_AddItemToArray(msgs, cJSON_Duplicate(m, 1));
   cJSON_AddItemToObject(req, "messages", msgs);
 
-  /* tools: only when registered */
-  if (a->ntools > 0) {
+  /* A pre-registered registry must not bypass a later disabled policy. */
+  if (a->tools_on && a->ntools > 0) {
     cJSON *tools = cJSON_CreateArray();
     for (int i = 0; i < a->ntools; i++) {
       const MotirisTool *t = &a->tools[i];
@@ -839,7 +842,7 @@ int motiris_run(MotirisAgent *a) {
             cJSON_GetObjectItemCaseSensitive(tc, "id"));
         if (!name) continue;
 
-        const MotirisTool *t = find_tool(a, name);
+        const MotirisTool *t = a->tools_on ? find_tool(a, name) : NULL;
         char *result;
         if (!t) {
           result = string_result("error: unknown tool (not registered)");

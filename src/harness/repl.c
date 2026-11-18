@@ -373,33 +373,37 @@ static int tts_done_reply(const char *s) {
   return 1;
 }
 
-static int tts_goal_ack(cJSON *message, const char *content) {
-  if (!tts_done_reply(content)) return 0;
-  cJSON *previous = message ? message->prev : NULL;
+static int tts_goal_prompt(const cJSON *message) {
   const char *role = cJSON_GetStringValue(
-      cJSON_GetObjectItemCaseSensitive(previous, "role"));
+      cJSON_GetObjectItemCaseSensitive(message, "role"));
   const char *prompt = cJSON_GetStringValue(
-      cJSON_GetObjectItemCaseSensitive(previous, "content"));
+      cJSON_GetObjectItemCaseSensitive(message, "content"));
   return role && !strcmp(role, "user") && prompt
       && !strncmp(prompt, "Goal check: <", 13);
 }
 
 static void tts_new_reply(MotirisAgent *a) {
   if (!motiris_tts_enabled()) return;
-  cJSON *messages = motiris_messages(a);
-  cJSON *m = messages ? messages->child : NULL;
-  if (m) while (m->next) m = m->next;
+  const cJSON *start = motiris_turn_start(a);
   const char *speech = NULL;
-  for (; m; m = m->prev) {
+  int goal_confirm = 0;
+  /* Restrict selection to this run; user-controlled goal-like text is not a
+   * synthetic boundary. Never traverse cJSON's circular prev links. */
+  for (const cJSON *m = start; m; m = m->next) {
+    if (m != start && tts_goal_prompt(m)) goal_confirm = 1;
     const char *role = cJSON_GetStringValue(
         cJSON_GetObjectItemCaseSensitive(m, "role"));
     const char *content = cJSON_GetStringValue(
         cJSON_GetObjectItemCaseSensitive(m, "content"));
-    if (!role || strcmp(role, "assistant") || !content || !*content) continue;
-    /* With goal-check, retain the real answer instead of the later DONE. */
-    if (tts_goal_ack(m, content)) continue;
-    speech = content;
-    break;  /* newest final reply; also avoids cJSON's circular first->prev */
+    if (role && !strcmp(role, "assistant")) {
+      cJSON *calls = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+      int confirmation_call = goal_confirm && cJSON_IsArray(calls) &&
+                              cJSON_GetArraySize(calls) > 0;
+      int synthetic_done = goal_confirm && content && tts_done_reply(content);
+      /* Confirmation tools/DONE do not replace the real pre-goal answer. */
+      if (!confirmation_call && !synthetic_done)
+        speech = content && *content ? content : NULL;
+    }
   }
   if (!speech) return;
 

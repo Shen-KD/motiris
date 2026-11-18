@@ -119,7 +119,7 @@ static const MotirisTool skill_tools[] = {
 };
 
 void motiris_register_skill_tools(MotirisAgent *a, const char *dir) {
-  if (!dir || !*dir) return;
+  if (!motiris_tools_enabled(a) || !dir || !*dir) return;
 
   free(skill_dir);
   skill_dir = strdup(dir);
