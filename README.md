@@ -22,6 +22,15 @@ dependencies** (no Node, no Python, no database, no web server), and the
 agent process stays idle-quiet between requests.
 `Model + Harness = Agent` — but the harness weighs nothing.
 
+CLI, cron and Gateway apply `--no-tools` before reading configured MCP
+servers, so `tools:true` cannot re-enable a CLI-disabled Agent or start a
+child backend. Registration, provider schema assembly and dispatch also check
+the per-Agent policy independently. Embedders that need the same override
+should call `motiris_set_tools_enabled(agent, 0)` before
+`motiris_apply_config()`. A real `subagent` child receives both `--no-tools`
+and `--no-plugin`, and therefore does not inherit configured Plugin/MCP side
+effects.
+
 ## Features
 
 - **Agent loop with tool calling** — OpenAI-compatible chat completions:
@@ -31,7 +40,9 @@ agent process stays idle-quiet between requests.
   goal (the first user message) is fully met: it replies `DONE` to
   finish, or keeps working (tools included), bounded by `--max-steps`.
 - **Runtime tool plug/unplug** — tools live in a registry;
-  `motiris_unregister_tool()` removes one at runtime, `--no-tools` starts bare.
+  `motiris_unregister_tool()` removes one at runtime. `--no-tools` is a
+  fail-closed per-Agent policy for built-in, Skill, Plugin and MCP tools:
+  they are not initialized, advertised or executed.
 - **Runtime plugin system** — plugins are shared objects (`.so`) dropped
   into a plugins directory; motiris dlopens them at startup and they
   register tools through a small plugin API. Add a tool without touching
@@ -50,7 +61,9 @@ agent process stays idle-quiet between requests.
 - **Bounded live history and replay** — per-agent item/byte budgets evict only
   complete oldest user turns. Independent replay limits select a safe suffix
   for the provider without changing stored history or splitting tool calls.
-- **Skills** — a directory of `.md` files injected as system context.
+- **Skills** — a directory of `.md` files injected as system context. With
+  `--no-tools`, text-only injection uses direct bounded file reads (4096
+  directory entries, 128 files, 1 MiB total), never a shell command.
 - **Tiny core** — cJSON is the only runtime-embedded vendor; HTTP goes
   through a built-in libcurl C backend (no child process; HTTPS/TLS
   handled by the system libcurl shared library). A spawn-`curl` fallback
@@ -180,6 +193,12 @@ map invalid hex digits to zero. Legacy I/U/A/T logs and former sanitized filenam
 migrated or replayed. `"reset":true` removes only that exact ID's snapshot and
 starts fresh. Successful responses report `checkpoint` as
 `saved` or `volatile-only`, or include a bounded `checkpoint_error`.
+
+Gateway terminal replies are scoped to the current run. Empty, null or
+missing terminal content returns `(no reply)` instead of hanging or reusing
+an older/intermediate answer. Goal-check's synthetic `DONE` remains hidden
+even when confirmation performs tool calls first; a real `DONE` answering an
+external user prompt is not confused with that acknowledgement.
 
 Each agent's live history is capped at 256 messages and 16 MiB of compact
 serialized message records by default. `MOTIRIS_HISTORY_MAX_MESSAGES` and
@@ -379,6 +398,9 @@ Optional host-only REPL speech output (only with `TTS_TOOLS=1`):
   Timeout, missing/failing engines, and invalid settings produce a bounded
   diagnostic without hiding the reply or failing the REPL turn. Goal-check's
   synthetic `DONE` acknowledgement is not spoken.
+- Reply selection is bounded to the current run. Empty terminal replies start
+  no engine and never reuse older/intermediate speech. Goal-check tool rounds
+  and its synthetic `DONE` are skipped without hiding a real answer.
 - With no `MOTIRIS_TTS_CMD`, the optional runtime path is idle and starts no
   processes. This is REPL-only, not STT, streaming/full-duplex audio, local
   neural inference, gateway audio, or MCU/RTOS support.
@@ -509,7 +531,7 @@ make test-webtools-parser # malformed/truncated DDG row tests (also in smoke #11
 make test-filetools # malformed handlers + file bounds/atomic fault coverage
 make test-memory   # memory corruption/atomic faults + replacement coverage
 make test-vision   # optional vision build + 10 local-mock integration cases
-make test-tts      # optional TTS build + 8 fake-engine integration cases
+make test-tts      # optional TTS build + 13 fake-engine integration cases
 make test-docker   # default suite inside a throwaway debian container
                    # (clean HOME/ports/processes, mirrors CI)
 ```

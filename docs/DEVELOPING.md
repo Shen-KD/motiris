@@ -100,6 +100,57 @@ The no-filesystem switch does not make unrelated host tools, HTTP transports,
 plugins, sessions or gateway MCU-portable. A real target port still needs its
 own HAL/RTOS backends and measured RAM/Flash budget.
 
+### Fail-closed tool policy and bounded terminal replies
+
+`--no-tools` is a per-Agent execution policy, not merely a built-in
+registration filter. CLI, cron and Gateway disable the Agent before
+`motiris_apply_config()`, which preserves that override instead of allowing
+`tools:true` to re-enable it or initialize configured MCP children. Plugin,
+Skill and MCP entry points also return before directory scanning, `dlopen`,
+global Skill mutation or `fork`. Core registration, provider schema assembly
+and dispatch independently check the same flag, so a tool registered before
+disabling is neither advertised nor executed. Registering while disabled is a
+no-op; re-enabling does not discard the existing per-Agent registry. Real
+subagents receive both `--no-tools` and `--no-plugin`.
+
+`motiris_cron_run_with_tools()` carries the CLI policy into each fresh job
+Agent. The existing `motiris_cron_run()` keeps its signature and delegates
+with config-driven tools enabled, so the public C API remains compatible.
+The no-tools text-only `--skill-dir` path uses direct regular-file reads
+rather than `popen`: at most 4096 directory entries, 128 loaded files and
+1 MiB including headers/NUL, with an 8 KiB read scratch buffer and partial
+file rollback. It has no shell evaluation, child process or unbounded
+directory/content growth.
+
+Gateway and optional TTS use the const, Agent-owned `motiris_turn_start()`
+accessor to scan only the latest external run in forward order. The pointer
+is invalidated by message mutation/import or Agent destruction. Empty/null/
+missing terminal content clears the current candidate instead of looping
+through cJSON's circular `prev` link or reusing an older/intermediate reply.
+A confirmation flag tracks the synthetic goal prompt across tool calls:
+confirmation tool messages and `DONE` preserve the real answer, while real
+`DONE` content answering an external goal-like user prompt remains visible/
+spoken. No global turn state, queue, thread or approval state machine is
+added; optional pending approval remains outside this change.
+
+Reference host measurements on 2026-11-19 (Linux x86_64, gcc, stripped except
+the strict probe; baseline `7bd95d6`) are:
+
+| Build / measurement | Baseline | Policy/reply fixes | Relative result |
+| --- | ---: | ---: | --- |
+| Default full CLI | 186,624 bytes; text 175,698; data 3,144; BSS 169,040 | 190,720 bytes; text 177,356; data 3,128; BSS 169,040 | +4,096 file; +1,658 text; -16 data; BSS unchanged |
+| Strict core-only nofs probe | 69,920 bytes unstripped; text 50,771; data 1,016; BSS 4,232 | 70,000 bytes unstripped; text 51,159; data 1,016; BSS 4,232 | +80 file; +388 text; data/BSS unchanged; libc only |
+| Optional `TTS_TOOLS=1` full CLI | default above | 190,720 bytes; text 180,550; data 3,128; BSS 169,040 | +0 file and +3,194 text vs fixed default; 13 fake-engine cases pass |
+| `PERSISTENCE=0` full CLI | 182,528 bytes; text 168,737; data 3,000; BSS 169,040 | 182,528 bytes; text 170,363; data 2,984; BSS 169,040 | +0 file; +1,626 text; -16 data; volatile/fail-closed tests pass |
+| `FILE_TOOLS=0 SHELL_TOOLS=0 MEMORY_TOOLS=0` | not re-measured | 170,240 bytes; text 159,270; data 2,992; BSS 164,944 | optional backend-cut suite passes |
+| `tests/perf.sh` cold / 5-step loop peak RSS | 9,324 / 9,248 KiB | 9,296 / 9,024 KiB | -28 / -224 KiB host variation; both 50 ms, guards pass |
+
+Default and optional direct ELF dependencies remain only `libcurl.so.4` and
+`libc.so.6`. The policy adds constant per-Agent/loop state; no approval
+backend, dynamic queue or idle work is introduced. These are host application
+bounds and relative measurements, not MCU Flash/RAM headroom. No MCU/RTOS
+cross-toolchain, target or hardware validation was performed.
+
 ### Provider routing, single rendering and bounded responses
 
 Every nonempty configured provider list, including a singleton, selects the
@@ -439,8 +490,10 @@ is available; all numbers above are host-only.
 
 `TTS_TOOLS=1` compiles `src/harness/tts.c` and the conditional REPL call site.
 It adds no public core API and no agent/session state. After a successful turn,
-the REPL selects the new final assistant message (skipping goal-check's
-synthetic `DONE`) and passes it to `MOTIRIS_TTS_CMD` with `exec`, not a shell.
+the REPL selects the current run's terminal assistant message, skips
+confirmation tool rounds and goal-check's synthetic `DONE`, and passes the
+real answer to `MOTIRIS_TTS_CMD` with `exec`, not a shell. Empty terminal
+replies do not invoke an engine or reuse older/intermediate speech.
 The executable owns synthesis, playback and audio storage; motiris never
 receives audio and discards engine stdout/stderr.
 
@@ -464,12 +517,14 @@ baseline `65f6584`) are:
 | Optional REPL + `/bin/sh` fake sink | 9,112 KiB peak process RSS | One echo reply through the bounded pipe; no real audio engine/device |
 | Default `tests/perf.sh` cold / 5-step loop peak RSS | 8,924 / 8,984 KiB | baseline 8,992 / 9,008 KiB; both below 64 MiB guard |
 
-Default file/text/data/BSS deltas are all zero; default and optional direct
-ELF dependencies remain only `libcurl.so.4` and `libc.so.6`. The core source and public header
-are untouched. These are host binary/RSS measurements, not target Flash/RAM
-headroom. `tests/tts.sh` covers eight fake-engine cases: exact text, backend
-failure, timeout/reaping, truncation, goal-check filtering, missing engine,
-invalid timeout and runtime-disabled behavior. No real speech engine, audio
+Default and optional direct ELF dependencies remain only `libcurl.so.4` and
+`libc.so.6`. The TTS backend itself adds no direct dependency; the shared run
+accessor and current core/header deltas are measured in the policy section
+above. These are host binary/RSS measurements, not target Flash/RAM
+headroom. `tests/tts.sh` covers 13 fake-engine cases: exact text, backend
+failure, timeout/reaping, truncation, immediate and tool-mediated goal-check
+filtering, real-versus-synthetic `DONE`, empty/current-turn selection, missing
+engine, invalid timeout and runtime-disabled behavior. No real speech engine, audio
 device, MCU cross-toolchain or hardware validation is claimed.
 
 ### Bounded optional shell subprocess backend
@@ -923,8 +978,13 @@ per-agent registry in CLI, REPL, gateway and cron builds. The optional getters
 selected default provider without making the agent struct public. Vision-specific
 `MOTIRIS_VISION_*` overrides are read per call; no global session state is added.
 
-Agent callbacks:
+Agent callbacks and run boundaries:
 
+- `motiris_turn_start` — const Agent-owned pointer to the latest external
+  run's first message; synthetic goal-check messages do not move it. Use only
+  until the next message mutation/import or Agent destruction.
+- `motiris_cron_run_with_tools` — cron CLI policy variant; the original
+  `motiris_cron_run` remains config-driven and source-compatible.
 - `motiris_set_stream_cb` — per-token sink (single slot; repl owns it).
 - `motiris_set_tool_hook` / `motiris_add_tool_hook` — called after each
   tool executes with (name, args, result_json, ud); result may contain
@@ -961,6 +1021,12 @@ lives in plugin.c and is shared with toolscan.
 
 ## Tests that must not regress
 
+- Smoke #3: `--no-tools` wins over `tools:true` for ordinary CLI and cron;
+  built-in/Skill/Plugin/MCP schemas and execution stay disabled, configured
+  MCP children and Plugin init do not occur, text-only Skill injection cannot
+  invoke a shell, and a real subagent starts no configured backends. The
+  strict-C11 probe also registers before disabling and proves direct-C
+  dispatch and per-Agent policy isolation.
 - Smoke #4: run one real cold-start echo turn and record peak RSS with GNU
   `time`. There is no binary-size gate; the measurement is a runtime-RAM
   optimization signal, not an artifact limit. Test images install `time`.
@@ -1003,6 +1069,9 @@ may still use its own atomic replacement.
   Raw/escaped embedded-NUL and malformed-Unicode IDs fail with HTTP 400 before
   reset/provider I/O without changing the aliased snapshot; restart replay
   excludes rejected messages and a double-escaped literal `\\u0000` ID remains valid.
+  Empty/null/missing terminal replies, intermediate tool-call text, external
+  goal-like prompts and tool-mediated confirmation return bounded current-run
+  replies, followed by healthy requests; configured MCP remains disabled.
 - Smoke #11: shell drains both pipes concurrently, enforces per-stream/total
   output caps and a monotonic timeout, kills/reaps its process group, and
   survives repeated calls without fd/direct-child leaks (also under ASAN/UBSAN).
@@ -1032,7 +1101,9 @@ may still use its own atomic replacement.
 - Smoke #24-26: per-tool schema files (override / invalid json / plugin
   subdir layout) — if you change the merge logic or dir resolution,
   update these.
-- Smoke #27: goal-check loop (`--goal-check` + DONE confirmation).
+- Smoke #27: goal-check loop (`--goal-check` + DONE confirmation). Gateway
+  and optional TTS additionally cover confirmation tool calls, real versus
+  synthetic `DONE`, and empty terminal messages without stale replies.
 - Goal-check state is per-agent (goal from the agent's own messages,
   `confirm_asked` is a `motiris_run` local); no new global state — keep
   it that way when touch agent.c.

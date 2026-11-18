@@ -133,6 +133,7 @@ static Session *get_session(const char *chat_id, int tools_on,
   s->chat_id = strdup(chat_id);
   s->agent = motiris_new();
   if (!s->chat_id || !s->agent) goto fail;
+  if (!tools_on) motiris_set_tools_enabled(s->agent, 0);
   motiris_apply_config(s->agent);   /* model/base_url/transport from config */
   if (tools_on) motiris_register_core_tools(s->agent);
 
@@ -433,20 +434,53 @@ static int check_token(const char *req, int *bad) {
   return 0;
 }
 
-/* return the last assistant content (final reply), or NULL */
+static int gateway_goal_prompt(const cJSON *message) {
+  const char *role = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(message, "role"));
+  const char *prompt = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(message, "content"));
+  return role && !strcmp(role, "user") && prompt &&
+         !strncmp(prompt, "Goal check: <", 13);
+}
+
+static int gateway_done_reply(const char *s) {
+  while (*s && strchr(" \t\r\n.", *s)) s++;
+  size_t n = strlen(s);
+  while (n && strchr(" \t\r\n.", s[n - 1])) n--;
+  if (n != 4) return 0;
+  for (size_t i = 0; i < 4; i++) {
+    char c = s[i];
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if (c != "done"[i]) return 0;
+  }
+  return 1;
+}
+
+/* Return the current run's terminal reply. The core-owned run boundary
+ * distinguishes real users from synthetic goal prompts without inspecting
+ * user-controlled prefixes; forward traversal avoids circular prev links. */
 static char *last_reply(MotirisAgent *a) {
-  cJSON *m = motiris_messages(a)->child;
-  if (!m) return NULL;
-  while (m->next) m = m->next;
-  for (; m; m = m->prev) {
+  const cJSON *start = motiris_turn_start(a);
+  const char *reply = NULL;
+  int goal_confirm = 0;
+  for (const cJSON *m = start; m; m = m->next) {
+    if (m != start && gateway_goal_prompt(m)) goal_confirm = 1;
     const char *role = cJSON_GetStringValue(
         cJSON_GetObjectItemCaseSensitive(m, "role"));
     const char *content = cJSON_GetStringValue(
         cJSON_GetObjectItemCaseSensitive(m, "content"));
-    if (role && !strcmp(role, "assistant") && content && *content)
-      return strdup(content);
+    if (role && !strcmp(role, "assistant")) {
+      cJSON *calls = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+      int confirmation_call = goal_confirm && cJSON_IsArray(calls) &&
+                              cJSON_GetArraySize(calls) > 0;
+      int synthetic_done = goal_confirm && content &&
+                           gateway_done_reply(content);
+      /* Confirmation tools/DONE do not replace the real pre-goal answer. */
+      if (!confirmation_call && !synthetic_done)
+        reply = content && *content ? content : NULL;
+    }
   }
-  return NULL;
+  return reply ? strdup(reply) : NULL;
 }
 
 static void handle_connection(int fd, int tools_on) {

@@ -58,6 +58,7 @@ if test_in 3; then
 echo "== 3: unknown tool tolerated when built-ins disabled"
 OUT=$(./motiris -p hi --transport echo --no-tools)
 echo "$OUT" | grep -q 'echo round complete' || { echo "FAIL: $OUT"; exit 1; }
+python3 tests/no_tools.py
 
 fi
 if test_in 4; then

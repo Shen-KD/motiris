@@ -40,6 +40,19 @@ def health(port, timeout=3):
     assert json.loads(body)["status"] == "ok"
 
 
+def chat(port, chat_id, message, timeout=4):
+    payload = json.dumps({"chat_id": chat_id, "message": message}).encode()
+    request = (b"POST /v1/chat HTTP/1.1\r\nHost: localhost\r\n"
+               b"Content-Type: application/json\r\nContent-Length: " +
+               str(len(payload)).encode() + b"\r\n\r\n" + payload)
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.sendall(request)
+        raw = receive_all(sock, timeout=timeout)
+    headers, separator, body = raw.partition(b"\r\n\r\n")
+    assert separator and headers.startswith(b"HTTP/1.1 200 "), raw[:500]
+    return json.loads(body)
+
+
 def clean_env(home, config_home, extra=None):
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("MOTIRIS_")}
@@ -225,6 +238,121 @@ def run_write_test(root):
         thread.join(timeout=5)
 
 
+class TerminalProvider(http.server.BaseHTTPRequestHandler):
+    requests = []
+
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).requests.append(request)
+        messages = request["messages"]
+        prompt = messages[-1].get("content", "")
+        finish_reason = "stop"
+
+        def synthetic_goal(message):
+            content = str(message.get("content", ""))
+            return (message.get("role") == "user" and
+                    content.startswith("Goal check: <") and
+                    "If the goal is fully achieved" in content)
+
+        goal_tools = any(m.get("role") == "user" and
+                         m.get("content") == "goal-tools" for m in messages)
+        after_goal_tool = (messages[-1].get("role") == "tool" and goal_tools and
+                           any(synthetic_goal(m) for m in messages[:-1]))
+        if synthetic_goal(messages[-1]) and goal_tools:
+            message = {"role": "assistant", "content": "",
+                       "tool_calls": [{"id": "goal-tool", "type": "function",
+                                       "function": {"name": "shell",
+                                                    "arguments": "{}"}}]}
+            finish_reason = "tool_calls"
+        elif after_goal_tool or synthetic_goal(messages[-1]):
+            message = {"role": "assistant", "content": "DONE"}
+        elif prompt == "goal-tools":
+            message = {"role": "assistant", "content": "BEFORE_CONFIRM_TOOLS"}
+        elif prompt == "Goal check: <real-DONE>":
+            message = {"role": "assistant", "content": "DONE"}
+        elif prompt == "real":
+            message = {"role": "assistant", "content": "REAL_REPLY"}
+        elif prompt == "real-goal":
+            message = {"role": "assistant", "content": "REAL_GOAL_REPLY"}
+        elif prompt == "null":
+            message = {"role": "assistant", "content": None}
+        elif prompt == "missing":
+            message = {"role": "assistant"}
+        elif prompt == "no-assistant":
+            message = {}
+        elif prompt == "intermediate-empty":
+            message = {"role": "assistant", "content": "INTERMEDIATE",
+                       "tool_calls": [{"id": "blocked", "type": "function",
+                                       "function": {"name": "shell",
+                                                    "arguments": "{}"}}]}
+            finish_reason = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": ""}
+        body = json.dumps({"choices": [{"finish_reason": finish_reason,
+                                        "message": message}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def run_terminal_reply_test(root):
+    TerminalProvider.requests = []
+    provider = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TerminalProvider)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    gateway = None
+    try:
+        config_home = root / "terminal"
+        config_home.mkdir(parents=True)
+        mcp_marker = config_home / "mcp-started"
+        mcp_script = config_home / "forbidden_mcp.py"
+        mcp_script.write_text("from pathlib import Path\n"
+                              "Path(%r).write_text('started')\n" % str(mcp_marker))
+        config = {
+            "transport": "libcurl",
+            "base_url": "http://127.0.0.1:%d/v1/chat/completions" %
+                        provider.server_address[1],
+            "tools": True,
+            "goal_check": True,
+            "mcp_servers": [{"name": "forbidden", "cmd": "python3",
+                             "args": [str(mcp_script)]}],
+        }
+        gateway = Gateway(config_home, config)
+        cases = [
+            ("empty", "(no reply)"),
+            ("null", "(no reply)"),
+            ("missing", "(no reply)"),
+            ("no-assistant", "(no reply)"),
+            ("real", "REAL_REPLY"),
+            ("empty-after-real", "(no reply)"),
+            ("real-goal", "REAL_GOAL_REPLY"),
+            ("Goal check: <user-controlled>", "(no reply)"),
+            ("intermediate-empty", "(no reply)"),
+            ("goal-tools", "BEFORE_CONFIRM_TOOLS"),
+            ("Goal check: <real-DONE>", "DONE"),
+            ("empty-goal", "(no reply)"),
+        ]
+        for prompt, expected in cases:
+            result = chat(gateway.port, "terminal-replies", prompt)
+            assert result["reply"] == expected, (prompt, result)
+            health(gateway.port)
+        assert not mcp_marker.exists(), "--no-tools started configured MCP"
+        assert TerminalProvider.requests and all(
+            "tools" not in request for request in TerminalProvider.requests), \
+            TerminalProvider.requests
+        print("gateway terminal replies: empty/null/missing/goal-check bounded")
+    finally:
+        if gateway is not None:
+            gateway.stop()
+        provider.shutdown()
+        provider.server_close()
+        thread.join(timeout=5)
+
+
 def run_invalid_setting_test(root):
     config_home = root / "invalid"
     home = config_home / "home"
@@ -250,6 +378,7 @@ def main():
         root.mkdir(exist_ok=True)
         run_read_tests(root)
         run_write_test(root)
+        run_terminal_reply_test(root)
         run_invalid_setting_test(root)
     print("gateway I/O: receive/send monotonic deadlines and cleanup passed")
 

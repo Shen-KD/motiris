@@ -15,12 +15,14 @@ const char *motiris_tool_schema(const char *name) {
 }
 
 static int cancel_flag;
+static int tool_calls;
 static int cancel_requested(void *ud) {
   (void)ud;
   return cancel_flag;
 }
 static char *shell_result(const char *args, void *ud) {
   (void)args; (void)ud;
+  tool_calls++;
   const char result[] = "{\"ok\":true}";
   char *copy = malloc(sizeof result);
   if (copy) memcpy(copy, result, sizeof result);
@@ -36,7 +38,15 @@ int main(void) {
   MotirisAgent *a = motiris_new();
   if (!a) return 1;
   motiris_set_transport(a, "echo");
+  /* Keep a pre-registered tool to prove disabled execution is fail-closed;
+   * registration after disabling must also be rejected per Agent. */
+  MotirisTool existing = { .name = "shell", .call = shell_result };
+  motiris_register_tool(a, &existing);
+  if (motiris_tool_count(a) != 1) return 1;
   motiris_set_tools_enabled(a, 0);
+  MotirisTool rejected = { .name = "rejected", .call = shell_result };
+  motiris_register_tool(a, &rejected);
+  if (motiris_tool_count(a) != 1) return 1;
   motiris_add_user(a, "offline nofs probe");
   if (motiris_run(a)) {
     fprintf(stderr, "core-nofs: %s\n", motiris_last_error(a));
@@ -55,8 +65,8 @@ int main(void) {
         strstr(content, "unknown tool") && strlen(content) < 128)
       found_bounded_error = 1;
   }
-  if (!found_bounded_error) {
-    fprintf(stderr, "core-nofs: bounded unavailable-tool error missing\n");
+  if (!found_bounded_error || tool_calls != 0) {
+    fprintf(stderr, "core-nofs: disabled tool execution was not fail-closed\n");
     motiris_free(a);
     return 1;
   }
@@ -190,9 +200,9 @@ int main(void) {
   motiris_set_cancel_cb(d, NULL, NULL);
   int retry_rc = motiris_run(d);
   int retry_messages = cJSON_GetArraySize(motiris_messages(d));
-  if (retry_rc != MOTIRIS_RUN_OK || retry_messages != 4) {
-    fprintf(stderr, "core-nofs: retry rc=%d messages=%d error=%s\n",
-            retry_rc, retry_messages, motiris_last_error(d));
+  if (retry_rc != MOTIRIS_RUN_OK || retry_messages != 4 ||
+      tool_calls != 2 || motiris_tools_enabled(a)) {
+    fprintf(stderr, "core-nofs: per-Agent policy/retry isolation failed\n");
     motiris_free(d);
     motiris_free(a);
     return 1;

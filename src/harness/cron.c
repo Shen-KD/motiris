@@ -88,8 +88,9 @@ static int load_jobs(const char *file, Job *jobs, int *n) {
   return 0;
 }
 
-static void run_job(Job *jb, const char *filename, int verbose) {
+static void run_job(Job *jb, const char *filename, int verbose, int tools_on) {
   MotirisAgent *a = motiris_new();
+  if (!tools_on) motiris_set_tools_enabled(a, 0);
   motiris_apply_config(a);
   motiris_register_core_tools(a);
   if (motiris_tools_enabled(a)) motiris_register_file_tools(a);
@@ -117,7 +118,8 @@ static void run_job(Job *jb, const char *filename, int verbose) {
   (void)filename;
 }
 
-int motiris_cron_run(const char *file, int once, int verbose) {
+int motiris_cron_run_with_tools(const char *file, int once, int verbose,
+                                int tools_on) {
   Job jobs[MAX_JOBS];
   int n = 0;
   if (load_jobs(file, jobs, &n)) return 1;
@@ -128,7 +130,7 @@ int motiris_cron_run(const char *file, int once, int verbose) {
     int ran = 0;
     for (int i = 0; i < n; i++) {
       if (now - jobs[i].last_run >= jobs[i].interval_s) {
-        run_job(&jobs[i], file, verbose);
+        run_job(&jobs[i], file, verbose, tools_on);
         ran = 1;
       }
     }
@@ -139,4 +141,8 @@ int motiris_cron_run(const char *file, int once, int verbose) {
     }
     sleep(1);
   }
+}
+
+int motiris_cron_run(const char *file, int once, int verbose) {
+  return motiris_cron_run_with_tools(file, once, verbose, 1);
 }

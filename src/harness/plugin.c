@@ -81,6 +81,7 @@ static void load_one(MotirisAgent *a, const char *path) {
  * Directories are tried first; a subdir without a matching .so is
  * skipped silently (its .json schema may still have been indexed). */
 int motiris_load_plugins(MotirisAgent *a, const char *dir) {
+  if (!motiris_tools_enabled(a) || !motiris_plugins_enabled(a)) return 0;
   if (motiris_plugin_dir(a) && *motiris_plugin_dir(a)) dir = motiris_plugin_dir(a);
   char *d = resolve_dir(dir);
 

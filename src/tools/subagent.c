@@ -45,7 +45,8 @@ static char *subagent_call(const char *args_json, void *ud) {
   char *bin = own_bin();
   if (!bin) { cJSON_Delete(args); return err_json("subagent path allocation failed"); }
   char *const child_argv[] = {
-    bin, "-p", (char *)task, "--no-tools", "--max-steps", "3", NULL
+    bin, "-p", (char *)task, "--no-tools", "--no-plugin",
+    "--max-steps", "3", NULL
   };
   ChildProcResult child;
   childproc_run("subagent", child_argv, "MOTIRIS_SUBAGENT_TIMEOUT_S",

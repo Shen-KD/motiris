@@ -53,6 +53,10 @@ int  motiris_provider_count(MotirisAgent *a);
 void motiris_register_tool(MotirisAgent *a, const MotirisTool *t); /* copied */
 void motiris_unregister_tool(MotirisAgent *a, const char *name); /* runtime unplug */
 cJSON *motiris_messages(MotirisAgent *a);                        /* session log */
+/* Agent-owned first message of the latest run's external user turn, or NULL.
+ * Synthetic goal-check messages do not move this boundary. The read-only
+ * pointer is invalidated by message mutation/import or agent destruction. */
+const cJSON *motiris_turn_start(MotirisAgent *a);
 
 /* ---- plugins: runtime-loadable shared objects ---- */
 /* tool-invocation observer: called after each tool executes */
@@ -131,7 +135,7 @@ const char *motiris_transport_name(MotirisAgent *a);
 
 /* ---- centralized config: $HOME/.motiris/{env,config.json} ---- */
 void motiris_load_env(void);                  /* call before new() */
-void motiris_apply_config(MotirisAgent *a);   /* defaults, CLI wins */
+void motiris_apply_config(MotirisAgent *a);   /* preserves pre-disabled tools */
 int  motiris_init_config(void);               /* write templates */
 /* Atomically update one whitelisted scalar config.json key. Prints only the
  * key/path on success, never the value. Returns 0 on success, nonzero on error. */
@@ -186,6 +190,9 @@ int  motiris_session_load(MotirisAgent *agent, const char *path,
 
 /* ---- cron: scheduled agent runs ---- */
 int motiris_cron_run(const char *jobs_file, int once, int verbose);
+/* CLI policy variant; the original API above keeps tools config-driven. */
+int motiris_cron_run_with_tools(const char *jobs_file, int once, int verbose,
+                                int tools_on);
 
 /* ---- MCP: register remote tools from an external stdio server ---- */
 int motiris_register_mcp_server(MotirisAgent *a, const char *name,
