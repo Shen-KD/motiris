@@ -571,6 +571,45 @@ static char *build_request(MotirisAgent *a, const char *model) {
 }
 
 /* ---------------- response handling ---------------- */
+/* Provider response metadata is not part of motiris's replay contract. Keep
+ * only the fields accepted by the strict snapshot codec at ingestion;
+ * imported snapshots continue to reject unknown fields. */
+static void retain_fields(cJSON *object, const char *const *allowed,
+                          size_t count) {
+  if (!cJSON_IsObject(object)) return;
+  for (cJSON *field = object->child; field;) {
+    cJSON *next = field->next;
+    size_t i = 0;
+    if (field->string)
+      for (; i < count; i++)
+        if (!strcmp(field->string, allowed[i])) break;
+    if (!field->string || i == count)
+      cJSON_Delete(cJSON_DetachItemViaPointer(object, field));
+    field = next;
+  }
+}
+
+static cJSON *canonical_assistant_message(const cJSON *message) {
+  static const char *const message_fields[] = {
+    "role", "content", "tool_calls"
+  };
+  static const char *const call_fields[] = { "id", "type", "function" };
+  static const char *const function_fields[] = { "name", "arguments" };
+  cJSON *assistant = cJSON_Duplicate(message, 1);
+  if (!assistant) return NULL;
+  retain_fields(assistant, message_fields,
+                sizeof message_fields / sizeof message_fields[0]);
+  cJSON *calls = cJSON_GetObjectItemCaseSensitive(assistant, "tool_calls");
+  for (cJSON *call = cJSON_IsArray(calls) ? calls->child : NULL;
+       call; call = call->next) {
+    retain_fields(call, call_fields, sizeof call_fields / sizeof call_fields[0]);
+    retain_fields(cJSON_GetObjectItemCaseSensitive(call, "function"),
+                  function_fields,
+                  sizeof function_fields / sizeof function_fields[0]);
+  }
+  return assistant;
+}
+
 static char *string_result(const char *text) {
   cJSON *j = cJSON_CreateString(text);
   char *printed = cJSON_PrintUnformatted(j);
@@ -772,8 +811,8 @@ int motiris_run(MotirisAgent *a) {
       return cancel_run(a, run_tail, start_tok_in, start_tok_out);
     }
 
-    /* keep assistant message in history (may carry tool_calls) */
-    cJSON *assistant = cJSON_Duplicate(msg, 1);
+    /* Keep one canonical assistant representation for replay/checkpoints. */
+    cJSON *assistant = canonical_assistant_message(msg);
     if (!assistant || append_message(a, assistant)) {
       cJSON_Delete(assistant);
       cJSON_Delete(j);

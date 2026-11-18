@@ -122,6 +122,20 @@ deltas exist, a transport/parse/API failure ends that run rather than mixing a
 partial answer with fallback output. The flag is run/attempt local, not global
 agent or session state.
 
+Provider assistant objects are canonicalized before entering per-Agent history:
+only `role`, `content` and `tool_calls` participate in replay and snapshots.
+Tool-call entries retain only `id`, `type` and `function`; function entries
+retain only `name` and `arguments`, so nested provider extensions cannot leak
+into the strict snapshot schema. Response-only metadata such as `refusal` and
+`annotations` is discarded after
+the bounded provider response has been parsed, so null/string/array metadata
+shapes cannot make an otherwise successful turn fail snapshot validation. The
+current response tree remains available for content/tool dispatch. Snapshot
+import retains its strict unknown-field and duplicate-field rejection; this is
+an ingestion boundary, not a relaxation of the persisted format. The temporary
+response duplicate remains bounded by the existing response/receive limits and
+adds no retained global or per-session metadata.
+
 `MOTIRIS_RESPONSE_MAX_BYTES` configures `C` from 1 through 16 MiB (default and
 hard maximum 16 MiB). Invalid values warn and use the default. Buffered
 libcurl and spawned-curl bodies, each SSE line, aggregate content and each
@@ -185,6 +199,29 @@ preflight adds no retained allocation, Agent state, thread or idle work. Default
 direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
 No MCU/RTOS cross-toolchain, target Flash/RAM or hardware validation is
 available; none of these host numbers is an MCU support claim.
+
+### Canonical session replay and NUL-safe gateway IDs
+
+Assistant canonicalization reuses the existing bounded cJSON response duplicate
+and retains no provider metadata or new Agent/global state. The gateway's
+Content-Length NUL scan is allocation-free and O(n) over the existing 1 MiB
+body cap. Default core dependencies and the snapshot format are unchanged;
+`PERSISTENCE=0` still removes only the optional host checkpoint backend.
+
+Reference host measurements on 2026-11-19 (Linux x86_64, gcc `-O2`/component
+`-Os`, stripped except the core probe; baseline `7d39e66`) are:
+
+| Build / measurement | Baseline | Session-isolation fix | Relative result |
+| --- | --- | --- | --- |
+| Default full CLI | 186,624 bytes; text 174,882; data 3,048; BSS 169,040 | 186,624 bytes; text 175,698; data 3,144; BSS 169,040 | +0 file; +816 text; +96 data; BSS unchanged |
+| Strict core-only nofs probe | 69,840 bytes unstripped; text 50,115; data 952; BSS 4,232 | 69,920 bytes unstripped; text 50,771; data 1,016; BSS 4,232 | +80 file; +656 text; +64 data; BSS unchanged; libc only |
+| Default `tests/perf.sh` cold / 5-step loop peak RSS | 9,232 / 9,276 KiB | 9,128 / 9,140 KiB | -104 / -136 KiB host variation; both 50 ms, guards pass |
+| `PERSISTENCE=0` full CLI | not re-measured | 182,528 bytes; text 168,737; data 3,000; BSS 169,040 | vs fixed default: -4,096 file; -6,961 text; -144 data; BSS unchanged |
+
+Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
+The persistence-cut explicit-operation, PTY and volatile-gateway suite passes.
+These are host binary/RSS measurements, not MCU Flash/RAM headroom. No
+MCU/RTOS cross-toolchain, target or hardware validation was performed.
 
 ### Bounded MCP stdio I/O
 
@@ -326,6 +363,19 @@ fixed-size stack storage for deadlines, one `pollfd` and offsets; the
 process-wide timeout setting is immutable after startup and contains no
 Agent/session data. The existing receive allocation remains at most 16 KiB + 1 MiB + 1 byte,
 and response strings retain their existing bounded producer/history limits.
+
+Before cJSON decodes `/v1/chat`, the gateway scans the explicit Content-Length
+body for raw NUL bytes and JSON `\u0000` escapes in strings, validates all four
+hex digits of every Unicode escape, then uses `cJSON_ParseWithLength`. Malformed
+escapes are rejected instead of allowing cJSON's invalid-hex-as-zero conversion
+to synthesize NUL. This allocation-free O(n) scan rejects HTTP 400 before
+reset, session lookup or snapshot I/O, preventing a C-string prefix from
+aliasing another chat ID or truncating a message. Escape parity is honored, so
+a double-escaped literal `\\u0000` remains a distinct valid ID. The existing
+1 MiB body bound also bounds this scan; no ID-length copy, thread or retained
+state is added. Escaped/raw-NUL and malformed-Unicode reset rejection, snapshot
+byte preservation, restart isolation and literal-backslash acceptance run in
+smoke #9.
 
 Reference host measurements on 2026-11-17 (Linux x86_64, gcc `-O2`/harness
 `-Os`, stripped; baseline `57d3122`) are:
@@ -686,6 +736,10 @@ REPL/CLI reports its retained message count. Verbose mode diagnoses both live
 eviction and replay omission. The strict-C11 nofs probe exercises two complete
 turns with a four-message live/replay limit and no POSIX/file/libcurl backend.
 
+Provider assistant history is canonicalized to `role`, `content` and
+`tool_calls` at ingestion. Other provider response metadata is not replayed or
+persisted; imported snapshots still fail closed on unknown fields.
+
 `src/core/checkpoint.c` owns the versioned snapshot contract and the portable
 `motiris_session_export` / `motiris_session_import` memory-buffer API. Export
 returns a malloc'd NUL-terminated buffer and explicit length; the caller owns
@@ -917,7 +971,10 @@ lives in plugin.c and is shared with toolscan.
   PTY auto-save are included. Multi-turn item/byte retention, complete-turn
   eviction, restore-time limits and independent replay item/byte budgets run
   in `tests/history.py`; live overflow fails closed, and an over-budget replay
-  active turn is rejected before transport. `make test-core-nofs` separately
+  active turn is rejected before transport. Provider `refusal:null/string` and
+  `annotations:[]/array` fixtures plus tool-call `index` and nested function
+  extensions prove metadata is stripped at ingestion, while re-signed top-level
+  and nested unknown-field snapshots remain rejected. `make test-core-nofs` separately
   verifies byte-exact caller-owned memory round-trip, fail-closed ownership
   and digest checks, and cancellation after a tool result under strict C11
   without host file I/O. The cancelled assistant/tool messages are removed,
@@ -943,6 +1000,9 @@ may still use its own atomic replacement.
   Gateway session regressions cover colliding punctuation, case, Unicode,
   120-byte IDs, full assistant restoration after restart and 64-session
   eviction, legacy/ownership/digest fail-closed behavior, and exact-ID reset.
+  Raw/escaped embedded-NUL and malformed-Unicode IDs fail with HTTP 400 before
+  reset/provider I/O without changing the aliased snapshot; restart replay
+  excludes rejected messages and a double-escaped literal `\\u0000` ID remains valid.
 - Smoke #11: shell drains both pipes concurrently, enforces per-stream/total
   output caps and a monotonic timeout, kills/reaps its process group, and
   survives repeated calls without fd/direct-child leaks (also under ASAN/UBSAN).

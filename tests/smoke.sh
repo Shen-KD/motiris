@@ -330,6 +330,20 @@ def chat(chat_id, message, reset=False, expected=200):
     return json.loads(raw)
 
 
+def raw_chat(payload, expected=400):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("POST", "/v1/chat", payload,
+                 {"Content-Type": "application/json"})
+    response = conn.getresponse()
+    raw = response.read()
+    status = response.status
+    conn.close()
+    if status != expected:
+        raise AssertionError("raw request: expected HTTP %d, got %d: %s" %
+                             (expected, status, raw[:300]))
+    return json.loads(raw)
+
+
 def users(index=-1):
     return [m.get("content", "").rstrip("\n")
             for m in captures[index].get("messages", [])
@@ -424,6 +438,37 @@ try:
     restart_gateway()
     chat("tenant?a", "PUBLIC-BETA-3")
     assert users() == ["PUBLIC-BETA", "PUBLIC-BETA-2", "PUBLIC-BETA-3"], users()
+
+    # Reject decoded NUL before reset/session lookup: a hidden suffix must not
+    # alias this ID, mutate its snapshot or reach the provider. A literal,
+    # double-escaped \\u0000 string remains a distinct valid ID.
+    nul_path = logdir / ("tenant?a".encode().hex() + ".log")
+    nul_before = nul_path.read_bytes()
+    before = len(captures)
+    error = chat("tenant?a\0other", "MUST-NOT-JOIN", reset=True, expected=400)
+    assert "NUL" in error["error"], error
+    assert len(captures) == before
+    assert nul_path.read_bytes() == nul_before
+    error = raw_chat(b'{"chat_id":"tenant?a\x00other",'
+                     b'"message":"RAW-MUST-NOT-JOIN","reset":true}')
+    assert "NUL" in error["error"], error
+    assert len(captures) == before
+    assert nul_path.read_bytes() == nul_before
+    # cJSON's invalid-hex conversion must not turn a malformed escape into
+    # an embedded NUL after the security scan.
+    error = raw_chat(b'{"chat_id":"tenant?a\\u000gother",'
+                     b'"message":"MALFORMED-MUST-NOT-JOIN","reset":true}')
+    assert "Unicode" in error["error"], error
+    assert len(captures) == before
+    assert nul_path.read_bytes() == nul_before
+    restart_gateway()
+    chat("tenant?a", "PUBLIC-BETA-4")
+    assert users() == ["PUBLIC-BETA", "PUBLIC-BETA-2", "PUBLIC-BETA-3",
+                       "PUBLIC-BETA-4"], users()
+    literal_id = "literal\\u0000id"
+    chat(literal_id, "LITERAL-BACKSLASH-U")
+    assert users() == ["LITERAL-BACKSLASH-U"], users()
+    assert (logdir / (literal_id.encode().hex() + ".log")).is_file()
 finally:
     stop_gateway()
     provider.shutdown()

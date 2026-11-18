@@ -172,9 +172,13 @@ growth.
 filename is the lowercase hex encoding of the complete ID (at most 244 bytes
 including `.log`), so punctuation, case, Unicode and long IDs cannot alias.
 Each snapshot also binds that encoded ID in `session_id`; mismatches fail
-before history reaches the provider. Legacy I/U/A/T logs and former sanitized
-filenames are not migrated or replayed. `"reset":true` removes only that exact
-ID's snapshot and starts fresh. Successful responses report `checkpoint` as
+before history reaches the provider. Gateway JSON strings containing a raw NUL
+or a decoded `\u0000` are rejected with HTTP 400 before reset or session lookup,
+so a hidden suffix cannot alias another ID; a double-escaped literal `\\u0000`
+remains valid. Malformed Unicode escapes are also rejected before cJSON can
+map invalid hex digits to zero. Legacy I/U/A/T logs and former sanitized filenames are not
+migrated or replayed. `"reset":true` removes only that exact ID's snapshot and
+starts fresh. Successful responses report `checkpoint` as
 `saved` or `volatile-only`, or include a bounded `checkpoint_error`.
 
 Each agent's live history is capped at 256 messages and 16 MiB of compact
@@ -227,7 +231,13 @@ latest snapshot per session. The host backend limits files to 1 MiB, snapshots
 to 256 messages and 256 tool calls, and each serialized message to 256 KiB.
 It preserves message order and multiline text as JSON, validates tool
 call/result pairing and an integrity digest, and writes a mode-0600 temporary
-file followed by flush/`fsync` and atomic `rename`. The FNV-1a-64 digest is
+file followed by flush/`fsync` and atomic `rename`. Provider assistant messages
+are canonicalized at ingestion to `role`, `content` and `tool_calls` for
+replay/snapshots. Tool-call entries retain only `id`, `type` and `function`;
+function entries retain only `name` and `arguments`. Response-only metadata
+such as `refusal` and `annotations` cannot make a successful turn unsavable.
+Snapshot imports still reject unknown
+fields rather than weakening validation. The FNV-1a-64 digest is
 for corruption detection, not cryptographic authentication. Corrupt, oversized,
 version-mismatched and legacy input fails closed; restoring never executes an
 old tool. REPL `/resume` requires an empty context (use `/new` first). The
