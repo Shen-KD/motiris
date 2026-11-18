@@ -25,7 +25,7 @@ static const MotirisTool disabled_file_tools[] = {
   { "patch", "Unavailable in this no-filesystem build.",
     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
     "\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},"
-    "\"required\":[\"path\",\"old\"]}", unavailable, NULL },
+    "\"required\":[\"path\",\"old\",\"new\"]}", unavailable, NULL },
   { "search_files", "Unavailable in this no-filesystem build.",
     "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},"
     "\"path\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}",

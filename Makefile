@@ -125,6 +125,13 @@ test-webtools-parser:
 		$(WEBTOOLS_TEST_LDFLAGS) -o build/webtools-parser
 	build/webtools-parser
 
+# Direct file handler validation, bounds and atomic-write fault injection.
+test-filetools: motiris
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o build/filetools-unit \
+		tests/filetools_unit.c src/vendor/cJSON.c $(LDFLAGS)
+	./build/filetools-unit
+
 # Host memory file fault injection plus model-driven integration coverage.
 test-memory: motiris
 	@mkdir -p build
@@ -194,13 +201,13 @@ test-docker:
 		motiris-test bash -c 'mkdir -p /tmp/home && make clean && make && sh tests/smoke.sh'
 
 clean:
-	rm -f motiris *.a build/memory-unit build/webtools-parser
+	rm -f motiris *.a build/memory-unit build/filetools-unit build/webtools-parser
 	rm -rf build/nofs
 	find src deps -name '*.o' -delete
 
 install: motiris
 	install -m 0755 motiris $(PREFIX)/bin/motiris
 
-.PHONY: test test-shell test-browser-subagent test-memory \
+.PHONY: test test-shell test-browser-subagent test-filetools test-memory \
 	test-webtools-parser test-vision test-tts test-core-nofs test-nofs \
 	test-persistence test-docker clean install
