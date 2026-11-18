@@ -96,6 +96,12 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- Keyless provider-list entries no longer inherit the default Agent or
+  `MOTIRIS_API_KEY` Bearer credential. Omitted/missing entry key environments,
+  independent keys and mixed multi-hop fallback are covered by offline mock
+  tests. The existing fixed 512-byte Authorization buffer now rejects keys
+  over 489 bytes before network I/O rather than silently omitting
+  authentication; errors never print the key.
 - File and persistent-memory handlers reject missing or wrongly typed required
   strings before touching stored state. This closes missing-`content` /
   missing-`value` data erasure and uninitialized file-error reads. File reads
