@@ -60,13 +60,17 @@ class Provider(http.server.BaseHTTPRequestHandler):
         has_final = any(m.get("content", "").startswith("assistant-visible")
                         for m in messages if m.get("role") == "assistant")
         if not has_tool:
-            message = {"role": "assistant", "tool_calls": [{
-                "id": "call_checkpoint", "type": "function",
-                "function": {"name": "shell", "arguments": "{}"}}]}
+            message = {"role": "assistant", "refusal": None, "annotations": [],
+                       "tool_calls": [{
+                "id": "call_checkpoint", "type": "function", "index": 0,
+                "function": {"name": "shell", "arguments": "{}",
+                             "provider_extension": {"ignored": True}}}]}
             finish = "tool_calls"
         elif not has_final:
             message = {"role": "assistant",
-                       "content": "assistant-visible\nUFORGED-BY-ASSISTANT"}
+                       "content": "assistant-visible\nUFORGED-BY-ASSISTANT",
+                       "refusal": "provider-only refusal metadata",
+                       "annotations": [{"type": "provider_annotation"}]}
             finish = "stop"
         else:
             message = {"role": "assistant", "content": "resumed ok"}
@@ -179,6 +183,13 @@ def main():
                 raise AssertionError("tool_calls not preserved")
             if messages[2]["tool_call_id"] != "call_checkpoint":
                 raise AssertionError("tool_call_id not preserved")
+            if any("refusal" in m or "annotations" in m for m in messages):
+                raise AssertionError("provider-only metadata reached a checkpoint")
+            saved_call = messages[1]["tool_calls"][0]
+            if set(saved_call) != {"id", "type", "function"}:
+                raise AssertionError("tool-call metadata reached a checkpoint")
+            if set(saved_call["function"]) != {"name", "arguments"}:
+                raise AssertionError("function metadata reached a checkpoint")
 
             invoke(["-r", str(snapshot_path)] + common, env)
             if Provider.captures[-1]["messages"] != messages:
@@ -210,6 +221,22 @@ def main():
             rejected = invoke(["-r", str(legacy)] + common, env, expected=2)
             if "integrity" not in rejected.stderr:
                 raise AssertionError("digest rejection diagnostic: %s" % rejected.stderr)
+
+            unknown = json.loads(original_bytes)
+            unknown["messages"][-1]["refusal"] = None
+            resign(unknown)
+            legacy.write_text(compact(unknown))
+            rejected = invoke(["-r", str(legacy)] + common, env, expected=2)
+            if "invalid snapshot structure" not in rejected.stderr:
+                raise AssertionError("unknown-field rejection diagnostic: %s" % rejected.stderr)
+
+            unknown_nested = json.loads(original_bytes)
+            unknown_nested["messages"][1]["tool_calls"][0]["index"] = 0
+            resign(unknown_nested)
+            legacy.write_text(compact(unknown_nested))
+            rejected = invoke(["-r", str(legacy)] + common, env, expected=2)
+            if "invalid snapshot structure" not in rejected.stderr:
+                raise AssertionError("nested unknown-field rejection: %s" % rejected.stderr)
 
             orphan = json.loads(original_bytes)
             orphan["messages"][2]["tool_call_id"] = "orphan"

@@ -307,12 +307,52 @@ static int parse_content_length(const char *req, size_t header_len,
   return 0;
 }
 
+static int json_hex_digit(unsigned char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+/* cJSON exposes decoded strings as NUL-terminated C strings without a
+ * separate length, and its invalid hex-digit conversion can also yield NUL.
+ * Validate every Unicode escape and reject raw/decoded NUL before parsing so
+ * IDs/messages cannot silently acquire a hidden suffix. Return 1 for NUL, 2
+ * for malformed Unicode. The scan is O(n), allocation-free and distinguishes
+ * a double-escaped literal from an actual Unicode escape. */
+static int json_string_error(const char *json, size_t length) {
+  int in_string = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)json[i];
+    if (!c) return 1;
+    if (!in_string) {
+      if (c == '"') in_string = 1;
+      continue;
+    }
+    if (c == '"') { in_string = 0; continue; }
+    if (c != '\\' || i + 1 >= length) continue;
+    c = (unsigned char)json[++i];
+    if (c != 'u') continue;
+    if (length - i < 5) return 2;
+    unsigned int codepoint = 0;
+    for (size_t j = 1; j <= 4; j++) {
+      int digit = json_hex_digit((unsigned char)json[i + j]);
+      if (digit < 0) return 2;
+      codepoint = (codepoint << 4) | (unsigned int)digit;
+    }
+    if (!codepoint) return 1;
+    i += 4;
+  }
+  return 0;
+}
+
 /* Read one bounded request. The allocation is at most
  * MAX_HEADER + MAX_BODY + 1 bytes, including the trailing NUL. */
-static char *read_request(int fd, int *status) {
+static char *read_request(int fd, int *status, size_t *request_body_len) {
   size_t cap = 8192, len = 0, header_len = 0, body_len = 0, searched = 0;
   struct timespec deadline;
   *status = 500;
+  *request_body_len = 0;
   if (gateway_deadline(&deadline) != 0) return NULL;
   char *buf = malloc(cap + 1);
   if (!buf) return NULL;
@@ -354,6 +394,7 @@ static char *read_request(int fd, int *status) {
       len = header_len + body_len; /* ignore pipelined/extra bytes */
       buf[len] = '\0';
       *status = 0;
+      *request_body_len = body_len;
       return buf;
     }
   }
@@ -415,7 +456,8 @@ static void handle_connection(int fd, int tools_on) {
     return;
   }
   int read_status = 0;
-  char *req = read_request(fd, &read_status);
+  size_t body_len = 0;
+  char *req = read_request(fd, &read_status, &body_len);
   if (!req) {
     const char *msg = read_status == 413 ? "request too large" :
                       read_status == 408 ? "request timeout" :
@@ -447,7 +489,13 @@ static void handle_connection(int fd, int tools_on) {
   /* locate body after CRLFCRLF */
   char *bs = strstr(req, "\r\n\r\n");
   if (!bs) { send_err(fd, 400, "malformed request"); goto out; }
-  body = cJSON_Parse(bs + 4);
+  int json_error = json_string_error(bs + 4, body_len);
+  if (json_error) {
+    send_err(fd, 400, json_error == 1 ? "embedded NUL is not allowed" :
+                                      "invalid Unicode escape");
+    goto out;
+  }
+  body = cJSON_ParseWithLength(bs + 4, body_len + 1);
   if (!body) { send_err(fd, 400, "invalid json body"); goto out; }
 
   const char *chat_id = NULL, *message = NULL;

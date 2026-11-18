@@ -82,10 +82,15 @@ skill_write 工具。会话恢复已升级为有界 full-turn JSON checkpoint，
   或 C API 调低。16 MiB 是有界上限而非预分配，也不是 MCU RAM 预算。
 - CLI `--save`、REPL(tty 下)和 Gateway 只在完整成功回合后保存；保留
   user/assistant/tool_calls/tool_call_id 的顺序与多行内容，不执行旧工具。
+  Provider assistant 在摄入时归一化为 role/content/tool_calls，tool call 与
+  function 也只保留快照契约字段；扩展 metadata 不进入 replay/snapshot，
+  导入快照仍拒绝未知字段。
 - 快照上限 1 MiB / 256 messages / 256 KiB record / 256 tool calls；校验
   session_id、完整性 digest、角色和 tool 配对，legacy/损坏/超限输入 fail closed。
 - 网关:`gateway/<hex(chat_id)>.log` 同时以文件名和 session_id 绑定完整 ID；
-  重启及 64 会话淘汰后恢复完整消息，旧 sanitize/I/U/A/T 文件不迁移。
+  重启及 64 会话淘汰后恢复完整消息，旧 sanitize/I/U/A/T 文件不迁移。JSON
+  解码前按 Content-Length 拒绝 raw/escaped NUL 和 malformed Unicode escape，
+  避免隐藏后缀共享会话或快照。
 - `--sessions` / `/sessions [TERM]` 继续列文件；`/resume FILE` 在空上下文
   恢复完整快照。host 后端采用短临时名 + flush/fsync + atomic rename，
   strict core-only nofs 构建不链接该模块。

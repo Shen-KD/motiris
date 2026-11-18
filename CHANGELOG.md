@@ -96,6 +96,15 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- Successful turns with provider assistant metadata (`refusal`, `annotations`
+  and other extensions) now save and resume through a canonical
+  `role`/`content`/`tool_calls` representation with strict tool-call/function
+  fields; imported snapshots still reject unknown fields. Gateway JSON bodies
+  are parsed with explicit lengths and reject raw/escaped embedded NUL plus
+  malformed Unicode escapes before reset/session lookup, so `chat_id` prefixes
+  cannot share history or snapshots. Offline tests cover metadata shapes,
+  strict-import preservation, raw/escaped/malformed Unicode NUL cases,
+  reset/restart isolation and double-escaped literal IDs.
 - Keyless provider-list entries no longer inherit the default Agent or
   `MOTIRIS_API_KEY` Bearer credential. Omitted/missing entry key environments,
   independent keys and mixed multi-hop fallback are covered by offline mock
