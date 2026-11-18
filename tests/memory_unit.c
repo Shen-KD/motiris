@@ -113,6 +113,12 @@ static char *call_set(const char *key, const char *value) {
   return result;
 }
 
+static char *call_set_raw(const char *json) {
+  char *result = mem_set_call(json, NULL);
+  if (!result) die("memory_set returned NULL for raw arguments");
+  return result;
+}
+
 static char *call_get(const char *key) {
   cJSON *args = cJSON_CreateObject();
   if (!args) die("allocate get arguments");
@@ -132,6 +138,15 @@ static void expect_error(const char *result) {
   if (!cJSON_IsObject(json) ||
       !cJSON_IsString(cJSON_GetObjectItemCaseSensitive(json, "error")) ||
       cJSON_GetObjectItemCaseSensitive(json, "ok"))
+    die(result);
+  cJSON_Delete(json);
+}
+
+static void expect_error_message(const char *result, const char *expected) {
+  cJSON *json = cJSON_Parse(result);
+  cJSON *error = cJSON_GetObjectItemCaseSensitive(json, "error");
+  if (!cJSON_IsObject(json) || !cJSON_IsString(error) ||
+      strcmp(error->valuestring, expected) || strlen(result) > 128)
     die(result);
   cJSON_Delete(json);
 }
@@ -304,6 +319,27 @@ int main(void) {
   expect_bytes(path, valid, sizeof(valid) - 1);
 
   for (int fault = 1; fault <= 4; fault++) check_save_failure(path, fault);
+
+  static const char *bad_values[] = {
+    "{\"key\":\"important\"}",
+    "{\"key\":\"important\",\"value\":null}",
+    "{\"key\":\"important\",\"value\":7}",
+    "{\"key\":\"important\",\"value\":[]}"
+  };
+  for (size_t i = 0; i < sizeof(bad_values) / sizeof(bad_values[0]); i++) {
+    write_raw(path, valid, sizeof(valid) - 1);
+    result = call_set_raw(bad_values[i]);
+    expect_error_message(result, "value required (string)");
+    free(result);
+    expect_bytes(path, valid, sizeof(valid) - 1);
+    expect_no_temps(path);
+  }
+  result = call_set("important", "");
+  expect_stored(result);
+  free(result);
+  result = call_get("important");
+  expect_value(result, "");
+  free(result);
 
   write_raw(path, valid, sizeof(valid) - 1);
   char *long_key = malloc(MEMORY_KEY_MAX + 2);

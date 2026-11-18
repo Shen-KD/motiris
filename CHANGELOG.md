@@ -96,6 +96,14 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- File and persistent-memory handlers reject missing or wrongly typed required
+  strings before touching stored state. This closes missing-`content` /
+  missing-`value` data erasure and uninitialized file-error reads. File reads
+  and patches now enforce the 1 MiB regular-file bound without FIFO blocking;
+  writes and patches use complete same-directory temporary writes,
+  `fsync`/close checks and atomic rename, preserving old bytes on the listed
+  pre-rename failures. Direct handler fault-injection suites run in tools and
+  sanitizer CI.
 - `browser_fetch` and `subagent` now share bounded host-child execution:
   `MOTIRIS_BROWSER_TIMEOUT_S` (default 30 s) and
   `MOTIRIS_SUBAGENT_TIMEOUT_S` (default 120 s), each range 1..120, apply one

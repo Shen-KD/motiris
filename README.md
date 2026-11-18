@@ -94,6 +94,7 @@ make test-core-nofs   # core-only retention + memory snapshot round-trip
 make test-shell       # bounded shell execution integration tests
 make test-browser-subagent # bounded browser/subagent process tests
 make test-webtools-parser # malformed/truncated web_search parser regression
+make test-filetools   # malformed args, file bounds and atomic fault injection
 make test-memory      # memory corruption/atomic-failure/replacement tests
 make test-vision      # clean optional-vision build + local mock integration
 make VISION_TOOLS=1   # opt in to the host-backed vision_analyze tool
@@ -280,6 +281,17 @@ rejected):
   file / 16 MiB total, 4096-byte line buffer and 200 matches. Results include
   skip/truncation diagnostics. Explicit start paths must still canonicalize
   inside the workspace.
+
+`read_file`, `write_file` and `patch` reject missing or wrongly typed required
+arguments before resolving or opening a target. Explicit empty `content` and
+`new` strings remain valid; `old` must be non-empty. Reads and patch results
+are capped at 1 MiB, as is `write_file` content. Reads reject FIFOs and other
+non-regular files without blocking. Writes use a short same-directory temporary
+file, preserve basic permission bits, check complete writes/`fsync`/`close` and
+atomically rename. Validation and listed pre-rename I/O failures return bounded
+errors, attempt temporary-file cleanup and preserve the original bytes.
+`patch` requires all of `path`, `old`
+and `new`. Direct handler fault-injection tests run in tools and sanitizer CI.
 
 Knowledge & delegation tools:
 
@@ -477,6 +489,7 @@ make test-persistence # PERSISTENCE=0 fail-closed/volatile-only integration
 make test-shell    # shell dual-stream/cap/timeout/reaping regression cases
 make test-browser-subagent # browser/subagent deadline/flood/cleanup cases
 make test-webtools-parser # malformed/truncated DDG row tests (also in smoke #11)
+make test-filetools # malformed handlers + file bounds/atomic fault coverage
 make test-memory   # memory corruption/atomic faults + replacement coverage
 make test-vision   # optional vision build + 10 local-mock integration cases
 make test-tts      # optional TTS build + 8 fake-engine integration cases

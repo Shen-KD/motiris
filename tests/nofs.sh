@@ -77,6 +77,10 @@ try:
         assert "time" in tool_names, tool_names
         assert "memory_get" in tool_names, tool_names
         assert "memory_set" in tool_names, tool_names
+        patch_schema = next(tool["function"] for tool in captures[0]["tools"]
+                            if tool["function"]["name"] == "patch")
+        assert set(patch_schema["parameters"]["required"]) == {
+            "path", "old", "new"}, patch_schema
         proc = subprocess.run(
             [str(root / "motiris"), "-p", "memory", "-k", "x", "--max-steps", "3"],
             env=env, text=True, capture_output=True, timeout=10)

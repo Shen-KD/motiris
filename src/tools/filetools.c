@@ -69,6 +69,118 @@ static char *err_json(const char *msg) {
   return s;
 }
 
+/* Read one regular file without blocking on FIFOs or growing past MAX_FILE.
+ * The caller owns the returned buffer. All failures leave *length at zero. */
+static char *read_bounded(const char *path, size_t *length, const char **error) {
+  *length = 0;
+  int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) { *error = "cannot open file"; return NULL; }
+
+  struct stat st;
+  if (fstat(fd, &st)) {
+    close(fd);
+    *error = "cannot stat file";
+    return NULL;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    close(fd);
+    *error = "file is not a regular file";
+    return NULL;
+  }
+  if (st.st_size < 0 || st.st_size > MAX_FILE) {
+    close(fd);
+    *error = "file exceeds 1 MiB limit";
+    return NULL;
+  }
+
+  size_t expected = (size_t)st.st_size;
+  char *buffer = malloc(expected + 1);
+  if (!buffer) {
+    close(fd);
+    *error = "cannot allocate file buffer";
+    return NULL;
+  }
+  size_t used = 0;
+  int failed = 0;
+  while (used <= expected) {
+    ssize_t n = read(fd, buffer + used, expected + 1 - used);
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0) { failed = 1; break; }
+    if (n == 0) break;
+    used += (size_t)n;
+  }
+  if (close(fd)) failed = 1;
+  if (failed || used != expected) {
+    free(buffer);
+    *error = used > expected && expected == MAX_FILE
+                 ? "file exceeds 1 MiB limit"
+                 : "file changed or could not be read completely";
+    return NULL;
+  }
+  buffer[used] = '\0';
+  *length = used;
+  return buffer;
+}
+
+/* Replace one existing regular file through a short, same-directory temporary
+ * name. Any write/sync/close/rename failure preserves the original. */
+static int atomic_write(const char *path, const char *data, size_t length,
+                        const char **error) {
+  struct stat st;
+  if (stat(path, &st) || !S_ISREG(st.st_mode)) {
+    *error = "file is not a regular file";
+    return -1;
+  }
+  const char *slash = strrchr(path, '/');
+  if (!slash) { *error = "cannot locate file directory"; return -1; }
+  size_t dirlen = slash == path ? 1 : (size_t)(slash - path);
+  size_t temporary_size = dirlen + sizeof("/.motiris-tmp-XXXXXX");
+  char *temporary = malloc(temporary_size);
+  if (!temporary) { *error = "cannot allocate temporary file path"; return -1; }
+  if (dirlen == 1 && path[0] == '/')
+    snprintf(temporary, temporary_size, "/.motiris-tmp-XXXXXX");
+  else
+    snprintf(temporary, temporary_size, "%.*s/.motiris-tmp-XXXXXX",
+             (int)dirlen, path);
+
+  int fd = mkstemp(temporary);
+  if (fd < 0) {
+    free(temporary);
+    *error = "cannot create temporary file";
+    return -1;
+  }
+  int rc = -1;
+  if (fchmod(fd, st.st_mode & 0777)) {
+    *error = "cannot set temporary file permissions";
+    goto out;
+  }
+  size_t written = 0;
+  while (written < length) {
+    ssize_t n = write(fd, data + written, length - written);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) { *error = "cannot write temporary file"; goto out; }
+    written += (size_t)n;
+  }
+  if (fsync(fd)) { *error = "cannot sync temporary file"; goto out; }
+  if (close(fd)) {
+    fd = -1;
+    *error = "cannot close temporary file";
+    goto out;
+  }
+  fd = -1;
+  if (rename(temporary, path)) {
+    *error = "cannot replace file atomically";
+    goto out;
+  }
+  rc = 0;
+
+out:
+  if (fd >= 0) close(fd);
+  if (rc) unlink(temporary);
+  free(temporary);
+  return rc;
+}
+
 /* ---------------- read_file ---------------- */
 static char *read_file_call(const char *args_json, void *ud) {
   (void)ud;
@@ -76,29 +188,18 @@ static char *read_file_call(const char *args_json, void *ud) {
   if (!args) return err_json("cannot parse arguments");
   const char *path = cJSON_GetStringValue(
       cJSON_GetObjectItemCaseSensitive(args, "path"));
-  char errb[256];
-  char *abs = path ? resolve(path, errb, sizeof errb) : NULL;
+  if (!path) { cJSON_Delete(args); return err_json("path required (string)"); }
+  char errb[256] = {0};
+  char *abs = resolve(path, errb, sizeof errb);
   if (!abs) { cJSON_Delete(args); return err_json(errb); }
 
-  FILE *f = fopen(abs, "r");
+  const char *error = NULL;
+  size_t len;
+  char *buf = read_bounded(abs, &len, &error);
   free(abs);
   cJSON_Delete(args);
-  if (!f) return err_json("cannot open file");
+  if (!buf) return err_json(error);
 
-  size_t cap = 4096, len = 0;
-  char *buf = malloc(cap);
-  size_t n;
-  while ((n = fread(buf + len, 1, cap - len - 1, f)) > 0) {
-    len += n;
-    if (len + 1 >= cap) {
-      if (cap >= MAX_FILE) { fclose(f); free(buf);
-        return err_json("file exceeds 1MB limit"); }
-      cap *= 2;
-      buf = realloc(buf, cap);
-    }
-  }
-  fclose(f);
-  buf[len] = '\0';
   cJSON *r = cJSON_CreateObject();
   cJSON_AddStringToObject(r, "content", buf);
   free(buf);
@@ -402,16 +503,25 @@ static char *write_call(const char *args_json, void *ud) {
       cJSON_GetObjectItemCaseSensitive(args, "path"));
   const char *content = cJSON_GetStringValue(
       cJSON_GetObjectItemCaseSensitive(args, "content"));
-  char errb[256];
-  char *abs = path ? resolve(path, errb, sizeof errb) : NULL;
+  if (!path) { cJSON_Delete(args); return err_json("path required (string)"); }
+  if (!content) {
+    cJSON_Delete(args);
+    return err_json("content required (string)");
+  }
+  size_t len = strlen(content);
+  if (len > MAX_FILE) {
+    cJSON_Delete(args);
+    return err_json("content exceeds 1 MiB limit");
+  }
+  char errb[256] = {0};
+  char *abs = resolve(path, errb, sizeof errb);
   if (!abs) { cJSON_Delete(args); return err_json(errb); }
 
-  FILE *f = fopen(abs, "w");
+  const char *error = NULL;
+  int rc = atomic_write(abs, content, len, &error);
   free(abs);
   cJSON_Delete(args);
-  if (!f) return err_json("cannot write file");
-  if (content) fwrite(content, 1, strlen(content), f);
-  fclose(f);
+  if (rc) return err_json(error);
 
   cJSON *r = cJSON_CreateObject();
   cJSON_AddStringToObject(r, "ok", "written");
@@ -431,47 +541,59 @@ static char *patch_call(const char *args_json, void *ud) {
       cJSON_GetObjectItemCaseSensitive(args, "old"));
   const char *new_t = cJSON_GetStringValue(
       cJSON_GetObjectItemCaseSensitive(args, "new"));
-  char errb[256];
-
+  if (!path) { cJSON_Delete(args); return err_json("path required (string)"); }
   if (!old_t || !*old_t) {
     cJSON_Delete(args);
-    return err_json("old text required");
+    return err_json("old text required (non-empty string)");
   }
-  char *abs = path ? resolve(path, errb, sizeof errb) : NULL;
+  if (!new_t) { cJSON_Delete(args); return err_json("new required (string)"); }
+  char errb[256] = {0};
+  char *abs = resolve(path, errb, sizeof errb);
   if (!abs) { cJSON_Delete(args); return err_json(errb); }
 
-  size_t cap = 4096, len = 0;
-  char *buf = malloc(cap);
-  FILE *f = fopen(abs, "r");
-  if (!f) { free(buf); free(abs); cJSON_Delete(args);
-    return err_json("cannot open file"); }
-  size_t n;
-  while ((n = fread(buf + len, 1, cap - len - 1, f)) > 0) {
-    len += n;
-    if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+  const char *error = NULL;
+  size_t len;
+  char *buf = read_bounded(abs, &len, &error);
+  if (!buf) {
+    free(abs);
+    cJSON_Delete(args);
+    return err_json(error);
   }
-  fclose(f);
-  buf[len] = '\0';
 
   char *hit = strstr(buf, old_t);
-  size_t olen = strlen(old_t), nlen = new_t ? strlen(new_t) : 0;
+  size_t olen = strlen(old_t), nlen = strlen(new_t);
   int replaced = 0;
   if (hit) {
     size_t off = (size_t)(hit - buf);
-    size_t newlen = len - olen + nlen;
+    size_t suffix = len - off - olen;
+    if (nlen > MAX_FILE - off - suffix) {
+      free(buf);
+      free(abs);
+      cJSON_Delete(args);
+      return err_json("patched file exceeds 1 MiB limit");
+    }
+    size_t newlen = off + nlen + suffix;
     char *nb = malloc(newlen + 1);
+    if (!nb) {
+      free(buf);
+      free(abs);
+      cJSON_Delete(args);
+      return err_json("cannot allocate patched file buffer");
+    }
     memcpy(nb, buf, off);
     if (nlen) memcpy(nb + off, new_t, nlen);
-    memcpy(nb + off + nlen, buf + off + olen, len - off - olen + 1);
+    memcpy(nb + off + nlen, buf + off + olen, suffix + 1);
     free(buf);
     buf = nb;
     len = newlen;
     replaced = 1;
   }
 
-  if (replaced) {
-    f = fopen(abs, "w");
-    if (f) { fwrite(buf, 1, len, f); fclose(f); }
+  if (replaced && atomic_write(abs, buf, len, &error)) {
+    free(buf);
+    free(abs);
+    cJSON_Delete(args);
+    return err_json(error);
   }
   free(buf);
   free(abs);
@@ -500,7 +622,7 @@ static const MotirisTool file_tools[] = {
     "Replace the first occurrence of 'old' with 'new' in a workspace file.",
     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
     "\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},"
-    "\"required\":[\"path\",\"old\"]}",
+    "\"required\":[\"path\",\"old\",\"new\"]}",
     patch_call, NULL },
   { "search_files",
     "Regex-search files under a path (default workspace root); returns "

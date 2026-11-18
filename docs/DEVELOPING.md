@@ -38,6 +38,7 @@ make PERSISTENCE=0    # optional host checkpoint files -> volatile sessions
 make test-shell       # dual-stream, output cap, timeout and reaping tests
 make test-browser-subagent # browser/subagent deadline and cleanup tests
 make test-webtools-parser # malformed/truncated DDG response parser tests
+make test-filetools   # malformed handlers, file bounds and atomic faults
 make test-memory      # memory corruption, atomic fault and replacement tests
 make test-nofs        # strict-C11 core probe + full-CLI backend-cut test
 make test-persistence # full-CLI checkpoint-cut fail-closed/volatile tests
@@ -525,6 +526,58 @@ Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
 These are host binary/RSS measurements, not MCU Flash/RAM headroom. No
 MCU/RTOS cross-toolchain or hardware validation was performed.
 
+### Validated, bounded and atomic file tools
+
+`read_file`, `write_file` and `patch` validate every required JSON string
+before path resolution or file mutation. Missing, null, numeric and array
+values return deterministic bounded errors; empty `content` and `new` strings
+are valid, while `old` must be non-empty. The `patch` schema now declares `new`
+as required. `memory_set` likewise rejects a missing or wrongly typed `value`
+before loading or detaching persistent state, while preserving explicit empty
+string values.
+
+A shared regular-file reader uses `O_NONBLOCK`, `fstat`, exact-size allocation
+and complete-read checks. Input and patched output are capped at 1 MiB, with at
+most 1 MiB + 1 byte for each owned read/patch buffer. Patch temporarily owns
+both buffers before the old one is freed; cJSON argument trees and result
+serialization add phase-wise implementation-dependent overhead. `write_file`
+content is independently capped at 1 MiB. FIFOs and other non-regular files
+are rejected without a blocking read.
+
+Writes preserve basic `0777` permission bits on a short same-directory
+`mkstemp` file, handle partial writes and `EINTR`, check `fsync`/`close`, then
+atomically `rename`. Allocation, open, write, sync, close and rename failures
+return an error, attempt temporary-file cleanup and preserve the old bytes.
+Ownership, ACLs, xattrs and directory-fsync crash durability are not added.
+No runtime,
+thread, global Agent state or default core dependency was added; these host
+tools remain outside the strict-C11 core-only probe and retain their existing
+`FILE_TOOLS=0` / `MEMORY_TOOLS=0` no-I/O cuts.
+
+`tests/filetools_unit.c` includes the production translation unit and wraps
+open/read/allocation/temp-create/write/fsync/close/rename for deterministic
+fault injection. It covers malformed arguments, explicit empty strings,
+1 MiB boundaries, oversized input, FIFO rejection, short writes/reads,
+permission preservation and byte-for-byte failure preservation. It runs in
+smoke #11 and both ASAN/UBSAN and leak-enabled CI steps. `tests/memory_unit.c`
+also covers missing/wrongly typed values and explicit empty strings.
+
+Reference host measurements on 2026-11-18 (Linux x86_64, gcc, stripped;
+baseline `e08e2cc`) are:
+
+| Build / measurement | Baseline | Fixed branch | Relative result |
+| --- | ---: | ---: | --- |
+| Default full CLI | 186,624 bytes; text 173,042; data 3,048; BSS 169,040 | 186,624 bytes; text 174,754; data 3,048; BSS 169,040 | +0 file; +1,712 text; data/BSS unchanged |
+| Strict core-only nofs probe | 69,840 bytes unstripped; text 49,715; data 952; BSS 4,232 | identical file and sections | unchanged; host file tools absent |
+| `tests/perf.sh` cold peak RSS | 9,304 KiB | 9,156 KiB | -148 KiB host variation; both 50 ms |
+| `tests/perf.sh` 5-step loop peak RSS | 8,864 KiB | 9,156 KiB | +292 KiB host variation; both 50 ms and below guards |
+| Direct filetools unit maximum RSS | test not present | 6,040 KiB | New boundary/fault suite; GNU `time`, not an MCU budget |
+| Memory maximum-value integration RSS | 13,100 KiB existing reference | 13,072 KiB | -28 KiB host run variation; valid-path coverage unchanged |
+
+Default direct ELF dependencies remain only `libcurl.so.4` and `libc.so.6`.
+These are host application bounds and measurements, not MCU Flash/RAM
+headroom. No MCU/RTOS cross-toolchain or hardware validation was performed.
+
 ### Bounded, failure-safe persistent memory files
 
 `memory_set` / `memory_get` use the optional host
@@ -867,6 +920,8 @@ may still use its own atomic replacement.
 - Smoke #11: shell drains both pipes concurrently, enforces per-stream/total
   output caps and a monotonic timeout, kills/reaps its process group, and
   survives repeated calls without fd/direct-child leaks (also under ASAN/UBSAN).
+  `make test-filetools` proves malformed-argument rejection, bounded regular
+  file reads/patches, atomic failure cleanup and byte preservation.
   `make test-memory` additionally proves invalid-file preservation, bounded
   input/storage, atomic failure cleanup and leak-free repeated replacement;
   the dedicated sanitizer CI step enables LSan for both memory test layers.

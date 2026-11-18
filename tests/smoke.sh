@@ -526,6 +526,7 @@ rm -rf "$F11"
 make -s test-webtools-parser
 python3 tests/webtools.py
 python3 tests/shell.py
+make test-filetools
 make test-memory
 
 fi

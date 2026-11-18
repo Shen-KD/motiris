@@ -227,7 +227,8 @@ static char *mem_set_call(const char *args_json, void *ud) {
     cJSON_Delete(args);
     return err_json("memory key exceeds 256-byte limit");
   }
-  if (value && strlen(value) > MEMORY_VALUE_MAX) {
+  if (!value) { cJSON_Delete(args); return err_json("value required (string)"); }
+  if (strlen(value) > MEMORY_VALUE_MAX) {
     cJSON_Delete(args);
     return err_json("memory value exceeds 256 KiB limit");
   }
@@ -237,7 +238,7 @@ static char *mem_set_call(const char *args_json, void *ud) {
   if (!mem) { cJSON_Delete(args); return err_json(error); }
 
   cJSON_Delete(cJSON_DetachItemFromObject(mem, key));
-  if (!cJSON_AddStringToObject(mem, key, value ? value : "")) {
+  if (!cJSON_AddStringToObject(mem, key, value)) {
     cJSON_Delete(mem);
     cJSON_Delete(args);
     return err_json("cannot allocate memory entry");
