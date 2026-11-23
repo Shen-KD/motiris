@@ -1,8 +1,8 @@
 /* filetools.c - file read/write/patch/search tools (issue #4).
  *
- * All tools resolve paths against a workspace root (env MOTIRIS_WORKSPACE
- * if set, else the process cwd) and refuse to touch anything outside it
- * (realpath prefix check). Results are plain JSON for the model.
+ * Paths are canonicalized. The optional per-Agent workspace_guard restricts
+ * them to MOTIRIS_WORKSPACE/cwd; by default only OS permissions and the
+ * resource/atomicity checks limit file access. Results are plain JSON.
  */
 #include "motiris.h"
 
@@ -34,7 +34,8 @@ static const char *workspace(void) {
 }
 
 /* resolve path; returns malloc'd absolute path or NULL (blocked/noexist) */
-static char *resolve(const char *path, char *errbuf, size_t errlen) {
+static char *resolve(const char *path, char *errbuf, size_t errlen,
+                     MotirisAgent *agent) {
   if (!path || !*path) {
     snprintf(errbuf, errlen, "empty path");
     return NULL;
@@ -45,6 +46,7 @@ static char *resolve(const char *path, char *errbuf, size_t errlen) {
 
   char *res = realpath(abs, NULL);
   if (!res) { snprintf(errbuf, errlen, "cannot resolve %s", path); return NULL; }
+  if (agent && !motiris_workspace_guard_enabled(agent)) return res;
 
   const char *ws = workspace();
   char *wsr = realpath(ws, NULL);
@@ -59,6 +61,18 @@ static char *resolve(const char *path, char *errbuf, size_t errlen) {
     return NULL;
   }
   return res;
+}
+
+/* Read-only exception for exact files in the automatic skill index. Writes,
+ * patches and searches continue to use the strict workspace resolver above. */
+static char *resolve_read(const char *path, char *errbuf, size_t errlen,
+                          MotirisAgent *agent) {
+  char *resolved = resolve(path, errbuf, errlen, agent);
+  if (resolved || !path || path[0] != '/') return resolved;
+  resolved = realpath(path, NULL);
+  if (resolved && motiris_skill_file_readable(resolved)) return resolved;
+  free(resolved);
+  return NULL;
 }
 
 static char *err_json(const char *msg) {
@@ -183,14 +197,13 @@ out:
 
 /* ---------------- read_file ---------------- */
 static char *read_file_call(const char *args_json, void *ud) {
-  (void)ud;
   cJSON *args = cJSON_Parse(args_json);
   if (!args) return err_json("cannot parse arguments");
   const char *path = cJSON_GetStringValue(
       cJSON_GetObjectItemCaseSensitive(args, "path"));
   if (!path) { cJSON_Delete(args); return err_json("path required (string)"); }
   char errb[256] = {0};
-  char *abs = resolve(path, errb, sizeof errb);
+  char *abs = resolve_read(path, errb, sizeof errb, ud);
   if (!abs) { cJSON_Delete(args); return err_json(errb); }
 
   const char *error = NULL;
@@ -416,7 +429,6 @@ static void walk_dir_fd(int startfd, const char *startpath, SearchCtx *sc) {
 }
 
 static char *search_call(const char *args_json, void *ud) {
-  (void)ud;
   cJSON *args = cJSON_Parse(args_json);
   if (!args) return err_json("cannot parse arguments");
   const char *pattern = cJSON_GetStringValue(
@@ -429,22 +441,24 @@ static char *search_call(const char *args_json, void *ud) {
   }
 
   char errb[256];
-  char *abs = resolve(path ? path : ".", errb, sizeof errb);
+  char *abs = resolve(path ? path : ".", errb, sizeof errb, ud);
   if (!abs) { cJSON_Delete(args); return err_json(errb); }
-  char *wsr = realpath(workspace(), NULL);
+  int guarded = !ud || motiris_workspace_guard_enabled(ud);
+  char *wsr = guarded ? realpath(workspace(), NULL) : strdup("/");
   if (!wsr) {
     free(abs);
     cJSON_Delete(args);
     return err_json("workspace not resolvable");
   }
   size_t wl = strlen(wsr);
-  if (strncmp(abs, wsr, wl) || (abs[wl] && abs[wl] != '/')) {
+  if (guarded && (strncmp(abs, wsr, wl) || (abs[wl] && abs[wl] != '/'))) {
     free(wsr);
     free(abs);
     cJSON_Delete(args);
     return err_json("path outside workspace");
   }
-  const char *rel = abs[wl] ? abs + wl + 1 : ".";
+  const char *rel = guarded ? (abs[wl] ? abs + wl + 1 : ".")
+                            : (abs[1] ? abs + 1 : ".");
 
   SearchCtx sc = {0};
   sc.out = cJSON_CreateArray();
@@ -496,7 +510,6 @@ static char *search_call(const char *args_json, void *ud) {
 
 /* ---------------- write_file ---------------- */
 static char *write_call(const char *args_json, void *ud) {
-  (void)ud;
   cJSON *args = cJSON_Parse(args_json);
   if (!args) return err_json("cannot parse arguments");
   const char *path = cJSON_GetStringValue(
@@ -514,7 +527,7 @@ static char *write_call(const char *args_json, void *ud) {
     return err_json("content exceeds 1 MiB limit");
   }
   char errb[256] = {0};
-  char *abs = resolve(path, errb, sizeof errb);
+  char *abs = resolve(path, errb, sizeof errb, ud);
   if (!abs) { cJSON_Delete(args); return err_json(errb); }
 
   const char *error = NULL;
@@ -532,7 +545,6 @@ static char *write_call(const char *args_json, void *ud) {
 
 /* ---------------- patch (first occurrence replace) ---------------- */
 static char *patch_call(const char *args_json, void *ud) {
-  (void)ud;
   cJSON *args = cJSON_Parse(args_json);
   if (!args) return err_json("cannot parse arguments");
   const char *path = cJSON_GetStringValue(
@@ -548,7 +560,7 @@ static char *patch_call(const char *args_json, void *ud) {
   }
   if (!new_t) { cJSON_Delete(args); return err_json("new required (string)"); }
   char errb[256] = {0};
-  char *abs = resolve(path, errb, sizeof errb);
+  char *abs = resolve(path, errb, sizeof errb, ud);
   if (!abs) { cJSON_Delete(args); return err_json(errb); }
 
   const char *error = NULL;
@@ -609,23 +621,23 @@ static char *patch_call(const char *args_json, void *ud) {
 /* ---------------- registration ---------------- */
 static const MotirisTool file_tools[] = {
   { "read_file",
-    "Read a text file inside the workspace (env MOTIRIS_WORKSPACE or cwd).",
+    "Read a text file; workspace_guard optionally restricts its path.",
     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},"
     "\"required\":[\"path\"]}",
     read_file_call, NULL },
   { "write_file",
-    "Overwrite a file inside the workspace with the given content.",
+    "Overwrite an existing file atomically; optional workspace_guard applies.",
     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
     "\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}",
     write_call, NULL },
   { "patch",
-    "Replace the first occurrence of 'old' with 'new' in a workspace file.",
+    "Replace the first occurrence of 'old' with 'new'; optional path guard.",
     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
     "\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},"
     "\"required\":[\"path\",\"old\",\"new\"]}",
     patch_call, NULL },
   { "search_files",
-    "Regex-search files under a path (default workspace root); returns "
+    "Regex-search files under a path (default cwd); optional workspace_guard; returns "
     "matching file/line/text entries.",
     "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},"
     "\"path\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}",
@@ -633,6 +645,9 @@ static const MotirisTool file_tools[] = {
 };
 
 void motiris_register_file_tools(MotirisAgent *a) {
-  for (size_t i = 0; i < sizeof file_tools / sizeof file_tools[0]; i++)
-    motiris_register_tool(a, &file_tools[i]);
+  for (size_t i = 0; i < sizeof file_tools / sizeof file_tools[0]; i++) {
+    MotirisTool tool = file_tools[i];
+    tool.ud = a;
+    motiris_register_tool(a, &tool);
+  }
 }

@@ -152,6 +152,11 @@ void motiris_register_tool(MotirisAgent *a, const MotirisTool *t) {
   (void)t;
 }
 
+int motiris_skill_file_readable(const char *canonical_path) {
+  (void)canonical_path;
+  return 0; /* this unit exercises ordinary workspace paths only */
+}
+
 static void die(const char *message) {
   fprintf(stderr, "filetools-unit: FAIL: %s\n", message);
   exit(1);

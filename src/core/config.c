@@ -4,8 +4,8 @@
  *                defaults: a variable already exported in the calling
  *                environment wins. Parsed (never sourced) - plain text.
  *   config.json  optional JSON: model, base_url, api_key_env,
- *                max_steps, transport, stream, system, plugin_dir,
- *                tools, plugins.
+ *                max_steps, transport, stream, approval, reasoning_effort,
+ *                show_thinking, system, plugin_dir, tools, plugins.
  *
  * Precedence: CLI flags > config.json > env file > built-in defaults.
  * Missing files are fine; run `motiris --init` to generate templates.
@@ -37,13 +37,21 @@ static char *config_dir(void) {
   return p;
 }
 
-static char file_envs[16][64];
+/* Only keys whose provenance changes config.json precedence need tracking. */
+static char file_envs[3][32];
 static int n_file_envs;
+
+static int precedence_key(const char *key) {
+  return !strcmp(key, "MOTIRIS_MODEL") ||
+         !strcmp(key, "MOTIRIS_BASE_URL") ||
+         !strcmp(key, "MOTIRIS_GOAL_CHECK");
+}
 
 static void setenv_default(const char *key, const char *val) {
   if (val && *val && !getenv(key)) {
     setenv(key, val, 0);
-    if (n_file_envs < 16) snprintf(file_envs[n_file_envs++], 64, "%s", key);
+    if (precedence_key(key) && n_file_envs < 3)
+      snprintf(file_envs[n_file_envs++], 32, "%.31s", key);
   }
 }
 
@@ -55,26 +63,34 @@ static int env_overrides(const char *key) {
   return 1;
 }
 
-/* parse KEY=VALUE lines; apply MOTIRIS_* vars as defaults */
-/* expand ${NAME} and ${NAME:-default} in values (no shell involved) */
-static void expand_var(char *v, size_t cap) {
-  char *dollar = strchr(v, '$');
-  while (dollar && dollar[1] == '{') {
+/* parse KEY=VALUE lines; apply MOTIRIS_* vars as defaults.
+ * Expansion is bounded and copies replacements before moving overlapping
+ * inline defaults. Invalid/recursive entries are skipped with no value dump. */
+#define ENV_EXPANSION_MAX 64
+static int expand_var(char *v, size_t cap) {
+  for (int expansions = 0; expansions < ENV_EXPANSION_MAX; expansions++) {
+    char *dollar = strchr(v, '$');
+    if (!dollar || dollar[1] != '{') return 0;
     char *end = strchr(dollar, '}');
-    if (!end) break;
+    if (!end) return -1;
     *end = '\0';
     char *name = dollar + 2;
     const char *dflt = NULL;
     char *dash = strstr(name, ":-");
     if (dash) { *dash = '\0'; dflt = dash + 2; }
+    if (!*name) return -1;
     const char *val = getenv(name);
     const char *use = (val && *val) ? val : (dflt ? dflt : "");
     size_t used = strlen(use), tail = strlen(end + 1);
-    if (used + tail + (size_t)(dollar - v) + 1 > cap) break;
+    if (used + tail + (size_t)(dollar - v) + 1 > cap) return -1;
+    char *replacement = malloc(used + 1);
+    if (!replacement) return -1;
+    memcpy(replacement, use, used + 1);
     memmove(dollar + used, end + 1, tail + 1);
-    memcpy(dollar, use, used);
-    dollar = strchr(v, '$');
+    memcpy(dollar, replacement, used);
+    free(replacement);
   }
+  return -1;
 }
 
 static void load_env_file(const char *path) {
@@ -82,6 +98,12 @@ static void load_env_file(const char *path) {
   if (!f) return;
   char line[4096];
   while (fgets(line, sizeof line, f)) {
+    if (!strchr(line, '\n') && !feof(f)) {
+      int c;
+      while ((c = fgetc(f)) != '\n' && c != EOF) {}
+      fprintf(stderr, "motiris: %s: oversized env line skipped\n", path);
+      continue;
+    }
     char *eq = strchr(line, '=');
     if (!eq) continue;
     *eq = '\0';
@@ -94,7 +116,11 @@ static void load_env_file(const char *path) {
     while (*v == ' ' || *v == '\t') v++;
     size_t vl = strlen(v);
     while (vl && (v[vl - 1] == '\n' || v[vl - 1] == '\r')) v[--vl] = '\0';
-    expand_var(v, sizeof line - (size_t)(v - line));
+    if (expand_var(v, sizeof line - (size_t)(v - line))) {
+      fprintf(stderr, "motiris: %s: invalid or recursive expansion skipped\n",
+              path);
+      continue;
+    }
     if (!strncmp(k, "MOTIRIS_", 8) && *v) setenv_default(k, v);
   }
   fclose(f);
@@ -120,6 +146,62 @@ static int jbool(const cJSON *o, const char *key, int dflt) {
   return v ? cJSON_IsTrue(v) : dflt;
 }
 
+static int jint(const cJSON *o, const char *key, int dflt, int minimum,
+                int maximum) {
+  const cJSON *v = o ? cJSON_GetObjectItemCaseSensitive(o, key) : NULL;
+  if (!v) return dflt;
+  double number = cJSON_GetNumberValue(v);
+  if (!cJSON_IsNumber(v) || number < minimum || number > maximum ||
+      (double)(int)number != number) {
+    fprintf(stderr, "motiris: %s must be an integer in %d..%d; using %d\n",
+            key, minimum, maximum, dflt);
+    return dflt;
+  }
+  return (int)number;
+}
+
+#define SYSTEM_DOC_MAX_BYTES (256 * 1024)
+
+static void load_system_doc(MotirisAgent *a, const char *dir,
+                            const char *name) {
+  size_t cap = strlen(dir) + strlen(name) + 2;
+  char *path = malloc(cap);
+  if (!path) return;
+  snprintf(path, cap, "%s/%s", dir, name);
+  FILE *f = fopen(path, "r");
+  if (!f) { free(path); return; }
+  struct stat st;
+  if (fstat(fileno(f), &st) || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+      st.st_size > SYSTEM_DOC_MAX_BYTES) {
+    fprintf(stderr, "motiris: %s: invalid or oversized system document skipped\n",
+            path);
+    fclose(f);
+    free(path);
+    return;
+  }
+  size_t size = (size_t)st.st_size;
+  char *text = malloc(size + 1);
+  if (text) {
+    size_t got = fread(text, 1, size, f);
+    if (got == size && !ferror(f) && !memchr(text, '\0', size)) {
+      text[size] = '\0';
+      motiris_append_system(a, text);
+    } else {
+      fprintf(stderr, "motiris: %s: unreadable system document skipped\n", path);
+    }
+    free(text);
+  }
+  fclose(f);
+  free(path);
+}
+
+static void load_system_documents(MotirisAgent *a, const char *dir) {
+  /* Persona first, operational instructions second. CLI --system applied
+   * after config remains an explicit full override. */
+  load_system_doc(a, dir, "SOUL.md");
+  load_system_doc(a, dir, "AGENTS.md");
+}
+
 /* Apply config defaults without overriding a pre-disabled tools policy.
  * CLI/embedders can disable tools before this call to suppress MCP startup. */
 void motiris_apply_config(MotirisAgent *a) {
@@ -129,18 +211,32 @@ void motiris_apply_config(MotirisAgent *a) {
   char *p = malloc(n);
   snprintf(p, n, "%s/config.json", d);
   FILE *f = fopen(p, "r");
-  if (!f) { free(p); free(d); return; }
+  if (!f) { load_system_documents(a, d); free(p); free(d); return; }
   fseek(f, 0, SEEK_END);
   long sz = ftell(f);
   fseek(f, 0, SEEK_SET);
-  if (sz <= 0 || sz > CONFIG_MAX_BYTES) { fclose(f); free(p); free(d); return; }
+  if (sz <= 0 || sz > CONFIG_MAX_BYTES) {
+    fclose(f);
+    load_system_documents(a, d);
+    free(p);
+    free(d);
+    return;
+  }
   char *buf = malloc((size_t)sz + 1);
-  buf[fread(buf, 1, (size_t)sz, f)] = '\0';
+  if (!buf) {
+    fclose(f);
+    load_system_documents(a, d);
+    free(p);
+    free(d);
+    return;
+  }
+  size_t got = fread(buf, 1, (size_t)sz, f);
+  buf[got] = '\0';
   fclose(f);
 
-  cJSON *j = cJSON_Parse(buf);
+  cJSON *j = got == (size_t)sz ? cJSON_Parse(buf) : NULL;
   free(buf);
-  if (!j) { free(p); free(d); return; }
+  if (!j) { load_system_documents(a, d); free(p); free(d); return; }
 
   const char *s;
   if ((s = jstr(j, "model")) && !env_overrides("MOTIRIS_MODEL"))
@@ -154,11 +250,34 @@ void motiris_apply_config(MotirisAgent *a) {
   if ((s = jstr(j, "transport"))) motiris_set_transport(a, s);
   if ((s = jstr(j, "plugin_dir"))) motiris_set_plugin_dir(a, s);
   if ((s = jstr(j, "system"))) motiris_set_system(a, s);
-  if (cJSON_GetObjectItemCaseSensitive(j, "max_steps"))
-    motiris_set_max_steps(a, (int)cJSON_GetNumberValue(
-        cJSON_GetObjectItemCaseSensitive(j, "max_steps")));
+  cJSON *steps = cJSON_GetObjectItemCaseSensitive(j, "max_steps");
+  if (cJSON_IsNumber(steps)) {
+    double value = cJSON_GetNumberValue(steps);
+    if (value >= 0 && value <= INT_MAX && (double)(int)value == value)
+      motiris_set_max_steps(a, (int)value);
+    else
+      fprintf(stderr, "motiris: invalid max_steps; using existing value\n");
+  }
   if (cJSON_GetObjectItemCaseSensitive(j, "stream"))
-    motiris_set_stream(a, jbool(j, "stream", 0));
+    motiris_set_stream(a, jbool(j, "stream", 1));
+  if ((s = jstr(j, "approval"))) {
+    if (!strcmp(s, "off")) motiris_set_approval_required(a, 0);
+    else if (!strcmp(s, "ask")) motiris_set_approval_required(a, 1);
+    else fprintf(stderr, "motiris: approval must be off or ask\n");
+  }
+  motiris_set_workspace_guard(a, jbool(j, "workspace_guard", 0));
+  if ((s = jstr(j, "reasoning_effort")) &&
+      motiris_set_reasoning_effort(a, s))
+    fprintf(stderr, "motiris: reasoning_effort must be off, low, medium or high\n");
+  if (cJSON_GetObjectItemCaseSensitive(j, "show_thinking"))
+    motiris_set_thinking_visible(a, jbool(j, "show_thinking", 0));
+  int compact = jbool(j, "context_compaction", 0);
+  int compact_threshold = jint(j, "compaction_threshold", 32, 4, 256);
+  int compact_keep = jint(j, "compaction_keep", 8, 1, 128);
+  int compact_chars = jint(j, "compaction_max_chars", 8192, 256, 65536);
+  if (motiris_set_compaction(a, compact, (size_t)compact_threshold,
+                             (size_t)compact_keep, (size_t)compact_chars))
+    fprintf(stderr, "motiris: compaction_keep must be smaller than compaction_threshold\n");
   if (!tools_forced_off && cJSON_GetObjectItemCaseSensitive(j, "tools"))
     motiris_set_tools_enabled(a, jbool(j, "tools", 1));
   if (cJSON_GetObjectItemCaseSensitive(j, "plugins"))
@@ -209,56 +328,198 @@ void motiris_apply_config(MotirisAgent *a) {
     }
   }
   cJSON_Delete(j);
+  load_system_documents(a, d);
   free(p);
   free(d);
 }
 
-/* write the two template files if the config directory is missing */
+/* Conservative, all-or-nothing template initialization (issue #74). */
+static int init_write_all(int fd, const char *buf, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = write(fd, buf + off, len - off);
+    if (n > 0) { off += (size_t)n; continue; }
+    if (n < 0 && errno == EINTR) continue;
+    if (!n) errno = EIO;
+    return -1;
+  }
+  return 0;
+}
+
+static int init_write_new(const char *path, const char *content) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (fd < 0) return -1;
+  size_t len = strlen(content);
+  if (init_write_all(fd, content, len) || fsync(fd)) {
+    int saved = errno;
+    close(fd);
+    unlink(path);
+    errno = saved;
+    return -1;
+  }
+  if (close(fd)) {
+    int saved = errno;
+    unlink(path);
+    errno = saved;
+    return -1;
+  }
+  return 0;
+}
+
 int motiris_init_config(void) {
+  static const char *const names[] = {
+    "env", "config.json", "AGENTS.md", "SOUL.md",
+    "skills/motiris-config/SKILL.md",
+    "skills/motiris-session/SKILL.md",
+    "skills/motiris-context-compaction/SKILL.md"
+  };
+  static const char config_template[] =
+    "{\n"
+    "  \"model\": \"glm-5.1\",\n"
+    "  \"base_url\": \"https://token.moi.matrixorigin.cn/v1/chat/completions\",\n"
+    "  \"api_key_env\": \"MOI_TAAS_API_KEY\",\n"
+    "  \"max_steps\": 0,\n"
+    "  \"transport\": \"auto\",\n"
+    "  \"stream\": true,\n"
+    "  \"approval\": \"off\",\n"
+    "  \"workspace_guard\": false,\n"
+    "  \"reasoning_effort\": \"medium\",\n"
+    "  \"show_thinking\": false,\n"
+    "  \"context_compaction\": false,\n"
+    "  \"compaction_threshold\": 32,\n"
+    "  \"compaction_keep\": 8,\n"
+    "  \"compaction_max_chars\": 8192,\n"
+    "  \"tools\": true,\n"
+    "  \"plugins\": true,\n"
+    "  \"system\": \"You are iris, a concise helpful assistant.\"\n"
+    "}\n";
+  static const char agents_template[] =
+    "# AGENTS.md\n\n"
+    "- Inspect before changing; keep changes bounded and verify the result.\n"
+    "- Use the motiris-config skill for runtime and JSON configuration.\n"
+    "- approval and workspace_guard are off by default; enable guards when boundaries are wanted.\n"
+    "- Never overwrite existing configuration or credentials during initialization.\n"
+    "- Whenever a feature changes, update its relevant default installed SKILL.md in the same change.\n";
+  static const char soul_template[] =
+    "# SOUL.md\n\n"
+    "You are iris: direct, helpful and concise. State uncertainty plainly,\n"
+    "prefer verifiable facts, and keep the user's workspace and choices respected.\n";
+  static const char skill_template[] =
+    "---\n"
+    "name: motiris-config\n"
+    "description: Configure motiris runtime, streaming, reasoning and tool approval.\n"
+    "---\n"
+    "# Motiris configuration\n\n"
+    "Use `motiris set config KEY VALUE` or `motiris --config KEY VALUE` for JSON.\n"
+    "Keys: stream (boolean), max_steps (0 unlimited or positive), approval (off|ask),\n"
+    "reasoning_effort (off|low|medium|high), show_thinking (boolean),\n"
+    "workspace_guard (boolean; off permits any OS-accessible path).\n"
+    "In the REPL use /config, /approval, /reasoning and /thinking. Session card\n"
+    "changes are immediate; only the explicit save action persists them.\n"
+    "Compaction keys: context_compaction, compaction_threshold, compaction_keep,\n"
+    "compaction_max_chars. Enable compaction only when its optional plugin exists.\n"
+    "Skill discovery scans user < workspace < explicit directories. Only title,\n"
+    "description and path enter the system index; use read_file on an indexed path\n"
+    "to load the full body on demand. Do not print credentials. Keep existing\n"
+    "env/config/Markdown files unchanged unless explicitly asked to edit them.\n";
+  static const char session_skill_template[] =
+    "---\nname: motiris-session\n"
+    "description: Inspect, save, restore, and reset automatic UUID session traces.\n---\n"
+    "# Motiris sessions\n\n"
+    "Automatic state lives under MOTIRIS_HOME (default $HOME/.motiris):\n"
+    "session/session.json is the index and session/session-<uuid>.json is each trace.\n"
+    "REPL turns save automatically. Use /save to save now, /load for an indexed\n"
+    "restore into an empty context, and /new to start a fresh UUID without carrying\n"
+    "approval grants. Gateway sessions restore and reset by chat_id. Use the session\n"
+    "tools for legacy checkpoint logs. Never put reasoning side-channel text in traces.\n";
+  static const char compaction_skill_template[] =
+    "---\nname: motiris-context-compaction\n"
+    "description: Configure optional deterministic bounded context compaction.\n---\n"
+    "# Context compaction\n\n"
+    "Keep context_compaction false unless the optional plugin is installed.\n"
+    "Set compaction_threshold, compaction_keep and compaction_max_chars in config.json\n"
+    "or with --config. The plugin summarizes old complete turns only and preserves\n"
+    "the active user turn and tool-call/result pairs. Missing plugin or compaction\n"
+    "failure stops the run without silently discarding context. Verify with\n"
+    "tests/context_compaction.py. Update this Skill with every behavior change.\n";
+
   char *d = config_dir();
+  if (!d) return 1;
   if (mkdir(d, 0755) != 0 && errno != EEXIST) {
     fprintf(stderr, "motiris: cannot create %s\n", d);
     free(d);
     return 1;
   }
-  size_t n = strlen(d) + 16;
-  char *p = malloc(n);
-  int rc = 0;
+  size_t n = strlen(d) + 64;
+  char *path = malloc(n);
+  size_t env_cap = strlen(d) + 1024;
+  char *env_text = malloc(env_cap);
+  if (!path || !env_text) {
+    free(path); free(env_text); free(d);
+    return 1;
+  }
+  snprintf(env_text, env_cap,
+           "# motiris env defaults (MOTIRIS_* here lose to your shell)\n"
+           "MOTIRIS_API_KEY=${MOI_TAAS_API_KEY:-}\n"
+           "MOTIRIS_MODEL=glm-5.1\n"
+           "MOTIRIS_BASE_URL=https://token.moi.matrixorigin.cn/v1/chat/completions\n"
+           "MOTIRIS_PLUGIN_DIR=%s/plugins\n", d);
+  const char *contents[] = {
+    env_text, config_template, agents_template, soul_template, skill_template,
+    session_skill_template, compaction_skill_template
+  };
 
-  snprintf(p, n, "%s/env", d);
-  FILE *f = fopen(p, "w");
-  const char *home = getenv("HOME");
-  if (f) {
-    fprintf(f, "# motiris env defaults (MOTIRIS_* here lose to your shell)\n"
-               "MOTIRIS_API_KEY=${MOI_TAAS_API_KEY:-}\n"
-               "MOTIRIS_MODEL=glm-5.1\n"
-               "MOTIRIS_BASE_URL="
-               "https://token.moi.matrixorigin.cn/v1/chat/completions\n"
-               "MOTIRIS_PLUGIN_DIR=%s/.motiris/plugins\n",
-               home ? home : "");
-    fclose(f);
-  } else rc = 1;
+  /* Any existing target aborts the whole operation before the first write. */
+  for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+    snprintf(path, n, "%s/%s", d, names[i]);
+    struct stat st;
+    if (!lstat(path, &st)) {
+      fprintf(stderr, "motiris: %s exists; existing files kept unchanged\n", path);
+      free(path); free(env_text); free(d);
+      return 1;
+    }
+    if (errno != ENOENT) {
+      fprintf(stderr, "motiris: cannot inspect %s\n", path);
+      free(path); free(env_text); free(d);
+      return 1;
+    }
+  }
+  int dirs_ok = 1;
+  snprintf(path, n, "%s/skills", d);
+  if (mkdir(path, 0755) && errno != EEXIST) dirs_ok = 0;
+  static const char *const skill_dirs[] = {
+    "motiris-config", "motiris-session", "motiris-context-compaction"
+  };
+  for (size_t i = 0; dirs_ok && i < sizeof skill_dirs / sizeof skill_dirs[0]; i++) {
+    snprintf(path, n, "%s/skills/%s", d, skill_dirs[i]);
+    if (mkdir(path, 0755) && errno != EEXIST) dirs_ok = 0;
+  }
+  if (!dirs_ok) {
+    fprintf(stderr, "motiris: cannot create skill directories under %s\n", d);
+    free(path);
+    free(env_text);
+    free(d);
+    return 1;
+  }
 
-  snprintf(p, n, "%s/config.json", d);
-  f = fopen(p, "w");
-  if (f) {
-    fprintf(f, "{\n"
-               "  \"model\": \"glm-5.1\",\n"
-               "  \"base_url\": \"https://token.moi.matrixorigin.cn/v1/chat/completions\",\n"
-               "  \"api_key_env\": \"MOI_TAAS_API_KEY\",\n"
-               "  \"max_steps\": 10,\n"
-               "  \"transport\": \"auto\",\n"
-               "  \"stream\": true,\n"
-               "  \"tools\": true,\n"
-               "  \"plugins\": true,\n"
-               "  \"system\": \"You are iris, a concise helpful assistant.\"\n"
-               "}\n");
-    fclose(f);
-  } else rc = 1;
-
-  free(p);
+  for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+    snprintf(path, n, "%s/%s", d, names[i]);
+    if (init_write_new(path, contents[i])) {
+      fprintf(stderr, "motiris: cannot initialize %s: %s\n", path,
+              strerror(errno));
+      for (size_t j = 0; j < i; j++) {
+        snprintf(path, n, "%s/%s", d, names[j]);
+        unlink(path);
+      }
+      free(path); free(env_text); free(d);
+      return 1;
+    }
+  }
+  printf("motiris: initialized %s (max_steps=0, SSE on, approval off)\n", d);
+  free(path);
+  free(env_text);
   free(d);
-  return rc;
+  return 0;
 }
 
 /* ---------------- atomic scalar config editor ---------------- */
@@ -279,6 +540,14 @@ static const ConfigKey CONFIG_KEYS[] = {
   { "shell_allow", CONFIG_STRING, 0 },
   { "shell_deny", CONFIG_STRING, 0 },
   { "stream", CONFIG_BOOL, 0 },
+  { "show_thinking", CONFIG_BOOL, 0 },
+  { "workspace_guard", CONFIG_BOOL, 0 },
+  { "context_compaction", CONFIG_BOOL, 0 },
+  { "compaction_threshold", CONFIG_INT, 0 },
+  { "compaction_keep", CONFIG_INT, 0 },
+  { "compaction_max_chars", CONFIG_INT, 0 },
+  { "approval", CONFIG_STRING, 1 },
+  { "reasoning_effort", CONFIG_STRING, 1 },
   { "tools", CONFIG_BOOL, 0 },
   { "plugins", CONFIG_BOOL, 0 },
   { "goal_check", CONFIG_BOOL, 0 },
@@ -316,7 +585,9 @@ int motiris_set_config(const char *key, const char *value) {
   if (!spec) {
     fprintf(stderr, "motiris: unsupported config key (use model, base_url, "
             "api_key_env, transport, system, plugin_dir, shell_allow, "
-            "shell_deny, stream, tools, plugins, goal_check or max_steps)\n");
+            "shell_deny, stream, show_thinking, workspace_guard, approval, reasoning_effort, "
+            "context_compaction, compaction_threshold, compaction_keep, "
+            "compaction_max_chars, tools, plugins, goal_check or max_steps)\n");
     return 1;
   }
   if (spec->nonempty && !*value) {
@@ -333,21 +604,36 @@ int motiris_set_config(const char *key, const char *value) {
       return 1;
     }
   } else if (spec->type == CONFIG_INT) {
-    if (*value < '1' || *value > '9') {
-      fprintf(stderr, "motiris: max_steps must be an integer in 1..%d\n", INT_MAX);
+    if (*value < '0' || *value > '9') {
+      fprintf(stderr, "motiris: %s must be an integer in 0..%d\n", key, INT_MAX);
       return 1;
     }
     char *end = NULL;
     errno = 0;
     int_value = strtol(value, &end, 10);
-    if (errno == ERANGE || !end || *end || int_value < 1 || int_value > INT_MAX) {
-      fprintf(stderr, "motiris: max_steps must be an integer in 1..%d\n", INT_MAX);
+    if (errno == ERANGE || !end || *end || int_value < 0 || int_value > INT_MAX) {
+      fprintf(stderr, "motiris: %s must be an integer in 0..%d\n", key, INT_MAX);
       return 1;
     }
+  } else if ((!strcmp(key, "compaction_threshold") && (int_value < 4 || int_value > 256)) ||
+             (!strcmp(key, "compaction_keep") && (int_value < 1 || int_value > 128)) ||
+             (!strcmp(key, "compaction_max_chars") &&
+              (int_value < 256 || int_value > 65536))) {
+    fprintf(stderr, "motiris: invalid %s limit\n", key);
+    return 1;
   } else if (!strcmp(key, "transport") && strcmp(value, "auto") &&
              strcmp(value, "libcurl") && strcmp(value, "curl") &&
              strcmp(value, "echo")) {
     fprintf(stderr, "motiris: transport must be auto, libcurl, curl or echo\n");
+    return 1;
+  } else if (!strcmp(key, "approval") && strcmp(value, "off") &&
+             strcmp(value, "ask")) {
+    fprintf(stderr, "motiris: approval must be off or ask\n");
+    return 1;
+  } else if (!strcmp(key, "reasoning_effort") && strcmp(value, "off") &&
+             strcmp(value, "low") && strcmp(value, "medium") &&
+             strcmp(value, "high")) {
+    fprintf(stderr, "motiris: reasoning_effort must be off, low, medium or high\n");
     return 1;
   }
 

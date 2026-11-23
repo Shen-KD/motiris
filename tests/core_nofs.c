@@ -34,6 +34,177 @@ static void cancel_after_tool(const char *name, const char *args,
   cancel_flag = 1;
 }
 
+typedef struct {
+  int calls;
+  MotirisApprovalDecision decision;
+} ApprovalProbe;
+
+static MotirisApprovalDecision approval_decision(const char *name,
+                                                  const char *args, void *ud) {
+  ApprovalProbe *probe = ud;
+  (void)name; (void)args;
+  probe->calls++;
+  return probe->decision;
+}
+
+static void clear_messages_keep_approval(MotirisAgent *a) {
+  cJSON *messages = motiris_messages(a);
+  cJSON_Delete(messages->child);
+  messages->child = messages->prev = messages->next = NULL;
+}
+
+static int tool_message_contains(MotirisAgent *a, const char *needle) {
+  for (cJSON *m = motiris_messages(a)->child; m; m = m->next) {
+    const char *role = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(m, "role"));
+    const char *content = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(m, "content"));
+    if (role && content && !strcmp(role, "tool") && strstr(content, needle) &&
+        strlen(content) < 160)
+      return 1;
+  }
+  return 0;
+}
+
+#define APPROVAL_CHECK(condition, message) do { \
+  if (!(condition)) { \
+    fprintf(stderr, "core-nofs approval: %s\n", message); \
+    motiris_free(a); motiris_free(b); motiris_free(c); motiris_free(d); \
+    return 1; \
+  } \
+} while (0)
+
+static int runtime_control_tests(void) {
+  MotirisAgent *a = motiris_new();
+  if (!a) return 1;
+  MotirisTool shell = { .name = "shell", .call = shell_result };
+  motiris_set_transport(a, "echo");
+  motiris_register_tool(a, &shell);
+  motiris_set_stream(a, 1);
+  motiris_set_max_steps(a, 0);
+  motiris_add_user(a, "unlimited explicit choice");
+  MotirisAgent *guarded = motiris_new();
+  motiris_set_workspace_guard(guarded, 1);
+  int ok = motiris_stream_enabled(a) && motiris_max_steps(a) == 0 &&
+           !motiris_workspace_guard_enabled(a) &&
+           motiris_workspace_guard_enabled(guarded) &&
+           motiris_run(a) == MOTIRIS_RUN_OK;
+  motiris_free(guarded);
+  if (!ok)
+    fprintf(stderr, "core-nofs: runtime getters or unlimited max_steps failed\n");
+  motiris_free(a);
+  return ok ? 0 : 1;
+}
+
+static int approval_core_tests(void) {
+  MotirisAgent *a = NULL, *b = NULL, *c = NULL, *d = NULL;
+  ApprovalProbe pa = {0, MOTIRIS_APPROVAL_ALLOW_ONCE};
+  ApprovalProbe pb = {0, MOTIRIS_APPROVAL_ALLOW_ONCE};
+  ApprovalProbe denied = {0, MOTIRIS_APPROVAL_DENY};
+  MotirisTool before = { .name = "before", .call = shell_result };
+  MotirisTool shell = { .name = "shell", .call = shell_result };
+  MotirisTool after = { .name = "after", .call = shell_result };
+  int initial_calls;
+
+  a = motiris_new();
+  APPROVAL_CHECK(a != NULL, "allocation failed");
+  motiris_set_transport(a, "echo");
+  motiris_register_tool(a, &before);
+  motiris_register_tool(a, &shell);
+  motiris_register_tool(a, &after);
+  APPROVAL_CHECK(!motiris_approval_required(a), "approval must default off");
+  initial_calls = tool_calls;
+  motiris_add_user(a, "default unrestricted");
+  APPROVAL_CHECK(motiris_run(a) == MOTIRIS_RUN_OK &&
+                 tool_calls == initial_calls + 1 && pa.calls == 0,
+                 "default-off tool did not execute without a callback");
+  clear_messages_keep_approval(a);
+
+  motiris_set_approval_required(a, 1);
+  APPROVAL_CHECK(motiris_approval_required(a), "approval mode did not change");
+  motiris_set_approval_callback(a, approval_decision, &pa);
+  motiris_add_user(a, "allow once first");
+  APPROVAL_CHECK(motiris_run(a) == MOTIRIS_RUN_OK && pa.calls == 1 &&
+                 tool_calls == initial_calls + 2,
+                 "allow-once did not execute exactly once");
+  clear_messages_keep_approval(a);
+  motiris_add_user(a, "allow once second");
+  APPROVAL_CHECK(motiris_run(a) == MOTIRIS_RUN_OK && pa.calls == 2 &&
+                 tool_calls == initial_calls + 3,
+                 "allow-once incorrectly survived the call");
+  clear_messages_keep_approval(a);
+
+  pa.decision = MOTIRIS_APPROVAL_ALLOW_SESSION;
+  motiris_add_user(a, "session grant");
+  APPROVAL_CHECK(motiris_run(a) == MOTIRIS_RUN_OK && pa.calls == 3 &&
+                 tool_calls == initial_calls + 4,
+                 "session decision did not execute");
+  clear_messages_keep_approval(a);
+  motiris_add_user(a, "session reuse");
+  APPROVAL_CHECK(motiris_run(a) == MOTIRIS_RUN_OK && pa.calls == 3 &&
+                 tool_calls == initial_calls + 5,
+                 "session grant prompted again");
+  clear_messages_keep_approval(a);
+
+  /* shell moves from slot 1 to slot 0; its grant must move with it. */
+  motiris_unregister_tool(a, "before");
+  motiris_set_approval_callback(a, NULL, NULL);
+  motiris_add_user(a, "shifted session grant");
+  APPROVAL_CHECK(motiris_run(a) == MOTIRIS_RUN_OK &&
+                 tool_calls == initial_calls + 6,
+                 "unregister corrupted the shifted session grant");
+  clear_messages_keep_approval(a);
+
+  b = motiris_new();
+  APPROVAL_CHECK(b != NULL, "second Agent allocation failed");
+  motiris_set_transport(b, "echo");
+  motiris_register_tool(b, &shell);
+  motiris_set_approval_required(b, 1);
+  motiris_set_approval_callback(b, approval_decision, &pb);
+  motiris_add_user(b, "independent approval");
+  APPROVAL_CHECK(motiris_run(b) == MOTIRIS_RUN_OK && pb.calls == 1 &&
+                 tool_calls == initial_calls + 7,
+                 "one Agent inherited another Agent's session grant");
+
+  c = motiris_new();
+  APPROVAL_CHECK(c != NULL, "callback-less Agent allocation failed");
+  motiris_set_transport(c, "echo");
+  motiris_register_tool(c, &shell);
+  motiris_set_approval_required(c, 1);
+  motiris_add_user(c, "no approval channel");
+  APPROVAL_CHECK(motiris_run(c) == MOTIRIS_RUN_ERROR &&
+                 tool_calls == initial_calls + 7 &&
+                 strstr(motiris_last_error(c), "approval") &&
+                 strlen(motiris_last_error(c)) < 160 &&
+                 tool_message_contains(c, "approval"),
+                 "missing callback did not fail closed with a bounded error");
+
+  d = motiris_new();
+  APPROVAL_CHECK(d != NULL, "denial Agent allocation failed");
+  motiris_set_transport(d, "echo");
+  motiris_register_tool(d, &shell);
+  motiris_set_approval_required(d, 1);
+  motiris_set_approval_callback(d, approval_decision, &denied);
+  motiris_add_user(d, "deny this call");
+  APPROVAL_CHECK(motiris_run(d) == MOTIRIS_RUN_OK && denied.calls == 1 &&
+                 tool_calls == initial_calls + 7 &&
+                 tool_message_contains(d, "denied"),
+                 "denial executed the tool or hid the result from the model");
+
+  motiris_clear_approval_grants(a);
+  motiris_add_user(a, "cleared session grant");
+  APPROVAL_CHECK(motiris_run(a) == MOTIRIS_RUN_ERROR &&
+                 tool_calls == initial_calls + 7,
+                 "clearing grants did not restore fail-closed behavior");
+
+  motiris_free(a);
+  motiris_free(b);
+  motiris_free(c);
+  motiris_free(d);
+  return 0;
+}
+#undef APPROVAL_CHECK
+
 int main(void) {
   MotirisAgent *a = motiris_new();
   if (!a) return 1;
@@ -209,7 +380,8 @@ int main(void) {
   }
   motiris_free(d);
   motiris_free(a);
-  puts("core-nofs: strict C11 echo, cancellation, retention and snapshots passed");
+  if (runtime_control_tests() || approval_core_tests()) return 1;
+  puts("core-nofs: strict C11 echo, approval, cancellation, retention and snapshots passed");
   return 0;
 
 fail:

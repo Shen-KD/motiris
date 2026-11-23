@@ -61,12 +61,14 @@ make test-tts         # clean optional build + fake-engine integration tests
 | MCU / RTOS | **待定 / 未验证** | Chip, RTOS, cross-toolchain, RAM/Flash and hardware test matrix have not been supplied; host results are not MCU support claims |
 
 `search_files` keeps directory enumeration inside the optional POSIX file
-backend. An explicitly named start path is canonicalized and checked against
-the workspace, then reopened relative to a workspace directory fd. Every
-component and recursive entry uses `openat(..., O_NOFOLLOW)`; recursive
-symlinks (including loops) are skipped. This closes symlink replacement
-between a pathname check and open without adding any dependency to core.
-Read/write/patch keep their existing canonical-path behavior.
+backend. An explicitly named start path is canonicalized. With the default
+`workspace_guard=false`, search reopens from `/`; with the guard enabled it
+first checks workspace containment and reopens from the workspace directory
+fd. Every component and recursive entry uses `openat(..., O_NOFOLLOW)`;
+recursive symlinks (including loops) are skipped. This closes symlink
+replacement between a pathname check and open without adding a core
+dependency. Read/write/patch share the same per-Agent optional boundary while
+retaining canonical paths, file type/size limits and atomic replacement.
 
 Traversal is iterative, not recursive in C. Its hard limits are 32 open
 directory levels, 4096 visited entries (excluding `.`/`..`), 1 MiB read per
@@ -105,22 +107,25 @@ own HAL/RTOS backends and measured RAM/Flash budget.
 `--no-tools` is a per-Agent execution policy, not merely a built-in
 registration filter. CLI, cron and Gateway disable the Agent before
 `motiris_apply_config()`, which preserves that override instead of allowing
-`tools:true` to re-enable it or initialize configured MCP children. Plugin,
-Skill and MCP entry points also return before directory scanning, `dlopen`,
-global Skill mutation or `fork`. Core registration, provider schema assembly
+`tools:true` to re-enable it or initialize configured MCP children. Plugin and
+MCP entry points return before directory scanning, `dlopen` or `fork`.
+Core registration, provider schema assembly
 and dispatch independently check the same flag, so a tool registered before
 disabling is neither advertised nor executed. Registering while disabled is a
-no-op; re-enabling does not discard the existing per-Agent registry. Real
-subagents receive both `--no-tools` and `--no-plugin`.
+no-op; re-enabling does not discard the existing per-Agent registry. Skill
+metadata indexing remains available, but no Skill/read tool is registered or
+executed and bodies are not injected. Real subagents receive both `--no-tools`
+and `--no-plugin`.
 
 `motiris_cron_run_with_tools()` carries the CLI policy into each fresh job
 Agent. The existing `motiris_cron_run()` keeps its signature and delegates
 with config-driven tools enabled, so the public C API remains compatible.
-The no-tools text-only `--skill-dir` path uses direct regular-file reads
-rather than `popen`: at most 4096 directory entries, 128 loaded files and
-1 MiB including headers/NUL, with an 8 KiB read scratch buffer and partial
-file rollback. It has no shell evaluation, child process or unbounded
-directory/content growth.
+The no-tools Skill index uses direct bounded regular-file reads rather than
+`popen`: at most 4096 entries per directory, 128 Skills and 1 MiB per file.
+Only frontmatter metadata reaches system context. It has no shell evaluation,
+child process or full-body prompt injection; loading a body requires the
+explicit built-in `read_file` tool and therefore is unavailable under
+`--no-tools`.
 
 Gateway and optional TTS use the const, Agent-owned `motiris_turn_start()`
 accessor to scan only the latest external run in forward order. The pointer
@@ -927,10 +932,13 @@ container / clang).
 ## Release & install
 
 - Tag `vX.Y.Z` -> `.github/workflows/release.yml` builds, runs smoke,
-  packages `motiris-<v>-linux-x86_64.tar.gz` + `motiris.sha256` +
-  `motiris-info.txt`, creates the GitHub release.
-- `install.sh` fetches the latest release, verifies sha256, installs,
-  bootstraps `~/.motiris/{env,config.json}` (never overwrites).
+  packages the main and optional context-compaction tarballs, their separate
+  sha256 files (each names its archive), and `motiris-info.txt`.
+- `install.sh` verifies new archives before extraction into empty directories,
+  rejects unexpected members, and retains a strict legacy binary-hash fallback.
+  It bootstraps defaults without overwriting user files. Interactive users can
+  select context compaction; automation uses `--plugins=context-compaction` or
+  `--plugins=none`. Session/read/write/MCP/approval are built in.
 - `--version` prints `MOTIRIS_VERSION` (git describe, fallback 0.1.0),
   git SHA and build date — injected via CPPFLAGS in the Makefile so CFLAGS
   overrides (CI -Werror) don't drop them.
@@ -967,10 +975,12 @@ motiris_unregister_tool(a, name);
 ```
 
 Runtime plugins: a .so exporting `motiris_plugin_init(MotirisAgent*,
-const MotirisPluginApi*)`. The api currently offers
-`register_tool` / `unregister_tool` / `add_tool_hook`
-(tool-call observers; multi-slot, appended — the repl's hook and
-plugin hooks coexist).
+const MotirisPluginApi*)`. API v2 offers `register_tool` / `unregister_tool` /
+`add_tool_hook` plus additive `set_compactor`. Tool observers are multi-slot;
+the compaction callback is synchronous, deterministic and returns success or
+failure before any old context is removed. `plugins/context_compaction/`
+implements bounded extractive summaries without recursive model calls. Its
+`SKILL.md` is installed with the plugin and updated with behavior changes.
 
 Optional vision: `VISION_TOOLS=1` registers `vision_analyze` through the same
 per-agent registry in CLI, REPL, gateway and cron builds. The optional getters
@@ -985,7 +995,10 @@ Agent callbacks and run boundaries:
   until the next message mutation/import or Agent destruction.
 - `motiris_cron_run_with_tools` — cron CLI policy variant; the original
   `motiris_cron_run` remains config-driven and source-compatible.
-- `motiris_set_stream_cb` — per-token sink (single slot; repl owns it).
+- `motiris_set_stream_cb` — answer-delta sink (single slot; repl/gateway owns it).
+- `motiris_set_reasoning_cb` — provider-only reasoning side channel; never
+  canonicalized or persisted. `motiris_set_print_answer` lets Gateway suppress
+  duplicate core stdout without changing REPL/CLI output.
 - `motiris_set_tool_hook` / `motiris_add_tool_hook` — called after each
   tool executes with (name, args, result_json, ud); result may contain
   `"error"` — the repl renders that as a red ✗ line.
@@ -997,8 +1010,10 @@ config.json spawns a stdio JSON-RPC server; each remote tool registers
 as `<server>:<tool>`. `env` overrides are applied in the child process
 before exec (not yet implemented for arbitrary vars — see mcp.c).
 
-Sessions: `src/harness/sessions.c` owns state directories and legacy trace
-listing; `src/core/checkpoint.c` owns validated full-turn memory
+Sessions: `src/harness/session_store.c` owns the automatic UUID index and
+canonical `session-<uuid>.json` traces under `MOTIRIS_HOME/session/`. REPL and
+Gateway use atomic latest/selected restore and reset; reasoning is excluded.
+`src/harness/sessions.c` owns legacy trace listing; `src/core/checkpoint.c` owns validated full-turn memory
 serialization/restoration, and `src/harness/checkpoints.c` adds bounded atomic
 host-file I/O. `--save`, `-r`, REPL `/resume`/auto-save and gateway restore
 all use the same snapshot contract. `PERSISTENCE=0` replaces the host backend
@@ -1007,10 +1022,12 @@ file operations while preserving in-memory sessions and the portable core
 codec. `motiris_session_append` is legacy trace-only and must never be used
 as restore input.
 
-Skill files: `skill_patch` / `skill_write` in skilltools.c edit the
-indexed `--skill-dir` files in place; paths are built from the index
-(`skill_dir` + `file`), never from user input — no workspace guard
-needed (by construction bounded to the skill dir).
+Skill files: discovery merges user < workspace < explicit directories and
+injects only metadata. `read_file` may read an exact canonical indexed user
+Skill outside a guarded workspace, but never a new arbitrary external guarded
+path. Unguarded file tools may access any OS-permitted path. `skill_patch` /
+`skill_write` edit
+indexed files by their stored canonical paths, never user-selected paths.
 
 Per-tool schemas: `src/tools/toolscan.c` indexes
 `<plugin_dir>/<name>/<name>.json` and `<tools_dir>/<name>/<name>.json`

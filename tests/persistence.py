@@ -146,7 +146,7 @@ def test_gateway(env):
             log = None
 
     def chat(message, reset=False):
-        payload = {"chat_id": "volatile", "message": message}
+        payload = {"chat_id": "volatile", "message": message, "stream": False}
         if reset:
             payload["reset"] = True
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)

@@ -45,6 +45,7 @@ typedef struct Session {
   char *chat_id;
   MotirisAgent *agent;
   char *log_path;
+  char *session_id;
   struct Session *next;
 } Session;
 
@@ -54,6 +55,15 @@ static char *gw_token;
 static int gw_verbose;
 /* Process-wide immutable configuration, never per-Agent/session state. */
 static long gw_io_timeout_ms = GATEWAY_DEFAULT_TIMEOUT_S * 1000L;
+
+static void session_dispose(Session *s) {
+  if (!s) return;
+  motiris_free(s->agent);
+  free(s->chat_id);
+  free(s->log_path);
+  free(s->session_id);
+  free(s);
+}
 
 static Session *find_session(const char *chat_id) {
   for (Session *s = sessions; s; s = s->next)
@@ -66,10 +76,7 @@ static void evict_oldest(void) {
   Session *p = sessions, *prev = NULL;
   while (p && p->next) { prev = p; p = p->next; }
   if (prev) prev->next = NULL; else sessions = NULL;
-  motiris_free(p->agent);
-  free(p->chat_id);
-  free(p->log_path);
-  free(p);
+  session_dispose(p);
   n_sessions--;
 }
 
@@ -132,13 +139,29 @@ static Session *get_session(const char *chat_id, int tools_on,
   if (!s) return NULL;
   s->chat_id = strdup(chat_id);
   s->agent = motiris_new();
+  s->session_id = motiris_session_auto_id();
   if (!s->chat_id || !s->agent) goto fail;
+  if (!s->session_id) { session_dispose(s); return NULL; }
   if (!tools_on) motiris_set_tools_enabled(s->agent, 0);
+  motiris_set_print_answer(s->agent, 0);
   motiris_apply_config(s->agent);   /* model/base_url/transport from config */
   if (tools_on) motiris_register_core_tools(s->agent);
+  motiris_register_default_skill_tools(s->agent, NULL);
+  motiris_append_skill_context(s->agent);
 
 #ifndef MOTIRIS_NO_PERSISTENCE
-  /* Per-chat log: gateway/<lowercase-hex(chat_id)>.log. */
+  int restored_auto = 0;
+  char *restored_id = NULL;
+  int restore_rc = motiris_session_auto_restore(
+      s->agent, "gateway", chat_id, NULL, &restored_id, NULL, error);
+  if (restore_rc < 0) { session_dispose(s); return NULL; }
+  if (!restore_rc) {
+    free(s->session_id);
+    s->session_id = restored_id;
+    restored_auto = 1;
+  }
+  /* Per-chat legacy log remains as a migration fallback and dual-write
+   * compatibility path; new automatic traces are authoritative when present. */
   if (getenv("HOME")) {
     s->log_path = session_log_path(chat_id);
     if (!s->log_path) goto fail;
@@ -148,7 +171,10 @@ static Session *get_session(const char *chat_id, int tools_on,
     if (slash) *slash = '\0';
     mkdir_p(dir);
     free(dir);
-    if (load_session_log(s, error)) goto fail;
+    if (!restored_auto && load_session_log(s, error)) {
+      session_dispose(s);
+      return NULL;
+    }
   }
 #endif
   if (n_sessions >= MAX_SESSIONS) evict_oldest();
@@ -158,10 +184,7 @@ static Session *get_session(const char *chat_id, int tools_on,
   return s;
 
 fail:
-  motiris_free(s->agent);
-  free(s->chat_id);
-  free(s->log_path);
-  free(s);
+  session_dispose(s);
   return NULL;
 }
 
@@ -254,6 +277,63 @@ static void send_err(int fd, int code, const char *msg) {
   cJSON *e = cJSON_CreateObject();
   cJSON_AddStringToObject(e, "error", msg);
   send_json(fd, code, e);
+}
+
+typedef struct { int fd, failed; } SseWriter;
+
+static void sse_write_failed(SseWriter *writer) {
+  if (!writer->failed) {
+    if (errno == ETIMEDOUT)
+      fprintf(stderr, "motiris gateway: response write timed out\n");
+    else if (gw_verbose)
+      fprintf(stderr, "motiris gateway: SSE response write failed: %s\n",
+              strerror(errno));
+  }
+  writer->failed = 1;
+}
+
+static void send_sse_event(SseWriter *writer, const char *event, cJSON *body) {
+  char *json = cJSON_PrintUnformatted(body);
+  cJSON_Delete(body);
+  if (writer->failed || !json) { free(json); sse_write_failed(writer); return; }
+  const char prefix[] = "event: ";
+  const char middle[] = "\ndata: ";
+  const char suffix[] = "\n\n";
+  struct timespec deadline;
+  if (gateway_deadline(&deadline) ||
+      gateway_write_all(writer->fd, prefix, sizeof prefix - 1, &deadline) ||
+      gateway_write_all(writer->fd, event, strlen(event), &deadline) ||
+      gateway_write_all(writer->fd, middle, sizeof middle - 1, &deadline) ||
+      gateway_write_all(writer->fd, json, strlen(json), &deadline) ||
+      gateway_write_all(writer->fd, suffix, sizeof suffix - 1, &deadline))
+    sse_write_failed(writer);
+  free(json);
+}
+
+static int send_sse_start(SseWriter *writer, int fd) {
+  static const char headers[] =
+      "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+      "Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
+  struct timespec deadline;
+  writer->fd = fd;
+  if (gateway_deadline(&deadline) ||
+      gateway_write_all(fd, headers, sizeof headers - 1, &deadline))
+    sse_write_failed(writer);
+  return writer->failed ? -1 : 0;
+}
+
+static void gateway_delta(const char *text, void *ud) {
+  SseWriter *writer = ud;
+  cJSON *body = cJSON_CreateObject();
+  cJSON_AddStringToObject(body, "delta", text);
+  send_sse_event(writer, "content", body);
+}
+
+static void gateway_reasoning(const char *text, void *ud) {
+  SseWriter *writer = ud;
+  cJSON *body = cJSON_CreateObject();
+  cJSON_AddStringToObject(body, "delta", text);
+  send_sse_event(writer, "reasoning", body);
 }
 
 /* Find the end of the header block without reading past received bytes. */
@@ -548,8 +628,16 @@ static void handle_connection(int fd, int tools_on) {
     goto out;
   }
 
+  const char *session_error = NULL;
   if (cJSON_IsTrue(jrst)) { /* reset context and this exact ID's host snapshot */
 #ifndef MOTIRIS_NO_PERSISTENCE
+    if (motiris_session_auto_delete("gateway", chat_id, &session_error)) {
+      send_err(fd, 500, session_error ? session_error : "cannot reset session");
+      cJSON_Delete(body);
+      free(req);
+      close(fd);
+      return;
+    }
     char *path = session_log_path(chat_id);
     if (path && unlink(path) && errno != ENOENT) {
       free(path);
@@ -560,29 +648,55 @@ static void handle_connection(int fd, int tools_on) {
 #endif
     Session *s = find_session(chat_id);
     if (s) {
-      motiris_free(s->agent);
       /* unlink from list */
       Session **pp = &sessions;
       while (*pp && *pp != s) pp = &(*pp)->next;
       *pp = s->next;
-      free(s->chat_id); free(s->log_path); free(s);
+      session_dispose(s);
       n_sessions--;
     }
   }
 
-  const char *session_error = NULL;
   Session *s = get_session(chat_id, tools_on, &session_error);
   if (!s) {
     send_err(fd, 500, session_error ? session_error : "could not create session");
     goto out;
   }
-  motiris_add_user(s->agent, message);
+  cJSON *jstream = cJSON_GetObjectItemCaseSensitive(body, "stream");
+  int use_sse = !cJSON_IsFalse(jstream); /* SSE is the default wire format. */
+  int saved_stream = motiris_stream_enabled(s->agent);
+  SseWriter writer = { .fd = fd, .failed = 0 };
+  if (use_sse) {
+    motiris_set_stream(s->agent, 1);
+    if (send_sse_start(&writer, fd)) {
+      motiris_set_stream(s->agent, saved_stream);
+      cJSON_Delete(body);
+      free(req);
+      close(fd);
+      return;
+    }
+    motiris_set_stream_cb(s->agent, gateway_delta, &writer);
+    motiris_set_reasoning_cb(s->agent, gateway_reasoning, &writer);
+  } else {
+    motiris_set_stream(s->agent, 0);
+  }
 
+  motiris_add_user(s->agent, message);
   int rc = motiris_run(s->agent);
+  motiris_set_stream_cb(s->agent, NULL, NULL);
+  motiris_set_reasoning_cb(s->agent, NULL, NULL);
+  motiris_set_stream(s->agent, saved_stream);
+  const char *auto_checkpoint_error = NULL;
+  int auto_saved = 0;
+#ifndef MOTIRIS_NO_PERSISTENCE
+  auto_saved = !motiris_session_auto_save(
+      s->agent, s->session_id, "gateway", s->chat_id, &auto_checkpoint_error);
+#endif
   if (rc) {
     cJSON *e = cJSON_CreateObject();
     cJSON_AddStringToObject(e, "error", motiris_last_error(s->agent));
-    send_json(fd, 500, e);
+    if (use_sse) send_sse_event(&writer, "error", e);
+    else send_json(fd, 500, e);
     goto out;
   }
 
@@ -599,14 +713,17 @@ static void handle_connection(int fd, int tools_on) {
   char *reply = last_reply(s->agent);
   cJSON *r = cJSON_CreateObject();
   cJSON_AddStringToObject(r, "reply", reply ? reply : "(no reply)");
-  if (!s->log_path)
-    cJSON_AddStringToObject(r, "checkpoint", "volatile-only");
+  if (auto_checkpoint_error)
+    cJSON_AddStringToObject(r, "checkpoint_error", auto_checkpoint_error);
   else if (checkpoint_error)
     cJSON_AddStringToObject(r, "checkpoint_error", checkpoint_error);
-  else
+  else if (auto_saved)
     cJSON_AddStringToObject(r, "checkpoint", "saved");
+  else
+    cJSON_AddStringToObject(r, "checkpoint", "volatile-only");
   free(reply);
-  send_json(fd, 200, r);
+  if (use_sse) send_sse_event(&writer, "done", r);
+  else send_json(fd, 200, r);
 
 out:
   cJSON_Delete(body);

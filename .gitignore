@@ -1,5 +1,8 @@
 motiris
 examples/*.so
+plugins/*/*.so
+__pycache__/
+*.pyc
 *.o
 *.a
 /build/

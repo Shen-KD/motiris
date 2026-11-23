@@ -34,6 +34,7 @@ static const MotirisPluginApi api = {
   .register_tool = motiris_register_tool,
   .unregister_tool = motiris_unregister_tool,
   .add_tool_hook = motiris_add_tool_hook,
+  .set_compactor = motiris_set_compactor,
 };
 
 /* shared with toolscan.c: resolved default plugin dir (strdup'd) */

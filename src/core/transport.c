@@ -111,9 +111,13 @@ static int curl_progress_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
 typedef struct {
   void (*on_delta)(const char *text, void *ud);
   void *ud;
+  void (*on_reasoning)(const char *text, void *ud);
+  void *reasoning_ud;
   CancelCtx *cancel;
   Buf line;                       /* one SSE line, including bounded NUL */
   Buf content;                    /* concatenated delta.content */
+  Buf raw;                        /* buffered JSON fallback, before first SSE */
+  int saw_sse;
   size_t received, wire_limit;    /* bounded JSON/SSE framing as well */
   int failed;
   cJSON *tool_calls;              /* array of {id,type,function} */
@@ -133,6 +137,14 @@ static int stream_handle_data(StreamCtx *s, const char *payload) {
       cJSON_GetObjectItemCaseSensitive(j, "choices"), 0);
   cJSON *delta = choice ? cJSON_GetObjectItemCaseSensitive(choice, "delta") : NULL;
   if (!delta) { cJSON_Delete(j); return 0; }
+
+  const char *reasoning = cJSON_GetStringValue(
+      cJSON_GetObjectItemCaseSensitive(delta, "reasoning_content"));
+  if (!reasoning)
+    reasoning = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(delta, "reasoning"));
+  if (reasoning && *reasoning && s->on_reasoning)
+    s->on_reasoning(reasoning, s->reasoning_ud);
 
   const char *dc = cJSON_GetStringValue(
       cJSON_GetObjectItemCaseSensitive(delta, "content"));
@@ -238,6 +250,7 @@ static int stream_feed(StreamCtx *s, const char *p, size_t n) {
     if (c == '\n') {
       const char *line = s->line.data ? s->line.data : "";
       if (!strncmp(line, "data:", 5)) {
+        s->saw_sse = 1;
         const char *payload = line + 5;
         while (*payload == ' ') payload++;
         if (strcmp(payload, "[DONE]") && *payload &&
@@ -334,7 +347,15 @@ static size_t stream_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
     return 0;
   }
   s->received += n;
+  /* Some OpenAI-compatible endpoints ignore stream:true and return JSON.
+   * Keep a bounded copy only until the first SSE record establishes framing. */
+  if (!s->saw_sse && !s->raw.failed) (void)buf_append(&s->raw, ptr, n);
   if (stream_feed(s, ptr, n)) return 0;
+  if (s->saw_sse && s->raw.data) {
+    free(s->raw.data);
+    s->raw.data = NULL;
+    s->raw.len = 0;
+  }
   return n;
 }
 
@@ -342,7 +363,10 @@ static size_t stream_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
 static char *libcurl_send_stream(const char *url, const char *auth,
                                  const char *body,
                                  void (*on_delta)(const char *, void *),
-                                 void *ud, MotirisCancelCallback *cancel_cb,
+                                 void *ud,
+                                 void (*on_reasoning)(const char *, void *),
+                                 void *reasoning_ud,
+                                 MotirisCancelCallback *cancel_cb,
                                  void *cancel_ud, char **err) {
   CURL *c = curl_easy_init();
   if (!c) { if (err) *err = strdup("libcurl init failed"); return NULL; }
@@ -355,8 +379,11 @@ static char *libcurl_send_stream(const char *url, const char *auth,
   CancelCtx cancel = { cancel_cb, cancel_ud };
   size_t limit = response_limit();
   StreamCtx s = {
-    .on_delta = on_delta, .ud = ud, .cancel = &cancel,
+    .on_delta = on_delta, .ud = ud,
+    .on_reasoning = on_reasoning, .reasoning_ud = reasoning_ud,
+    .cancel = &cancel,
     .line = { .limit = limit }, .content = { .limit = limit },
+    .raw = { .limit = limit },
     .wire_limit = limit * STREAM_WIRE_OVERHEAD,
   };
   curl_easy_setopt(c, CURLOPT_URL, url);
@@ -392,7 +419,7 @@ static char *libcurl_send_stream(const char *url, const char *auth,
       }
     }
     free(s.content.data); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
-    free(s.line.data);
+    free(s.line.data); free(s.raw.data);
     return NULL;
   }
   if (http != 200) {
@@ -402,8 +429,20 @@ static char *libcurl_send_stream(const char *url, const char *auth,
       *err = m;
     }
     free(s.content.data); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
-    free(s.line.data);
+    free(s.line.data); free(s.raw.data);
     return NULL;
+  }
+
+  if (!s.saw_sse) {
+    free(s.content.data); free(s.line.data);
+    cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
+    if (s.raw.failed) {
+      free(s.raw.data);
+      if (err) *err = strdup(buffer_error(s.raw.failed));
+      return NULL;
+    }
+    if (!s.raw.data) s.raw.data = strdup("");
+    return s.raw.data;
   }
 
   /* rebuild one complete chat message from the delta aggregates */
@@ -426,6 +465,7 @@ static char *libcurl_send_stream(const char *url, const char *auth,
   if (s.usage) cJSON_AddItemToObject(resp, "usage", s.usage);
   free(s.content.data);
   free(s.line.data);
+  free(s.raw.data);
   char *printed = cJSON_PrintUnformatted(resp);
   cJSON_Delete(resp);
   return printed;
@@ -616,20 +656,44 @@ char *motiris_transport_send(const char *backend, const char *url,
 char *motiris_transport_send_stream(const char *backend, const char *url,
                                     const char *auth, const char *body,
                                     void (*on_delta)(const char *, void *),
-                                    void *ud, MotirisCancelCallback *cancel,
+                                    void *ud,
+                                    void (*on_reasoning)(const char *, void *),
+                                    void *reasoning_ud,
+                                    MotirisCancelCallback *cancel,
                                     void *cancel_ud, char **err) {
   if (err) *err = NULL;
 #ifndef MOTIRIS_NO_FILESYSTEM
   if (!backend || !strcmp(backend, "auto") || !strcmp(backend, "libcurl"))
     return libcurl_send_stream(url, auth, body, on_delta, ud,
+                               on_reasoning, reasoning_ud,
                                cancel, cancel_ud, err);
 #else
   (void)on_delta;
   (void)ud;
+  (void)on_reasoning;
+  (void)reasoning_ud;
 #endif
-  /* other backends: fall back to buffered send (aggregation identical) */
-  return motiris_transport_send(backend, url, auth, body,
-                                cancel, cancel_ud, err);
+  /* Other backends are buffered-only. Do not ask the provider for SSE and
+   * then try to parse it as one JSON response: negotiate stream off instead. */
+  cJSON *request = cJSON_Parse(body);
+  char *buffered = NULL;
+  if (request) {
+    cJSON_DeleteItemFromObjectCaseSensitive(request, "stream");
+    buffered = cJSON_PrintUnformatted(request);
+    cJSON_Delete(request);
+  }
+  if (!buffered) {
+    if (err) {
+      static const char message[] = "buffered transport request allocation failed";
+      *err = malloc(sizeof message);
+      if (*err) memcpy(*err, message, sizeof message);
+    }
+    return NULL;
+  }
+  char *response = motiris_transport_send(backend, url, auth, buffered,
+                                          cancel, cancel_ud, err);
+  free(buffered);
+  return response;
 }
 
 static char *transport_error(const char *msg) {

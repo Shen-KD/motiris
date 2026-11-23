@@ -7,12 +7,18 @@
 ```
 sh install.sh                 # latest release -> $HOME/bin (or ~/.local/bin)
 sh install.sh --skip-config   # binary only, keep your own config
-# knobs: --prefix DIR --model NAME --base-url URL --api-key-env VAR
+sh install.sh --plugins=context-compaction  # optional compactor, non-interactive
+sh install.sh --plugins=none                # no optional plugins
+# knobs: --prefix=DIR --model=NAME --base-url=URL --api-key-env=VAR
 ```
 
-Downloads the latest release asset, verifies its sha256, installs the
-binary, and writes `~/.motiris/{env,config.json}` (never overwrites an
-existing config). Build from source instead: `make && make install`.
+Downloads the latest release asset, verifies the archive sha256 before
+extraction, installs the binary, and writes `~/.motiris/{env,config.json}`
+without overwriting existing configuration, credentials or templates.
+Interactive installs offer the optional context-compaction plugin;
+non-interactive installs select it explicitly as above. Session, read/write,
+MCP and approval are built in and need no plugins. Build from source instead:
+`make && make install`.
 
 The name fuses **Iris** (Ἶρις, goddess of the rainbow and messenger of
 the gods, who carried the word across the bridge between worlds) with
@@ -55,15 +61,18 @@ effects.
   Text remains available on engine failure; the default build has no TTS code.
 - **Full-turn sessions** — bounded, versioned JSON checkpoints (`--save`,
   `-r`) preserve complete user/assistant/tool-call/tool-result messages.
-  Portable core memory export/import and an optional atomic host-file backend
-  share ownership/integrity checks and strict legacy rejection; `/sessions`
-  remains the review list.
+  Automatic UUID traces use `$MOTIRIS_HOME/session/session.json` plus
+  `session-<uuid>.json`; REPL `/save`, `/load`, `/new` and Gateway chat recovery
+  are built in. Portable core memory export/import and the optional atomic
+  host-file backend share ownership/integrity checks and strict legacy rejection.
 - **Bounded live history and replay** — per-agent item/byte budgets evict only
   complete oldest user turns. Independent replay limits select a safe suffix
   for the provider without changing stored history or splitting tool calls.
-- **Skills** — a directory of `.md` files injected as system context. With
-  `--no-tools`, text-only injection uses direct bounded file reads (4096
-  directory entries, 128 files, 1 MiB total), never a shell command.
+- **Directory-driven Skills** — user, workspace and explicit directories are
+  merged in that precedence order. Only each Skill's title, description and
+  canonical path enter the system index; the model loads a relevant body on
+  demand through `read_file`. Legacy root `*.md` and `<name>/SKILL.md` layouts
+  are bounded, and `--no-tools` never invokes a shell.
 - **Tiny core** — cJSON is the only runtime-embedded vendor; HTTP goes
   through a built-in libcurl C backend (no child process; HTTPS/TLS
   handled by the system libcurl shared library). A spawn-`curl` fallback
@@ -80,9 +89,9 @@ effects.
  Models    one provider: OpenAI-compatible HTTP (multi-vendor by choice)
  Tools     registry with runtime plug/unplug, incl. shell/time built-ins
  Plugins   .so files, dlopen'd, register tools via MotirisPluginApi
- Skills    --skill-dir *.md injected as system prompt
- Sessions  bounded full-turn JSON checkpoints (no database);
-          repl saves to ~/.local/share/motiris/sessions/
+ Skills    user < workspace < --skill-dir metadata index; read_file loads bodies
+ Sessions  bounded full-turn JSON checkpoints + automatic UUID traces;
+          $MOTIRIS_HOME/session/{session.json,session-<uuid>.json}
  Storage   out of the way: only what you ask for (--save)
  Trace     -v step/tool logging to stderr
  Sandbox   none by default: shell runs as your uid (documented risk)
@@ -154,20 +163,22 @@ motiris --cron jobs.json --once                          # scheduled jobs
 motiris --sessions [TERM]                                # list/search logs
 # repl (-i): / lists commands; ↑/↓ select, Enter runs, /exit leaves
 # commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM]
-#           /hotkey (interactive key bindings) /exit
+#           /save /load /config /approval /reasoning /thinking /hotkey /exit
 # Ctrl+C during a reply cancels generation, keeps the user instruction,
 # discards partial assistant/tool messages, and accepts a follow-up instruction
-# interactive repl turns checkpoint to ~/.local/share/motiris/sessions/
+# interactive turns auto-save to ~/.motiris/session/session-<uuid>.json
 # token-protected: MOTIRIS_GATEWAY_TOKEN=sekret motiris --gateway :8899
 ```
 
-The gateway keeps one context per `chat_id` (session logs survive
-restarts under `~/.local/share/motiris/gateway/`), exposes
-`GET /health` and `POST /v1/chat` (`{"chat_id","message","reset"?}`),
+The gateway keeps one context per `chat_id` (automatic UUID traces survive
+restarts under `~/.motiris/session/`), exposes
+`GET /health` and `POST /v1/chat` (`{"chat_id","message","reset"?,"stream"?}`),
 and optionally requires `Authorization: Bearer $MOTIRIS_GATEWAY_TOKEN`.
 Requests are limited to 16 KiB of headers and a 1 MiB body; malformed or
 incomplete requests get `400`, while oversized requests get `413` and the
-connection is closed.
+connection is closed. Responses default to `text/event-stream`: separate
+`reasoning` and `content` events carry JSON `{"delta":...}` payloads, followed
+by `done` or `error`. Send `"stream":false` for the legacy buffered JSON reply.
 
 `MOTIRIS_GATEWAY_IO_TIMEOUT_S` bounds connection I/O (default 30 s, allowed
 1..120; invalid values prevent startup). Request header+body receive uses one
@@ -226,6 +237,15 @@ used only when no provider list is configured. The fixed 512-byte
 prefix and NUL. Longer keys fail with a bounded error before any network I/O
 instead of silently sending an unauthenticated request.
 
+SSE streaming is on by default (`--no-stream` opts out), and `max_steps=0`
+means unlimited steps. `reasoning_effort` selects `off`, `low`, `medium` or
+`high`; `/reasoning` changes it interactively. `/thinking on` displays only
+provider-supplied `reasoning_content`/`reasoning` deltas in a separate side
+channel. Reasoning is never synthesized, added to canonical history, or saved
+in checkpoints/session traces. Approval defaults to `off`; `/approval ask`
+requires an interactive decision, while non-interactive or callback-less runs
+fail closed without executing the tool.
+
 REPL streaming prints a final answer once: the agent suppresses the aggregated
 copy only when the selected backend actually delivered text deltas, while buffered,
 echo and spawned-curl fallback still print their final message. Goal-check
@@ -268,6 +288,15 @@ turns do not auto-save, and gateway sessions neither load nor write snapshots
 (including reset unlinking); successful gateway replies remain
 `volatile-only`. No MCU/RTOS backend is claimed.
 
+Optional deterministic context compaction is configured with
+`context_compaction`, `compaction_threshold`, `compaction_keep` and
+`compaction_max_chars`. Install its plugin explicitly with the installer or
+`make plugins`, then enable it with `--config context_compaction true`. It
+summarizes only old complete turns and preserves the active user turn and
+tool-call/result pairs. Missing-plugin or compaction failures stop the run
+without silently dropping context; disabled installations retain existing
+behavior.
+
 The portable core also exposes `motiris_session_export` and
 `motiris_session_import` for caller-owned memory buffers. Export returns one
 malloc'd, NUL-terminated snapshot of at most 1 MiB; import takes an explicit
@@ -307,16 +336,19 @@ Built-in tools (disable with `--no-tools`):
   security boundary. `SHELL_TOOLS=0` removes this host backend at build time.
 - `time()` — UTC ISO-8601 + unix seconds.
 
-File tools (workspace = `MOTIRIS_WORKSPACE` or cwd; paths outside it are
-rejected):
+File tools canonicalize paths and are unrestricted by directory boundary by
+default. Set `"workspace_guard": true` to confine them to
+`MOTIRIS_WORKSPACE` (or cwd). With approval and the guard both off, the model
+can read/write any OS-permitted path without confirmation; enable both guards
+when that is not intended:
 
 - `read_file(path)` / `write_file(path, content)` / `patch(path, old, new)`
 - `search_files(pattern, path?)` — bounded recursive regex grep. Recursive
-  symlinks are skipped; every component is opened relative to the workspace
-  with `O_NOFOLLOW`. Limits: 32 directory levels, 4096 entries, 1 MiB per
+  symlinks are skipped; every component is opened relative to `/` (unguarded)
+  or the workspace (guarded) with `O_NOFOLLOW`. Limits: 32 directory levels, 4096 entries, 1 MiB per
   file / 16 MiB total, 4096-byte line buffer and 200 matches. Results include
-  skip/truncation diagnostics. Explicit start paths must still canonicalize
-  inside the workspace.
+  skip/truncation diagnostics. In guarded mode, explicit start paths must
+  canonicalize inside the workspace.
 
 `read_file`, `write_file` and `patch` reject missing or wrongly typed required
 arguments before resolving or opening a target. Explicit empty `content` and
@@ -410,16 +442,20 @@ Edit scalar JSON config without a text editor:
 ```sh
 motiris set config model glm-5.3
 motiris set config stream false       # JSON boolean, not a string
-motiris set config max_steps 20       # JSON integer
+motiris set config max_steps 0        # 0 = unlimited; positive = bounded
+motiris --config approval ask         # equivalent typed JSON editor
+motiris --init                        # all-or-nothing safe defaults/templates
 motiris set config api_key_env MOTIRIS_API_KEY
 ```
 
 The command updates `$MOTIRIS_HOME/config.json` (default
 `~/.motiris/config.json`) without starting an agent or contacting a provider.
 String keys are `model`, `base_url`, `api_key_env`, `transport`, `system`,
-`plugin_dir`, `shell_allow` and `shell_deny`; boolean keys are `stream`,
-`tools`, `plugins` and `goal_check` (`true`/`false`). `max_steps` must be a
-positive integer. Other fields, including `providers`, `mcp_servers` and
+`plugin_dir`, `shell_allow`, `shell_deny`, `approval` and `reasoning_effort`;
+boolean keys are `stream`, `show_thinking`, `workspace_guard`,
+`context_compaction`, `tools`, `plugins` and `goal_check`. Integer keys are `max_steps` (0 unlimited),
+`compaction_threshold`, `compaction_keep` and `compaction_max_chars`.
+Other fields, including `providers`, `mcp_servers` and
 extension fields, are preserved. Writes use a complete mode-0600 temporary
 file plus `fsync` and atomic rename. Empty, malformed, non-object, oversized
 or non-regular input is rejected without resetting the original; invalid
@@ -468,7 +504,7 @@ int motiris_plugin_init(MotirisAgent *a, const MotirisPluginApi *api) {
 ```
 
 ```
-make examples/hello_plugin.so
+make plugins                       # example + optional context compactor
 mkdir -p ~/.motiris/plugins/hello
 cp examples/hello_plugin.so ~/.motiris/plugins/hello/hello.so
 motiris -p "say hello to iris"   # plugin tool appears to the model automatically
@@ -498,7 +534,7 @@ src/agent.c            agent loop, request assembly, tool dispatch
 src/core/checkpoint.c  portable bounded memory snapshot export/import
 src/transport.c        libcurl C backend (default) / spawn-curl / echo
 src/tools.c            built-in tools (shell, time)
-src/filetools.c        read/write/patch/search (workspace-guarded)
+src/filetools.c        read/write/patch/search (optional workspace guard)
 src/webtools.c         web_fetch / web_search
 src/memorytools.c      persistent memory tools
 src/skilltools.c       SKILL.md index + on-demand load
