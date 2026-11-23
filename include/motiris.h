@@ -52,6 +52,26 @@ void motiris_add_provider(MotirisAgent *a, const MotirisProvider *p); /* copied 
 int  motiris_provider_count(MotirisAgent *a);
 void motiris_register_tool(MotirisAgent *a, const MotirisTool *t); /* copied */
 void motiris_unregister_tool(MotirisAgent *a, const char *name); /* runtime unplug */
+
+/* Optional synchronous approval for every registered tool on this Agent.
+ * Approval defaults off. Session grants are bounded by the tool registry and
+ * belong only to this Agent; no callback means a required call fails closed. */
+typedef enum MotirisApprovalDecision {
+  MOTIRIS_APPROVAL_DENY = 0,
+  MOTIRIS_APPROVAL_ALLOW_ONCE = 1,
+  MOTIRIS_APPROVAL_ALLOW_SESSION = 2,
+} MotirisApprovalDecision;
+typedef MotirisApprovalDecision (MotirisApprovalCallback)(
+    const char *tool_name, const char *args_json, void *ud);
+/* Optional filesystem directory boundary; off = OS-permission unrestricted. */
+void motiris_set_workspace_guard(MotirisAgent *a, int on);
+int  motiris_workspace_guard_enabled(const MotirisAgent *a);
+void motiris_set_approval_required(MotirisAgent *a, int on);
+int  motiris_approval_required(MotirisAgent *a);
+void motiris_set_approval_callback(MotirisAgent *a,
+                                   MotirisApprovalCallback *cb, void *ud);
+void motiris_clear_approval_grants(MotirisAgent *a);
+
 cJSON *motiris_messages(MotirisAgent *a);                        /* session log */
 /* Agent-owned first message of the latest run's external user turn, or NULL.
  * Synthetic goal-check messages do not move this boundary. The read-only
@@ -63,15 +83,25 @@ const cJSON *motiris_turn_start(MotirisAgent *a);
 typedef void (MotirisToolHook)(const char *name, const char *args,
                                const char *result, void *ud);
 
+typedef int (MotirisCompactionCallback)(MotirisAgent *a, size_t keep,
+                                        size_t max_chars, void *ud);
+
+void motiris_set_compactor(MotirisAgent *a, MotirisCompactionCallback *cb,
+                           void *ud);
+int  motiris_set_compaction(MotirisAgent *a, int enabled, size_t threshold,
+                            size_t keep, size_t max_chars);
+
 typedef struct MotirisPluginApi {
   int version;                                   /* MOTIRIS_PLUGIN_API_VERSION */
   void (*register_tool)(MotirisAgent *a, const MotirisTool *t);
   void (*unregister_tool)(MotirisAgent *a, const char *name);
   /* observe tool invocations (appends; coexists with repl/other hooks) */
   void (*add_tool_hook)(MotirisAgent *a, MotirisToolHook cb, void *ud);
+  /* v2 additive hook: deterministic, synchronous old-context compaction. */
+  void (*set_compactor)(MotirisAgent *a, MotirisCompactionCallback *cb, void *ud);
 } MotirisPluginApi;
 
-#define MOTIRIS_PLUGIN_API_VERSION 1
+#define MOTIRIS_PLUGIN_API_VERSION 2
 
 /* A plugin shared object exports:
  *   int motiris_plugin_init(MotirisAgent *a, const MotirisPluginApi *api);
@@ -80,7 +110,8 @@ typedef int (*motiris_plugin_init_fn)(MotirisAgent *a, const MotirisPluginApi *a
 
 int motiris_load_plugins(MotirisAgent *a, const char *dir);  /* 0 on success */
 void motiris_set_transport(MotirisAgent *a, const char *name);  /* "curl"|"echo" */
-void motiris_set_max_steps(MotirisAgent *a, int n);
+void motiris_set_max_steps(MotirisAgent *a, int n);   /* 0 = unlimited */
+int  motiris_max_steps(MotirisAgent *a);
 void motiris_set_goal_check(MotirisAgent *a, int on);   /* confirm goal met */
 void motiris_set_plugins_enabled(MotirisAgent *a, int on);
 void motiris_set_tools_enabled(MotirisAgent *a, int on);
@@ -88,9 +119,24 @@ void motiris_set_plugin_dir(MotirisAgent *a, const char *dir);
 int  motiris_plugins_enabled(MotirisAgent *a);
 const char *motiris_plugin_dir(MotirisAgent *a);
 void motiris_set_verbose(MotirisAgent *a, int on);
+/* Hosts with their own response writer can suppress core stdout replies. */
+void motiris_set_print_answer(MotirisAgent *a, int on);
 void motiris_set_stream(MotirisAgent *a, int on);      /* SSE streaming */
+int  motiris_stream_enabled(MotirisAgent *a);
 void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
-                           void *ud);   /* per-token sink (default stdout) */
+                           void *ud);   /* answer-delta sink */
+/* Provider-supplied reasoning is a side channel: it is never appended to
+ * canonical assistant content, history or checkpoints. */
+void motiris_set_reasoning_cb(MotirisAgent *a,
+                              void (*cb)(const char *, void *), void *ud);
+/* reasoning_effort: NULL/""/"off" omits the provider request field;
+ * low/medium/high are accepted. Returns -1 without changing invalid input. */
+int  motiris_set_reasoning_effort(MotirisAgent *a, const char *effort);
+const char *motiris_reasoning_effort(MotirisAgent *a);
+void motiris_set_thinking_visible(MotirisAgent *a, int on);
+int  motiris_thinking_visible(MotirisAgent *a);
+/* Append host-loaded instruction/persona text to the system prompt. */
+void motiris_append_system(MotirisAgent *a, const char *text);
 /* Optional cooperative cancellation for provider requests and agent steps.
  * The callback runs in the calling thread and must be async-signal-safe when
  * it reads a flag set by a host signal handler. */
@@ -118,9 +164,17 @@ void motiris_register_file_tools(MotirisAgent *a);  /* read/write/patch/search *
 void motiris_register_web_tools(MotirisAgent *a);   /* web_fetch/search */
 void motiris_register_memory_tools(MotirisAgent *a); /* memory get/set/list */
 void motiris_register_skill_tools(MotirisAgent *a, const char *dir);
+/* Merge user skills, workspace .motiris/skills, then an optional explicit
+ * directory. Later same-name skills take precedence. */
+void motiris_register_default_skill_tools(MotirisAgent *a,
+                                          const char *explicit_dir);
 int  motiris_skill_count(void);                      /* indexed skills */
 const char *motiris_skill_name(int i);               /* or NULL */
 const char *motiris_skill_desc(int i);               /* or NULL */
+/* Append only title/description/path metadata to system context. The model
+ * loads relevant bodies on demand through read_file. */
+void motiris_append_skill_context(MotirisAgent *a);
+int  motiris_skill_file_readable(const char *absolute_path);
 void motiris_register_subagent_tools(MotirisAgent *a);  /* subagent */
 void motiris_register_browser_tools(MotirisAgent *a);  /* browser_fetch */
 int  motiris_tools_enabled(MotirisAgent *a);
@@ -133,7 +187,8 @@ const char *motiris_api_key(MotirisAgent *a);
 const char *motiris_transport_name(MotirisAgent *a);
 #endif
 
-/* ---- centralized config: $HOME/.motiris/{env,config.json} ---- */
+/* ---- centralized config: $HOME/.motiris/{env,config.json,AGENTS.md,SOUL.md}
+ * and skills/<name>/SKILL.md ---- */
 void motiris_load_env(void);                  /* call before new() */
 void motiris_apply_config(MotirisAgent *a);   /* preserves pre-disabled tools */
 int  motiris_init_config(void);               /* write templates */
@@ -187,6 +242,23 @@ int  motiris_session_checkpoint(const char *sub, const char *id,
 int  motiris_session_load(MotirisAgent *agent, const char *path,
                           const char *expected_session_id,
                           size_t *loaded_messages, const char **error);
+
+/* Automatic UUID session store under $HOME/.motiris/session/ (MOTIRIS_HOME
+ * overrides that root). session.json is the index; each complete trace lives
+ * in session-<uuid>.json. kind is "repl" or "gateway"; chat_id is optional. */
+char *motiris_session_auto_id(void);  /* malloc'd 36-byte UUID, not a secret */
+int  motiris_session_auto_save(MotirisAgent *agent, const char *uuid,
+                               const char *kind, const char *chat_id,
+                               const char **error);
+/* selector NULL chooses the newest matching index entry. Returns 0 restored,
+ * 1 not found, -1 invalid/failed. On restore, *uuid is malloc-owned. */
+int  motiris_session_auto_restore(MotirisAgent *agent, const char *kind,
+                                  const char *chat_id, const char *selector,
+                                  char **uuid, size_t *loaded_messages,
+                                  const char **error);
+int  motiris_session_auto_delete(const char *kind, const char *chat_id,
+                                 const char **error);
+int  motiris_session_auto_list(const char *kind, const char *term);
 
 /* ---- cron: scheduled agent runs ---- */
 int motiris_cron_run(const char *jobs_file, int once, int verbose);

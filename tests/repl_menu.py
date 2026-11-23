@@ -118,7 +118,8 @@ def main():
             output = plain(raw)
             lines = terminal_lines(raw)
             for command in ("/help", "/new", "/tools", "/sessions",
-                            "/resume", "/skills", "/hotkey", "/exit"):
+                            "/load", "/save", "/resume", "/skills", "/thinking",
+                            "/reasoning", "/approval", "/config", "/hotkey", "/exit"):
                 assert command in output, (command, output)
                 assert any(line.startswith("  " + command) for line in lines), (
                     command, lines)
@@ -143,7 +144,7 @@ def main():
             # Every edit, including transposition, resets the selected match.
             repl.send("\x1b[B")
             raw = repl.read_until("list available skills [TERM]")
-            assert b"\x1b[7m  /skills" in raw, raw
+            assert b"\x1b[7m  /save" in raw, raw
             repl.send("\x1b[D")
             repl.read_until("list available skills [TERM]")
             repl.send("\x14")

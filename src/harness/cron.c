@@ -94,6 +94,8 @@ static void run_job(Job *jb, const char *filename, int verbose, int tools_on) {
   motiris_apply_config(a);
   motiris_register_core_tools(a);
   if (motiris_tools_enabled(a)) motiris_register_file_tools(a);
+  motiris_register_default_skill_tools(a, NULL);
+  motiris_append_skill_context(a);
   motiris_add_user(a, jb->prompt);
   int rc = motiris_run(a);
 

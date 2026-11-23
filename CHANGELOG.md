@@ -8,6 +8,32 @@ published by `.github/workflows/release.yml`.
 
 ### Added
 
+- Agent defaults and interaction: `max_steps=0` (unlimited), SSE streaming,
+  configurable reasoning effort, separate provider-only thinking deltas,
+  `/thinking`, `/reasoning`, `/approval` and `/config` cards, and fail-closed
+  optional tool approval. Existing explicit limits and `--no-stream` remain.
+- Safe all-or-nothing `--init` templates for config/env, `AGENTS.md`, `SOUL.md`
+  and default Skills; existing files abort initialization unchanged. Config
+  gains typed `approval`, `reasoning_effort`, `show_thinking` and compaction
+  fields, plus bounded recursive-expansion rejection in env files.
+- Directory-driven Skill discovery (user < workspace < explicit) with a
+  metadata-only title/description/path system index and exact-path `read_file`
+  body loading. User-indexed files have a narrow read-only exception when the
+  optional workspace guard is enabled.
+- Automatic UUID session traces at `$MOTIRIS_HOME/session/session.json` and
+  `session-<uuid>.json`, atomic index updates, REPL save/load/new and Gateway
+  restart/reset recovery. Legacy checkpoint logs remain migration fallbacks.
+- Optional per-Agent `workspace_guard` (default off): unrestricted file tools
+  can use any OS-permitted path with approval off; enabling the guard restores
+  canonical workspace confinement without removing file type, size, symlink or
+  atomic-write checks. Configuration cards, templates and four-tool tests are
+  synchronized.
+- Gateway SSE responses with distinct reasoning/content/error/done events and
+  `"stream":false` JSON compatibility. Optional deterministic context
+  compaction plugin (plugin API v2) preserves the current turn and complete
+  tool pairs and fails without discarding context. Installer plugin selection,
+  verified-before-extraction release archives and local installer regression
+  tests are included; session/read/write/MCP/approval remain built in.
 - Configurable provider receive bounds (`MOTIRIS_RESPONSE_MAX_BYTES`, default
   and hard maximum 16 MiB) cover buffered libcurl/spawned-curl bodies, SSE
   wire/line/content/tool-argument growth and streamed tool-call count.

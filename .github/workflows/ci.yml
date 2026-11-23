@@ -117,13 +117,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: plugin example compiles (gcc)
-        run: make examples/hello_plugin.so
+      - name: plugin artifacts compile (gcc)
+        run: make plugins
 
-      - name: plugin example compiles (clang -Werror)
+      - name: plugin artifacts compile (clang -Werror)
         run: |
           make clean
-          make examples/hello_plugin.so CC=clang \
+          make plugins CC=clang \
             CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -fPIC -shared"
 
   # component static libs compile/link independently (tools, core, harness)

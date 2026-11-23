@@ -37,7 +37,7 @@ unset MOTIRIS_API_KEY MOTIRIS_MODEL MOTIRIS_BASE_URL MOTIRIS_PLUGIN_DIR \
       MOTIRIS_HISTORY_MAX_BYTES MOTIRIS_REPLAY_MAX_MESSAGES \
       MOTIRIS_REPLAY_MAX_BYTES MOTIRIS_RESPONSE_MAX_BYTES 2>/dev/null || true
 
-make motiris examples/hello_plugin.so >/dev/null 2>&1
+make motiris plugins >/dev/null 2>&1
 
 if test_in 1; then
 echo "== 1: agent loop runs end-to-end (echo transport)"
@@ -89,6 +89,8 @@ echo "== 7: env config honored (MOTIRIS_MODEL)"
 OUT=$(MOTIRIS_MODEL=foo-model ./motiris -p hi --transport echo -v 2>&1)
 echo "$OUT" | grep -q 'foo-model via' || { echo FAIL; exit 1; }
 python3 tests/config_set.py
+python3 tests/config_env.py
+python3 tests/install.py
 
 fi
 if test_in 8; then
@@ -132,6 +134,7 @@ H=$(curl -s http://127.0.0.1:18089/health)
 echo "$H" | grep -q '"status":"ok"' || { echo "FAIL health: $H"; kill $GWPID 2>/dev/null; exit 1; }
 R=$(curl -s -X POST http://127.0.0.1:18089/v1/chat -d '{"chat_id":"g1","message":"hi"}')
 echo "$R" | grep -q 'echo round complete' || { echo "FAIL chat: $R"; kill $GWPID 2>/dev/null; exit 1; }
+echo "$R" | grep -q 'event: done' || { echo "FAIL default SSE chat: $R"; kill $GWPID 2>/dev/null; exit 1; }
 if ! python3 - <<'PY9'; then
 import socket
 
@@ -315,7 +318,7 @@ def restart_gateway():
 
 
 def chat(chat_id, message, reset=False, expected=200):
-    payload = {"chat_id": chat_id, "message": message}
+    payload = {"chat_id": chat_id, "message": message, "stream": False}
     if reset:
         payload["reset"] = True
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
@@ -485,7 +488,7 @@ F10=$(mktemp -d)
 mkdir -p "$F10/ws" "$F10/h1" "$F10/h2"
 printf 'hello content\n' > "$F10/ws/hello.txt"
 printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18091/v1/chat/completions"}' > "$F10/h1/config.json"
-printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18092/v1/chat/completions"}' > "$F10/h2/config.json"
+printf '{"transport":"libcurl","base_url":"http://127.0.0.1:18092/v1/chat/completions","workspace_guard":true}' > "$F10/h2/config.json"
 python3 -c '
 import http.server, json, threading
 class H(http.server.BaseHTTPRequestHandler):
@@ -518,6 +521,7 @@ kill $MOCKPID 2>/dev/null
 wait $MOCKPID 2>/dev/null || true
 cd "$ROOT"
 sh tests/search_files.sh
+python3 tests/workspace_guard.py
 rm -rf "$F10"
 
 fi
@@ -730,6 +734,8 @@ echo "$O9" | grep -q 'bye' || { echo "FAIL repl exit: $O9"; exit 1; }
 python3 tests/repl_menu.py
 python3 tests/repl_cancel.py
 python3 tests/render.py
+python3 tests/repl_cards.py
+python3 tests/session_auto.py
 
 fi
 if test_in 16; then
@@ -811,6 +817,7 @@ echo "$O11" | grep -q 'greeted' || { echo "FAIL plugin result: $O11"; exit 1; }
 kill $M17PID 2>/dev/null
 wait $M17PID 2>/dev/null || true
 rm -rf "$F17"
+python3 tests/context_compaction.py
 
 fi
 if test_in 18; then
@@ -835,6 +842,7 @@ O13=$(printf '/skills\n/exit\n' | "$ROOT/motiris" -i --transport echo \
 echo "$O13" | grep -q 'skill-nineteen' || { echo "FAIL /skills: $O13"; exit 1; }
 echo "$O13" | grep -q 'filter me' || { echo "FAIL /skills desc: $O13"; exit 1; }
 rm -rf "$F19"
+python3 tests/agent_defaults.py
 
 fi
 if test_in 20; then

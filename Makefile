@@ -105,7 +105,12 @@ motiris: libmotiris_core.a libmotiris_tools.a libmotiris_harness.a \
 examples/hello_plugin.so: examples/hello_plugin.c include/motiris.h
 	$(CC) $(CFLAGS) -fPIC -shared -Iinclude -Isrc/vendor -o $@ $<
 
-test: motiris
+plugins/context_compaction/context_compaction.so: plugins/context_compaction/context_compaction.c include/motiris.h
+	$(CC) $(CFLAGS) -fPIC -shared -Iinclude -Isrc/vendor -o $@ $<
+
+plugins: examples/hello_plugin.so plugins/context_compaction/context_compaction.so
+
+test: motiris plugins
 	sh tests/smoke.sh
 
 test-shell: motiris
@@ -201,7 +206,8 @@ test-docker:
 		motiris-test bash -c 'mkdir -p /tmp/home && make clean && make && sh tests/smoke.sh'
 
 clean:
-	rm -f motiris *.a build/memory-unit build/filetools-unit build/webtools-parser
+	rm -f motiris *.a build/memory-unit build/filetools-unit build/webtools-parser \
+		examples/hello_plugin.so plugins/context_compaction/context_compaction.so
 	rm -rf build/nofs
 	find src deps -name '*.o' -delete
 
@@ -210,4 +216,4 @@ install: motiris
 
 .PHONY: test test-shell test-browser-subagent test-filetools test-memory \
 	test-webtools-parser test-vision test-tts test-core-nofs test-nofs \
-	test-persistence test-docker clean install
+	test-persistence test-docker clean install plugins

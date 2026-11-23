@@ -5,8 +5,8 @@
  *        |                   append tool results  <-+ (execute tools)
  *        +------------ final answer printed, done  (finish_reason == stop)
  *
- * Messages are kept as a cJSON array; each round appends. The loop is
- * bounded by max_steps so a misbehaving model cannot loop forever.
+ * Messages are kept as a cJSON array; each round appends. A positive
+ * max_steps bounds the loop; zero deliberately leaves it unlimited.
  */
 #include "motiris.h"
 
@@ -35,13 +35,27 @@ struct MotirisAgent {
   char transport[16];
   int max_steps;
   int verbose;
+  int print_answer;
   int stream;
   void (*on_delta)(const char *, void *);
   void *delta_ud;
+  void (*on_reasoning)(const char *, void *);
+  void *reasoning_ud;
+  char reasoning_effort[8];
+  int thinking_visible;
   MotirisCancelCallback *cancel;
   void *cancel_ud;
   int tools_on, plugins_on;
   int goal_check;
+  int approval_required;
+  int workspace_guard;
+  int compact_enabled;
+  size_t compact_threshold, compact_keep, compact_max_chars;
+  MotirisCompactionCallback *compactor;
+  void *compact_ud;
+  MotirisApprovalCallback *approval;
+  void *approval_ud;
+  unsigned char approval_grants[(MAX_TOOLS + 7) / 8];
   char *plugin_dir;
   /* tool-call observers (multi-slot; plugins and repl can both watch) */
   struct { MotirisToolHook *cb; void *ud; } tool_hooks[8];
@@ -65,7 +79,10 @@ char *motiris_transport_send(const char *backend, const char *url,
 char *motiris_transport_send_stream(const char *backend, const char *url,
                                     const char *auth, const char *body,
                                     void (*on_delta)(const char *, void *),
-                                    void *ud, MotirisCancelCallback *cancel,
+                                    void *ud,
+                                    void (*on_reasoning)(const char *, void *),
+                                    void *reasoning_ud,
+                                    MotirisCancelCallback *cancel,
                                     void *cancel_ud, char **err);
 
 /* tools.c */
@@ -133,7 +150,12 @@ MotirisAgent *motiris_new(void) {
   a->model = sdup(m && *m ? m : "gpt-4o-mini");
   a->messages = cJSON_CreateArray();
   strcpy(a->transport, "auto");
-  a->max_steps = 10;
+  a->max_steps = 0;
+  a->compact_threshold = 32;
+  a->compact_keep = 8;
+  a->compact_max_chars = 8192;
+  a->print_answer = 1;
+  a->stream = 1;
   a->history_max_messages = env_limit("MOTIRIS_HISTORY_MAX_MESSAGES",
                                       HISTORY_MAX_MESSAGES, HISTORY_MAX_MESSAGES);
   a->history_max_bytes = env_limit("MOTIRIS_HISTORY_MAX_BYTES",
@@ -190,8 +212,18 @@ const char *motiris_api_key(MotirisAgent *a) { return a->api_key; }
 const char *motiris_transport_name(MotirisAgent *a) { return a->transport; }
 #endif
 void motiris_set_stream(MotirisAgent *a, int on) { a->stream = !!on; }
+int motiris_stream_enabled(MotirisAgent *a) { return a->stream; }
 void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                            void *ud) { a->on_delta = cb; a->delta_ud = ud; }
+void motiris_set_reasoning_cb(MotirisAgent *a,
+                              void (*cb)(const char *, void *), void *ud) {
+  a->on_reasoning = cb;
+  a->reasoning_ud = ud;
+}
+void motiris_set_thinking_visible(MotirisAgent *a, int on) {
+  a->thinking_visible = !!on;
+}
+int motiris_thinking_visible(MotirisAgent *a) { return a->thinking_visible; }
 void motiris_set_cancel_cb(MotirisAgent *a, MotirisCancelCallback *cb, void *ud) {
   a->cancel = cb;
   a->cancel_ud = ud;
@@ -213,6 +245,18 @@ static void forward_delta(const char *text, void *ud) {
   if (text && *text) forward->seen = 1;
   forward->cb(text, forward->ud);
 }
+
+typedef struct {
+  void (*cb)(const char *, void *);
+  void *ud;
+  int seen;
+} ReasoningForward;
+
+static void forward_reasoning(const char *text, void *ud) {
+  ReasoningForward *forward = ud;
+  if (text && *text) forward->seen = 1;
+  forward->cb(text, forward->ud);
+}
 void motiris_set_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud) {
   a->ntool_hooks = 0; /* replace any existing observers */
   motiris_add_tool_hook(a, cb, ud);
@@ -225,9 +269,51 @@ void motiris_add_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud) {
 }
 long motiris_tokens_in(MotirisAgent *a)  { return a->tok_in; }
 long motiris_tokens_out(MotirisAgent *a) { return a->tok_out; }
-void motiris_set_max_steps(MotirisAgent *a, int n) { a->max_steps = n; }
+void motiris_set_max_steps(MotirisAgent *a, int n) {
+  a->max_steps = n > 0 ? n : 0;
+}
+int motiris_max_steps(MotirisAgent *a) { return a->max_steps; }
 void motiris_set_verbose(MotirisAgent *a, int on) { a->verbose = on; }
+void motiris_set_print_answer(MotirisAgent *a, int on) { a->print_answer = !!on; }
 void motiris_set_goal_check(MotirisAgent *a, int on) { a->goal_check = !!on; }
+void motiris_set_workspace_guard(MotirisAgent *a, int on) {
+  a->workspace_guard = !!on;
+}
+int motiris_workspace_guard_enabled(const MotirisAgent *a) {
+  return a->workspace_guard;
+}
+void motiris_set_approval_required(MotirisAgent *a, int on) {
+  a->approval_required = !!on;
+}
+int motiris_approval_required(MotirisAgent *a) { return a->approval_required; }
+void motiris_set_approval_callback(MotirisAgent *a,
+                                   MotirisApprovalCallback *cb, void *ud) {
+  a->approval = cb;
+  a->approval_ud = ud;
+}
+void motiris_clear_approval_grants(MotirisAgent *a) {
+  memset(a->approval_grants, 0, sizeof a->approval_grants);
+}
+static void set_error(MotirisAgent *a, const char *msg, const char *arg);
+
+void motiris_set_compactor(MotirisAgent *a, MotirisCompactionCallback *cb,
+                           void *ud) {
+  a->compactor = cb;
+  a->compact_ud = ud;
+}
+int motiris_set_compaction(MotirisAgent *a, int enabled, size_t threshold,
+                           size_t keep, size_t max_chars) {
+  if (threshold < 4 || threshold > 256 || !keep || keep >= threshold ||
+      max_chars < 256 || max_chars > 65536) {
+    set_error(a, "%s", "invalid context compaction limits");
+    return -1;
+  }
+  a->compact_enabled = !!enabled;
+  a->compact_threshold = threshold;
+  a->compact_keep = keep;
+  a->compact_max_chars = max_chars;
+  return 0;
+}
 
 const char *motiris_last_error(MotirisAgent *a) {
   static const char none[] = "";
@@ -244,6 +330,39 @@ static void set_error(MotirisAgent *a, const char *msg, const char *arg) {
 void motiris_set_system(MotirisAgent *a, const char *sys) {
   free(a->system);
   a->system = sdup(sys);
+}
+
+void motiris_append_system(MotirisAgent *a, const char *text) {
+  if (!text || !*text) return;
+  size_t old = a->system ? strlen(a->system) : 0;
+  size_t add = strlen(text);
+  char *joined = malloc(old + add + 3);
+  if (!joined) {
+    set_error(a, "%s", "out of memory while loading system context");
+    return;
+  }
+  if (old) {
+    memcpy(joined, a->system, old);
+    memcpy(joined + old, "\n\n", 2);
+  }
+  memcpy(joined + old + (old ? 2 : 0), text, add + 1);
+  free(a->system);
+  a->system = joined;
+}
+
+int motiris_set_reasoning_effort(MotirisAgent *a, const char *effort) {
+  if (effort && *effort && strcmp(effort, "off") &&
+      strcmp(effort, "low") && strcmp(effort, "medium") &&
+      strcmp(effort, "high")) {
+    set_error(a, "%s", "reasoning effort must be off, low, medium or high");
+    return -1;
+  }
+  if (!effort || !*effort || !strcmp(effort, "off")) a->reasoning_effort[0] = '\0';
+  else snprintf(a->reasoning_effort, sizeof a->reasoning_effort, "%s", effort);
+  return 0;
+}
+const char *motiris_reasoning_effort(MotirisAgent *a) {
+  return a->reasoning_effort;
 }
 
 static int history_fail(MotirisAgent *a, const char *message) {
@@ -405,17 +524,34 @@ void motiris_add_user(MotirisAgent *a, const char *msg) {
   add_user_message(a, msg, 1);
 }
 
+static int approval_granted(const MotirisAgent *a, int slot) {
+  return (a->approval_grants[slot / 8] &
+          (unsigned char)(1u << (slot % 8))) != 0;
+}
+
+static void set_approval_grant(MotirisAgent *a, int slot, int granted) {
+  unsigned char mask = (unsigned char)(1u << (slot % 8));
+  if (granted) a->approval_grants[slot / 8] |= mask;
+  else a->approval_grants[slot / 8] &= (unsigned char)~mask;
+}
+
 void motiris_register_tool(MotirisAgent *a, const MotirisTool *t) {
   if (!a || !a->tools_on || !t || !t->name || a->ntools >= MAX_TOOLS) return;
-  a->tools[a->ntools++] = *t;
+  int slot = a->ntools++;
+  set_approval_grant(a, slot, 0);
+  a->tools[slot] = *t;
   /* external per-tool schema (toolscan.c) replaces the embedded one */
   const char *ext = motiris_tool_schema(t->name);
-  if (ext) a->tools[a->ntools - 1].parameters = ext;
+  if (ext) a->tools[slot].parameters = ext;
 }
 
 void motiris_unregister_tool(MotirisAgent *a, const char *name) {
   for (int i = 0; i < a->ntools; i++) {
     if (!strcmp(a->tools[i].name, name)) {
+      /* Registry slots move left; move only the corresponding grant bits. */
+      for (int j = i; j + 1 < a->ntools; j++)
+        set_approval_grant(a, j, approval_granted(a, j + 1));
+      set_approval_grant(a, a->ntools - 1, 0);
       memmove(&a->tools[i], &a->tools[i + 1],
               sizeof(MotirisTool) * (size_t)(a->ntools - i - 1));
       a->ntools--;
@@ -567,6 +703,8 @@ static char *build_request(MotirisAgent *a, const char *model) {
   }
 
   cJSON_AddNumberToObject(req, "temperature", 0.2);
+  if (*a->reasoning_effort)
+    cJSON_AddStringToObject(req, "reasoning_effort", a->reasoning_effort);
   if (a->stream) cJSON_AddTrueToObject(req, "stream");
   char *body = cJSON_PrintUnformatted(req);
   cJSON_Delete(req);
@@ -653,6 +791,19 @@ int motiris_run(MotirisAgent *a) {
   free(a->last_error);
   a->last_error = NULL;
   a->run_start = NULL;
+  size_t message_count = (size_t)cJSON_GetArraySize(a->messages);
+  if (a->compact_enabled && message_count > a->compact_threshold) {
+    if (!a->compactor) {
+      set_error(a, "%s",
+                "context compaction enabled but context-compaction plugin is unavailable");
+      return 1;
+    }
+    if (a->compactor(a, a->compact_keep, a->compact_max_chars,
+                     a->compact_ud) < 0) {
+      set_error(a, "%s", "context compaction failed; original context retained");
+      return 1;
+    }
+  }
   for (cJSON *m = a->messages->child; m; m = m->next)
     if (!strcmp(message_role(m), "user")) a->run_start = m;
   if (history_retain(a, a->run_start)) return 1;
@@ -675,11 +826,12 @@ int motiris_run(MotirisAgent *a) {
     }
   }
 
-  for (int step = 0; step < a->max_steps; step++) {
+  for (unsigned long step = 0;
+       a->max_steps == 0 || step < (unsigned long)a->max_steps; step++) {
     if (run_cancelled(a)) return cancel_run(a, run_tail, start_tok_in, start_tok_out);
     char *last_err = NULL;
     cJSON *j = NULL;
-    int delta_seen = 0;
+    int delta_seen = 0, reasoning_seen = 0;
 
     /* try providers in order; on transport/parse/api error, fail over */
     for (int pi = 0; pi < np; pi++) {
@@ -695,7 +847,7 @@ int motiris_run(MotirisAgent *a) {
         key = default_key;
       }
       if (a->verbose)
-        fprintf(stderr, "[motiris] step %d: %s via %s\n", step + 1, model,
+        fprintf(stderr, "[motiris] step %lu: %s via %s\n", step + 1, model,
                 a->nproviders > 0 ? pname(a, pi) : "default provider");
 
       char *body = build_request(a, model);
@@ -717,15 +869,21 @@ int motiris_run(MotirisAgent *a) {
 
       char *err = NULL;
       DeltaForward forward = { a->on_delta, a->delta_ud, 0 };
+      ReasoningForward reasoning = {
+        a->on_reasoning, a->reasoning_ud, 0
+      };
       char *resp = a->stream
           ? motiris_transport_send_stream(
                 a->transport, url, authp, body,
                 a->on_delta && !confirm_asked ? forward_delta : NULL,
                 a->on_delta && !confirm_asked ? &forward : NULL,
+                a->on_reasoning && !confirm_asked ? forward_reasoning : NULL,
+                a->on_reasoning && !confirm_asked ? &reasoning : NULL,
                 a->cancel, a->cancel_ud, &err)
           : motiris_transport_send(a->transport, url, authp, body,
                                    a->cancel, a->cancel_ud, &err);
       delta_seen = forward.seen;
+      reasoning_seen = reasoning.seen;
       free(body);
       if (run_cancelled(a)) {
         free(resp);
@@ -741,8 +899,8 @@ int motiris_run(MotirisAgent *a) {
         if (a->verbose && a->nproviders > 0)
           fprintf(stderr, "[motiris] provider %s failed: %s\n",
                   pname(a, pi), last_err);
-        /* Already visible deltas cannot be mixed with another provider. */
-        if (delta_seen) break;
+        /* Any visible provider output cannot be mixed with a fallback. */
+        if (delta_seen || reasoning_seen) break;
         continue;
       }
       if (a->verbose) {
@@ -755,7 +913,7 @@ int motiris_run(MotirisAgent *a) {
       if (!j) {
         free(last_err);
         last_err = sdup("cannot parse model response");
-        if (delta_seen) break;
+        if (delta_seen || reasoning_seen) break;
         continue;
       }
       cJSON *errj = cJSON_GetObjectItemCaseSensitive(j, "error");
@@ -772,7 +930,7 @@ int motiris_run(MotirisAgent *a) {
         if (a->verbose && a->nproviders > 0)
           fprintf(stderr, "[motiris] provider %s failed: %s\n",
                   pname(a, pi), last_err);
-        if (delta_seen) break;
+        if (delta_seen || reasoning_seen) break;
         continue;
       }
       /* accumulate usage/token stats from this response */
@@ -847,14 +1005,44 @@ int motiris_run(MotirisAgent *a) {
         if (!t) {
           result = string_result("error: unknown tool (not registered)");
         } else {
-          if (a->verbose) fprintf(stderr, "[motiris] tool call: %s(%s)\n",
-                                          name, args ? args : "");
-                  result = t->call(args ? args : "{}", t->ud);
-                  if (!result) result = string_result(
-                      "error: tool returned nothing");
-                  for (int hi = 0; hi < a->ntool_hooks; hi++)
-                    a->tool_hooks[hi].cb(name, args ? args : "{}", result,
-                                         a->tool_hooks[hi].ud);
+          int slot = (int)(t - a->tools);
+          int allowed = !a->approval_required || approval_granted(a, slot);
+          if (!allowed && !a->approval) {
+            result = string_result(
+                "error: approval unavailable (no callback installed)");
+            if (push_tool_message(a, id ? id : "", result)) {
+              free(result);
+              cJSON_Delete(j);
+              return MOTIRIS_RUN_ERROR;
+            }
+            free(result);
+            set_error(a, "%s",
+                      "approval required but no approval callback is installed");
+            cJSON_Delete(j);
+            return MOTIRIS_RUN_ERROR;
+          }
+          if (!allowed) {
+            MotirisApprovalDecision decision = a->approval(
+                name, args ? args : "{}", a->approval_ud);
+            if (decision == MOTIRIS_APPROVAL_ALLOW_SESSION) {
+              set_approval_grant(a, slot, 1);
+              allowed = 1;
+            } else if (decision == MOTIRIS_APPROVAL_ALLOW_ONCE) {
+              allowed = 1;
+            }
+          }
+          if (!allowed) {
+            result = string_result("error: tool call denied by approval policy");
+          } else {
+            if (a->verbose) fprintf(stderr, "[motiris] tool call: %s(%s)\n",
+                                            name, args ? args : "");
+            result = t->call(args ? args : "{}", t->ud);
+            if (!result) result = string_result(
+                "error: tool returned nothing");
+            for (int hi = 0; hi < a->ntool_hooks; hi++)
+              a->tool_hooks[hi].cb(name, args ? args : "{}", result,
+                                   a->tool_hooks[hi].ud);
+          }
         }
         if (push_tool_message(a, id ? id : "", result)) {
           free(result);
@@ -881,7 +1069,7 @@ int motiris_run(MotirisAgent *a) {
       return 0;
     }
     if (content && *content) {
-      if (!delta_seen) printf("%s\n", content);
+      if (!delta_seen && a->print_answer) printf("%s\n", content);
     } else if (!finish || strcmp(finish, "stop"))
       fprintf(stderr, "[motiris] warning: model stopped without output\n");
     if (a->goal_check && !confirm_asked) {

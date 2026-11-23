@@ -47,6 +47,7 @@ class Provider(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), Handler)
         self.responses = {}
         self.hits = Counter()
+        self.requests = {}
 
     def add(self, name, body, stream=False, chunk_size=None):
         path = "/v1/chat/completions/" + name
@@ -58,7 +59,8 @@ class Provider(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(length)
+        raw = self.rfile.read(length)
+        self.server.requests.setdefault(self.path, []).append(json.loads(raw))
         self.server.hits[self.path] += 1
         response = self.server.responses.get(self.path)
         if response is None:
@@ -230,6 +232,10 @@ def main():
                              "invalid stream response")
             expect_limit(invoke(provider, spawned_path, 512, env,
                                 transport="curl"))
+            # The spawn backend is buffered-only: default streaming must be
+            # negotiated down before the request, not by sending SSE it cannot parse.
+            assert "stream" not in provider.requests[spawned_path][-1], \
+                provider.requests[spawned_path][-1]
             expect_ok(invoke(provider, exact_path, len(exact), env),
                       "exact boundary\n")
 

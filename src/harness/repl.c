@@ -20,6 +20,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
+#include <termios.h>
 
 #include <linenoise.h>
 
@@ -38,15 +40,24 @@
 #define C_REVERSE "\033[7m"
 #define C_YELLOW "\033[33m"
 
-static const char *const CMDS[] = { "/help", "/new", "/tools", "/sessions",
-                                    "/resume", "/skills", "/hotkey", "/exit" };
+static const char *const CMDS[] = {
+  "/help", "/new", "/tools", "/sessions", "/load", "/save", "/resume",
+  "/skills", "/thinking", "/reasoning", "/approval", "/config",
+  "/hotkey", "/exit"
+};
 static const char *const CMDS_DESC[] = {
   "this help",
   "reset session context",
   "list tool information",
   "review past session logs [TERM]",
+  "restore latest or selected session [UUID|FILE]",
+  "save the current automatic session now",
   "restore a full-turn snapshot FILE",
   "list available skills [TERM]",
+  "show or hide provider reasoning [on|off]",
+  "set reasoning effort [off|low|medium|high]",
+  "show or set tool approval [off|ask]",
+  "configure this session interactively",
   "show interactive key bindings",
   "leave the repl",
 };
@@ -82,9 +93,30 @@ static int run_interruptible(MotirisAgent *a) {
   return rc;
 }
 
+typedef struct {
+  MotirisAgent *agent;
+  int reasoning_active;
+  char *session_id;
+} ReplState;
+
 static void delta_print(const char *text, void *ud) {
-  (void)ud;
+  ReplState *state = ud;
+  if (state->reasoning_active) {
+    printf(C_RESET "\n");
+    state->reasoning_active = 0;
+  }
   fputs(text, stdout);
+  fflush(stdout);
+}
+
+static void reasoning_print(const char *text, void *ud) {
+  ReplState *state = ud;
+  if (!motiris_thinking_visible(state->agent)) return;
+  if (!state->reasoning_active) {
+    printf(C_DIM "\n[thinking]\n" C_RESET);
+    state->reasoning_active = 1;
+  }
+  printf(C_DIM "%s" C_RESET, text);
   fflush(stdout);
 }
 
@@ -93,8 +125,8 @@ static void clip(char *dst, size_t n, const char *src, size_t maxlen) {
   size_t i = 0, o = 0;
   int prev_sp = 0;
   while (src[i] && o + 1 < n && o < maxlen) {
-    char c = src[i++];
-    if (c == '\n' || c == '\t' || c == '\r') c = ' ';
+    unsigned char c = (unsigned char)src[i++];
+    if (c < 32 || c == 127) c = ' ';
     if (c == ' ') {
       if (prev_sp) continue;
       prev_sp = 1;
@@ -121,6 +153,233 @@ static void repl_tool_hook(const char *name, const char *args,
     printf("  " C_YELLOW "⚙ %s" C_RESET "(%s) " C_DIM "→ %s" C_RESET "\n",
            name, abuf, rbuf);
   }
+}
+
+/* ---------------- shared interactive cards ---------------- */
+typedef struct {
+  struct termios termios;
+  struct sigaction sigint;
+  int active;
+} CardTerminal;
+
+static volatile sig_atomic_t card_interrupted;
+
+static void card_sigint(int sig) {
+  (void)sig;
+  card_interrupted = 1;
+}
+
+static int card_terminal_start(CardTerminal *terminal) {
+  memset(terminal, 0, sizeof *terminal);
+  if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO) ||
+      tcgetattr(STDIN_FILENO, &terminal->termios)) return 0;
+  struct termios raw = terminal->termios;
+  raw.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+  raw.c_iflag &= (tcflag_t)~(IXON | ICRNL);
+  raw.c_cc[VMIN] = 0;
+  raw.c_cc[VTIME] = 1; /* a lone Escape times out; arrows arrive together */
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &raw)) return 0;
+  struct sigaction action = {0};
+  action.sa_handler = card_sigint;
+  sigemptyset(&action.sa_mask);
+  card_interrupted = 0;
+  if (sigaction(SIGINT, &action, &terminal->sigint)) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &terminal->termios);
+    return 0;
+  }
+  terminal->active = 1;
+  printf("\033[?25l");
+  return 1;
+}
+
+static void card_terminal_stop(CardTerminal *terminal) {
+  if (!terminal->active) return;
+  printf("\033[?25h" C_RESET "\n");
+  fflush(stdout);
+  tcsetattr(STDIN_FILENO, TCSANOW, &terminal->termios);
+  sigaction(SIGINT, &terminal->sigint, NULL);
+  terminal->active = 0;
+}
+
+/* u/d/l/r navigate, Enter selects, q/Escape/Ctrl+C closes. */
+static int card_read_key(void) {
+  unsigned char c;
+  ssize_t n = read(STDIN_FILENO, &c, 1);
+  if (n < 0 && errno == EINTR)
+    return card_interrupted ? 'q' : 0;
+  if (n <= 0) return card_interrupted ? 'q' : 0;
+  if (c == 3 || c == 'q' || c == 'Q') return 'q';
+  if (c == '\r' || c == '\n') return '\n';
+  if (c == 's' || c == 'S') return 's';
+  if (c != 27) return (int)c;
+  unsigned char seq[2];
+  if (read(STDIN_FILENO, seq, 1) != 1) return 'q';
+  if (seq[0] != '[' && seq[0] != 'O') return 'q';
+  if (read(STDIN_FILENO, seq + 1, 1) != 1) return 'q';
+  if (seq[1] == 'A') return 'u';
+  if (seq[1] == 'B') return 'd';
+  if (seq[1] == 'C') return 'r';
+  if (seq[1] == 'D') return 'l';
+  return 0;
+}
+
+static void card_row(int selected, const char *label, const char *value) {
+  printf(selected ? C_REVERSE " > %-18s %-24s " C_RESET "\r\n"
+                  : "   %-18s %-24s\r\n", label, value);
+}
+
+static void draw_config_card(MotirisAgent *a, int selected) {
+  const char *effort = motiris_reasoning_effort(a);
+  char steps[32];
+  snprintf(steps, sizeof steps, "%d%s", motiris_max_steps(a),
+           motiris_max_steps(a) ? "" : " (unlimited)");
+  printf("\033[2J\033[H" C_BOLD "Session configuration" C_RESET "\r\n"
+         "Enter: change/select  arrows: navigate  s: save  q: close\r\n\r\n");
+  card_row(selected == 0, "stream:", motiris_stream_enabled(a) ? "on" : "off");
+  card_row(selected == 1, "approval:", motiris_approval_required(a) ? "ask" : "off");
+  card_row(selected == 2, "max_steps:", steps);
+  card_row(selected == 3, "thinking:",
+           motiris_thinking_visible(a) ? "on" : "off");
+  card_row(selected == 4, "reasoning:", effort && *effort ? effort : "provider");
+  card_row(selected == 5, "workspace_guard:",
+           motiris_workspace_guard_enabled(a) ? "on" : "off (any OS path)");
+  card_row(selected == 6, "save session now", "UUID trace + index");
+  card_row(selected == 7, "restore latest", "requires empty context");
+  card_row(selected == 8, "save changes", "to config.json");
+  card_row(selected == 9, "close", "keep session values");
+  fflush(stdout);
+}
+
+static void save_config_card(MotirisAgent *a) {
+  char steps[32], effort[16];
+  snprintf(steps, sizeof steps, "%d", motiris_max_steps(a));
+  const char *current = motiris_reasoning_effort(a);
+  snprintf(effort, sizeof effort, "%s", current && *current ? current : "off");
+  int failed = 0;
+  failed += motiris_set_config("stream",
+                               motiris_stream_enabled(a) ? "true" : "false") != 0;
+  failed += motiris_set_config("approval",
+                               motiris_approval_required(a) ? "ask" : "off") != 0;
+  failed += motiris_set_config("max_steps", steps) != 0;
+  failed += motiris_set_config("show_thinking",
+                               motiris_thinking_visible(a) ? "true" : "false") != 0;
+  failed += motiris_set_config("workspace_guard",
+                               motiris_workspace_guard_enabled(a) ? "true" : "false") != 0;
+  failed += motiris_set_config("reasoning_effort", effort) != 0;
+  if (failed) printf(C_RED "configuration: %d values could not be saved" C_RESET "\n",
+                     failed);
+  else printf(C_DIM "configuration saved" C_RESET "\n");
+}
+
+static void config_card(ReplState *state) {
+  MotirisAgent *a = state->agent;
+  static const int step_choices[] = { 0, 5, 10, 25, 50, 100 };
+  static const char *const efforts[] = { "", "low", "medium", "high" };
+  CardTerminal terminal;
+  if (!card_terminal_start(&terminal)) return;
+  int selected = 0, save = 0, session_action = 0, done = 0;
+  while (!done) {
+    draw_config_card(a, selected);
+    int key = card_read_key();
+    if (key == 'q') break;
+    if (key == 'u' || key == 'l') {
+      selected = (selected + 9) % 10;
+      continue;
+    } else if (key == 'd' || key == 'r') {
+      selected = (selected + 1) % 10;
+      continue;
+    } else if (key == 's') { save = 1; break; }
+    else if (key != '\n') continue;
+
+    if (selected == 0)
+      motiris_set_stream(a, !motiris_stream_enabled(a));
+    else if (selected == 1)
+      motiris_set_approval_required(a, !motiris_approval_required(a));
+    else if (selected == 2) {
+      int current = 0;
+      for (size_t i = 0; i < sizeof step_choices / sizeof step_choices[0]; i++)
+        if (step_choices[i] == motiris_max_steps(a)) current = (int)i;
+      motiris_set_max_steps(a, step_choices[(current + 1) % 6]);
+    } else if (selected == 3)
+      motiris_set_thinking_visible(a, !motiris_thinking_visible(a));
+    else if (selected == 4) {
+      const char *current = motiris_reasoning_effort(a);
+      int index = 0;
+      for (int i = 0; i < 4; i++)
+        if (!strcmp(current, efforts[i])) { index = i; break; }
+      motiris_set_reasoning_effort(a, efforts[(index + 1) % 4]);
+    } else if (selected == 5)
+      motiris_set_workspace_guard(a, !motiris_workspace_guard_enabled(a));
+    else if (selected == 6) { session_action = 1; done = 1; }
+    else if (selected == 7) { session_action = 2; done = 1; }
+    else if (selected == 8) { save = 1; done = 1; }
+    else if (selected == 9) done = 1;
+  }
+  card_terminal_stop(&terminal);
+  if (save) save_config_card(a);
+  if (session_action == 1) {
+    const char *error = NULL;
+    if (motiris_session_auto_save(a, state->session_id, "repl", NULL, &error))
+      printf(C_RED "session not saved: %s" C_RESET "\n",
+             error ? error : "snapshot failed");
+    else printf(C_DIM "session %s saved" C_RESET "\n", state->session_id);
+  } else if (session_action == 2) {
+    if (motiris_messages(a)->child) {
+      printf(C_YELLOW "use /new before restoring the latest session" C_RESET "\n");
+    } else {
+      const char *error = NULL;
+      char *uuid = NULL;
+      size_t loaded = 0;
+      int rc = motiris_session_auto_restore(a, "repl", NULL, NULL,
+                                            &uuid, &loaded, &error);
+      if (rc) printf(C_RED "session not restored: %s" C_RESET "\n",
+                     error ? error : "no automatic session");
+      else {
+        free(state->session_id);
+        state->session_id = uuid;
+        printf(C_DIM "restored %zu messages from %s" C_RESET "\n", loaded, uuid);
+      }
+    }
+  }
+}
+
+static void draw_approval_card(const char *name, const char *args, int selected) {
+  static const char *const choices[] = {
+    "allow once", "allow for session", "deny"
+  };
+  char safe_name[96], safe_args[160];
+  clip(safe_name, sizeof safe_name, name ? name : "(unknown)", 70);
+  clip(safe_args, sizeof safe_args, args ? args : "{}", 120);
+  printf("\033[2J\033[H" C_BOLD "Tool approval" C_RESET "\r\n"
+         "tool: %s\r\nargs: %s\r\n\r\n", safe_name, safe_args);
+  for (int i = 0; i < 3; i++)
+    card_row(selected == i, choices[i], "");
+  printf("\r\nEnter: select  arrows: navigate  q/Esc: deny\r\n");
+  fflush(stdout);
+}
+
+static MotirisApprovalDecision approval_card(const char *name,
+                                              const char *args, void *ud) {
+  (void)ud;
+  CardTerminal terminal;
+  if (!card_terminal_start(&terminal)) return MOTIRIS_APPROVAL_DENY;
+  int selected = 0;
+  MotirisApprovalDecision decision = MOTIRIS_APPROVAL_DENY;
+  for (;;) {
+    draw_approval_card(name, args, selected);
+    int key = card_read_key();
+    if (key == 'q') break;
+    if (key == 'u' || key == 'l') selected = (selected + 2) % 3;
+    else if (key == 'd' || key == 'r') selected = (selected + 1) % 3;
+    else if (key == '\n') {
+      decision = selected == 0 ? MOTIRIS_APPROVAL_ALLOW_ONCE :
+                 selected == 1 ? MOTIRIS_APPROVAL_ALLOW_SESSION :
+                                 MOTIRIS_APPROVAL_DENY;
+      break;
+    }
+  }
+  card_terminal_stop(&terminal);
+  return decision;
 }
 
 static const char *hist_path(void) {
@@ -232,18 +491,81 @@ static void print_hotkeys(void) {
          "     clear the screen\n");
 }
 
-static int handle_command(MotirisAgent *a, const char *line) {
+static int handle_command(MotirisAgent *a, ReplState *state,
+                          const char *line) {
   if (!strcmp(line, "/exit")) return 1;
   if (!strcmp(line, "/hotkey")) { print_hotkeys(); return 0; }
   if (!strcmp(line, "/new")) {
-    /* fresh session: drop all history messages */
+    /* fresh session: drop history and tool-specific session grants */
     cJSON *msgs = motiris_messages(a);
     cJSON_Delete(msgs->child);
     msgs->child = msgs->prev = msgs->next = NULL;
-    printf(C_DIM "[context cleared] new session\n" C_RESET);
+    motiris_clear_approval_grants(a);
+    free(state->session_id);
+    state->session_id = motiris_session_auto_id();
+    printf(C_DIM "[context cleared] new session %s\n" C_RESET,
+           state->session_id ? state->session_id : "(volatile)");
     return 0;
   }
   if (!strcmp(line, "/help")) { print_help(); return 0; }
+  if (!strcmp(line, "/thinking") || !strncmp(line, "/thinking ", 10)) {
+    const char *arg = strchr(line, ' ');
+    if (arg) {
+      arg++;
+      if (!strcmp(arg, "on")) motiris_set_thinking_visible(a, 1);
+      else if (!strcmp(arg, "off")) motiris_set_thinking_visible(a, 0);
+      else {
+        printf(C_RED "usage: /thinking [on|off]\n" C_RESET);
+        return 0;
+      }
+    }
+    printf("thinking: %s\n", motiris_thinking_visible(a) ? "on" : "off");
+    return 0;
+  }
+  if (!strcmp(line, "/reasoning") || !strncmp(line, "/reasoning ", 11)) {
+    const char *arg = strchr(line, ' ');
+    if (arg) {
+      arg++;
+      if (motiris_set_reasoning_effort(a, arg)) {
+        printf(C_RED "usage: /reasoning [off|low|medium|high]\n" C_RESET);
+        return 0;
+      }
+    }
+    const char *effort = motiris_reasoning_effort(a);
+    printf("reasoning: %s\n", effort && *effort ? effort : "provider");
+    return 0;
+  }
+  if (!strcmp(line, "/approval") || !strncmp(line, "/approval ", 10)) {
+    const char *arg = strchr(line, ' ');
+    if (arg) {
+      arg++;
+      if (!strcmp(arg, "off")) motiris_set_approval_required(a, 0);
+      else if (!strcmp(arg, "ask")) motiris_set_approval_required(a, 1);
+      else {
+        printf(C_RED "usage: /approval [off|ask]\n" C_RESET);
+        return 0;
+      }
+    }
+    printf("approval: %s%s\n", motiris_approval_required(a) ? "ask" : "off",
+           motiris_approval_required(a) ? "" : " (unrestricted)");
+    return 0;
+  }
+  if (!strcmp(line, "/config")) {
+    const char *effort = motiris_reasoning_effort(a);
+    /* Pipe mode must never enter a raw-terminal interaction. */
+    printf("stream: %s\napproval: %s\nmax_steps: %d\nthinking: %s\nreasoning: %s\nworkspace_guard: %s\n",
+           motiris_stream_enabled(a) ? "on" : "off",
+           motiris_approval_required(a) ? "ask" : "off",
+           motiris_max_steps(a),
+           motiris_thinking_visible(a) ? "on" : "off",
+           effort && *effort ? effort : "provider",
+           motiris_workspace_guard_enabled(a) ? "on" : "off");
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
+      printf(C_DIM "interactive terminal required to edit config\n" C_RESET);
+    else
+      config_card(state);
+    return 0;
+  }
   if (!strcmp(line, "/tools")) {
     printf("the tool list (shell, time, file/web/memory/skills/subagent,\n");
     printf("browser, MCP <server>:<tool>) is provided to the model each turn;\n");
@@ -253,10 +575,53 @@ static int handle_command(MotirisAgent *a, const char *line) {
   if (!strcmp(line, "/sessions") || !strncmp(line, "/sessions ", 10)) {
     const char *term = strchr(line, ' ');
     if (term) term++;
+    printf(C_DIM "== automatic sessions ==" C_RESET "\n");
+    motiris_session_auto_list(NULL, term);
     printf(C_DIM "== repl sessions ==" C_RESET "\n");
     motiris_session_list("sessions", term);
     printf(C_DIM "== gateway sessions ==" C_RESET "\n");
     motiris_session_list("gateway", term);
+    return 0;
+  }
+  if (!strcmp(line, "/save")) {
+    const char *error = NULL;
+    if (motiris_session_auto_save(a, state->session_id, "repl", NULL, &error))
+      printf(C_RED "session not saved: %s\n" C_RESET,
+             error ? error : "snapshot failed");
+    else
+      printf(C_DIM "[saved session %s]\n" C_RESET, state->session_id);
+    return 0;
+  }
+  if (!strcmp(line, "/load") || !strncmp(line, "/load ", 6)) {
+    if (motiris_messages(a)->child) {
+      printf(C_RED "session restore requires an empty context (use /new first)\n"
+             C_RESET);
+      return 0;
+    }
+    const char *selector = strchr(line, ' ');
+    if (selector) selector++;
+    const char *error = NULL;
+    size_t loaded = 0;
+    char *uuid = NULL;
+    int rc;
+    if (selector && (strchr(selector, '/') || strstr(selector, ".json"))) {
+      rc = motiris_session_load(a, selector, NULL, &loaded, &error);
+      if (!rc) uuid = motiris_session_auto_id();
+    } else {
+      rc = motiris_session_auto_restore(a, "repl", NULL, selector,
+                                        &uuid, &loaded, &error);
+      if (rc == 1) error = "no matching automatic session";
+    }
+    if (rc) {
+      printf(C_RED "cannot restore session: %s\n" C_RESET,
+             error ? error : "invalid snapshot");
+      free(uuid);
+      return 0;
+    }
+    free(state->session_id);
+    state->session_id = uuid;
+    printf(C_DIM "[loaded %zu messages from session %s]\n" C_RESET, loaded,
+           state->session_id ? state->session_id : "(unknown)");
     return 0;
   }
   if (!strcmp(line, "/resume") || !strncmp(line, "/resume ", 8)) {
@@ -418,8 +783,15 @@ static void tts_new_reply(MotirisAgent *a) {
 #endif
 
 int motiris_repl(MotirisAgent *a) {
-  motiris_set_stream(a, 1);
-  motiris_set_stream_cb(a, delta_print, NULL);
+  ReplState state = {
+    .agent = a,
+    .reasoning_active = 0,
+    .session_id = motiris_session_auto_id(),
+  };
+  motiris_set_stream_cb(a, delta_print, &state);
+  motiris_set_reasoning_cb(a, reasoning_print, &state);
+  if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
+    motiris_set_approval_callback(a, approval_card, &state);
   motiris_set_tool_hook(a, repl_tool_hook, NULL);
   int color = isatty(1) ? 1 : 0;
 
@@ -459,7 +831,7 @@ int motiris_repl(MotirisAgent *a) {
     linenoiseHistoryAdd(line);
     linenoiseHistorySave(hist);
 
-    int cmd = handle_command(a, line);
+    int cmd = handle_command(a, &state, line);
     if (cmd == 1) { free(line); break; }
     if (cmd == 0) { free(line); continue; }
 
@@ -468,6 +840,7 @@ int motiris_repl(MotirisAgent *a) {
 
     printf(C_DIM "→ you" C_RESET "\n");
     if (color) printf(C_CYAN);
+    state.reasoning_active = 0;
     long ti0 = motiris_tokens_in(a), to0 = motiris_tokens_out(a);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -477,6 +850,10 @@ int motiris_repl(MotirisAgent *a) {
             + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
     long di = motiris_tokens_in(a) - ti0;
     long dout = motiris_tokens_out(a) - to0;
+    if (state.reasoning_active) {
+      printf(C_RESET "\n");
+      state.reasoning_active = 0;
+    }
     if (color) printf(C_RESET "\n");
     if (rc == MOTIRIS_RUN_CANCELLED)
       fprintf(stderr, C_YELLOW "generation cancelled; enter a new instruction"
@@ -485,6 +862,14 @@ int motiris_repl(MotirisAgent *a) {
                          motiris_last_error(a));
 #ifdef MOTIRIS_TTS_TOOLS
     if (!rc) tts_new_reply(a);
+#endif
+#ifndef MOTIRIS_NO_PERSISTENCE
+    {
+      const char *error = NULL;
+      if (motiris_session_auto_save(a, state.session_id, "repl", NULL, &error))
+        fprintf(stderr, C_YELLOW "automatic session not saved: %s" C_RESET "\n",
+                error ? error : "snapshot failed");
+    }
 #endif
     if (sess_id && !rc) {
       const char *error = NULL;
@@ -503,5 +888,6 @@ int motiris_repl(MotirisAgent *a) {
   printf(C_DIM "bye" C_RESET "\n");
   free(sess_id);
   sess_id = NULL;
+  free(state.session_id);
   return 0;
 }

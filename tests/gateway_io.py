@@ -41,7 +41,9 @@ def health(port, timeout=3):
 
 
 def chat(port, chat_id, message, timeout=4):
-    payload = json.dumps({"chat_id": chat_id, "message": message}).encode()
+    # Legacy JSON compatibility is explicit; the default is covered separately.
+    payload = json.dumps({"chat_id": chat_id, "message": message,
+                          "stream": False}).encode()
     request = (b"POST /v1/chat HTTP/1.1\r\nHost: localhost\r\n"
                b"Content-Type: application/json\r\nContent-Length: " +
                str(len(payload)).encode() + b"\r\n\r\n" + payload)
@@ -353,6 +355,98 @@ def run_terminal_reply_test(root):
         thread.join(timeout=5)
 
 
+class StreamingProvider(http.server.BaseHTTPRequestHandler):
+    requests = []
+
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).requests.append(request)
+        if request.get("stream"):
+            def event(delta):
+                return b"data: " + json.dumps({"choices": [{"delta": delta}]},
+                    separators=(",", ":")).encode() + b"\n\n"
+            body = (event({"reasoning_content": 'why "x"\n'}) +
+                    event({"content": "A"}) + event({"reasoning": "B"}) +
+                    event({"content": " final"}) + b"data: [DONE]\n\n")
+            content_type = "text/event-stream"
+        else:
+            body = json.dumps({"choices": [{"finish_reason": "stop", "message": {
+                "role": "assistant", "content": "buffered"}}]}).encode()
+            content_type = "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        for offset in range(0, len(body), 11):
+            self.wfile.write(body[offset:offset + 11])
+            self.wfile.flush()
+
+    def log_message(self, *_args):
+        pass
+
+
+def parse_sse(body):
+    events = []
+    for block in body.decode().strip().split("\n\n"):
+        lines = block.splitlines()
+        event = next(line[7:] for line in lines if line.startswith("event: "))
+        data = next(line[6:] for line in lines if line.startswith("data: "))
+        events.append((event, json.loads(data)))
+    return events
+
+
+def run_sse_test(root):
+    StreamingProvider.requests = []
+    provider = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StreamingProvider)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    gateway = None
+    try:
+        config_home = root / "sse"
+        config = {
+            "transport": "libcurl", "reasoning_effort": "high",
+            "base_url": "http://127.0.0.1:%d/v1/chat" % provider.server_address[1],
+        }
+        gateway = Gateway(config_home, config)
+        payload = json.dumps({"chat_id": "sse-chat", "message": "hello"}).encode()
+        request = (b"POST /v1/chat HTTP/1.1\r\nHost: localhost\r\n"
+                   b"Content-Type: application/json\r\nContent-Length: " +
+                   str(len(payload)).encode() + b"\r\n\r\n" + payload)
+        with socket.create_connection(("127.0.0.1", gateway.port), timeout=3) as sock:
+            sock.sendall(request)
+            raw = receive_all(sock)
+        headers, separator, body = raw.partition(b"\r\n\r\n")
+        assert separator and headers.startswith(b"HTTP/1.1 200 "), raw[:300]
+        assert b"text/event-stream" in headers, headers
+        events = parse_sse(body)
+        assert [name for name, _ in events] == [
+            "reasoning", "content", "reasoning", "content", "done"], events
+        assert events[0][1]["delta"] == 'why "x"\n', events
+        assert events[-1][1]["reply"] == "A final", events
+        assert StreamingProvider.requests[0]["reasoning_effort"] == "high"
+
+        result = chat(gateway.port, "sse-chat", "second", timeout=4)
+        assert result["reply"] == "buffered", result
+        second = StreamingProvider.requests[1]
+        assert "stream" not in second, second
+        assert all("reasoning" not in message and "reasoning_content" not in message
+                   for message in second["messages"]), second
+        index = json.loads((config_home / "session/session.json").read_text())
+        assert index["sessions"][0]["kind"] == "gateway", index
+        assert index["sessions"][0]["chat_id"] == "sse-chat", index
+        trace = json.loads((config_home / "session" /
+                            index["sessions"][0]["file"]).read_text())
+        assert all("reasoning" not in message and "reasoning_content" not in message
+                   for message in trace["messages"]), trace
+        print("gateway SSE: reasoning/content/done, JSON opt-out and clean history passed")
+    finally:
+        if gateway is not None:
+            gateway.stop()
+        provider.shutdown()
+        provider.server_close()
+        thread.join(timeout=5)
+
+
 def run_invalid_setting_test(root):
     config_home = root / "invalid"
     home = config_home / "home"
@@ -379,6 +473,7 @@ def main():
         run_read_tests(root)
         run_write_test(root)
         run_terminal_reply_test(root)
+        run_sse_test(root)
         run_invalid_setting_test(root)
     print("gateway I/O: receive/send monotonic deadlines and cleanup passed")
 

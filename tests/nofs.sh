@@ -60,7 +60,8 @@ try:
             "base_url": "http://127.0.0.1:%d/v1/chat/completions" %
                         server.server_address[1],
         }))
-        env = os.environ.copy()
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("MOTIRIS_")}
         env["MOTIRIS_HOME"] = str(home)
         env["HOME"] = str(home / "user-home")
         env.pop("MOTIRIS_API_KEY", None)

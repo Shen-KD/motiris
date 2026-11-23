@@ -50,7 +50,8 @@ thread.start()
 def run_search(workspace, home, path, pattern):
     global next_args
     next_args = {"path": path, "pattern": pattern}
-    env = os.environ.copy()
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("MOTIRIS_")}
     env["MOTIRIS_HOME"] = str(home)
     env["MOTIRIS_WORKSPACE"] = str(workspace)
     env.pop("MOTIRIS_API_KEY", None)
@@ -83,6 +84,7 @@ try:
             "transport": "libcurl",
             "base_url": "http://127.0.0.1:%d/v1/chat/completions" %
                         server.server_address[1],
+            "workspace_guard": True,
         }))
 
         result = run_search(ws, home, ".", "INSIDE-OK|OUTSIDE-SECRET")

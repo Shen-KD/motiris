@@ -117,7 +117,8 @@ def run_disabled_policy(root, provider):
     # The old unquoted popen command would evaluate this substitution in cwd.
     skill_dir = root / "skills$(touch${IFS}NO_TOOLS_SHELL_PWNED)"
     skill_dir.mkdir()
-    (skill_dir / "notes.md").write_text("TEXT_ONLY_SKILL_SENTINEL\n")
+    (skill_dir / "notes.md").write_text(
+        "---\nname: notes\ndescription: metadata-only\n---\nTEXT_ONLY_SKILL_SENTINEL\n")
     (home / "config.json").write_text(json.dumps({
         "transport": "libcurl", "base_url": provider.url,
         "tools": True, "plugins": True,
@@ -154,7 +155,9 @@ def run_disabled_policy(root, provider):
         provider.requests
     system = [m.get("content", "") for m in provider.requests[0]["messages"]
               if m.get("role") == "system"]
-    assert any("TEXT_ONLY_SKILL_SENTINEL" in text for text in system), system
+    assert any("Available skills" in text and "metadata-only" in text
+               for text in system), system
+    assert all("TEXT_ONLY_SKILL_SENTINEL" not in text for text in system), system
     tool_results = [m for m in provider.requests[1]["messages"]
                     if m.get("role") == "tool"]
     assert len(tool_results) == 4, tool_results

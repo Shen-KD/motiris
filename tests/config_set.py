@@ -63,15 +63,24 @@ def main():
         })
         path.write_text(json.dumps(data))
         for key, value in [("stream", "false"), ("tools", "true"),
-                           ("plugins", "false"), ("goal_check", "true")]:
+                           ("plugins", "false"), ("goal_check", "true"),
+                           ("show_thinking", "true"),
+                           ("workspace_guard", "true")]:
             proc = set_config(env, key, value)
             assert proc.returncode == 0, (key, proc.stdout, proc.stderr)
         proc = set_config(env, "max_steps", "25")
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        for key, value in [("approval", "ask"), ("reasoning_effort", "high"),
+                           ("max_steps", "0")]:
+            proc = set_config(env, key, value)
+            assert proc.returncode == 0, (key, proc.stdout, proc.stderr)
         data = json.loads(path.read_text())
         assert data["stream"] is False and data["tools"] is True
         assert data["plugins"] is False and data["goal_check"] is True
-        assert data["max_steps"] == 25 and type(data["max_steps"]) is int
+        assert data["show_thinking"] is True
+        assert data["workspace_guard"] is True
+        assert data["approval"] == "ask" and data["reasoning_effort"] == "high"
+        assert data["max_steps"] == 0 and type(data["max_steps"]) is int
         assert data["providers"][0]["name"] == "keep"
         assert data["mcp_servers"][0]["cmd"] == "mock"
         assert data["extension"] == {"preserve": [1, True, None]}
@@ -94,8 +103,10 @@ def main():
             assert proc.returncode == 0, (key, proc.stdout, proc.stderr)
             assert json.loads(path.read_text())[key] == value
 
-        for key, value in [("max_steps", "0"), ("max_steps", "-1"),
-                           ("max_steps", "12x"), ("max_steps", "2147483648"),
+        for key, value in [("max_steps", "-1"), ("max_steps", "12x"),
+                           ("max_steps", "2147483648"), ("approval", "auto"),
+                           ("reasoning_effort", "deep"), ("show_thinking", "yes"),
+                           ("workspace_guard", "yes"),
                            ("stream", "yes"), ("transport", "bogus"),
                            ("model", ""), ("unknown", "value")]:
             assert_unchanged(path, path.read_bytes(), env, key, value)

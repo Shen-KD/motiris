@@ -4,11 +4,11 @@
  */
 #include "motiris.h"
 
-#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 static void usage(FILE *f) {
@@ -22,20 +22,23 @@ static void usage(FILE *f) {
 "                        (default https://api.openai.com/v1/chat/completions)\n"
 "  -k, --api-key KEY     bearer token (env MOTIRIS_API_KEY)\n"
 "  -s, --system TEXT     system prompt\n"
-"  -S, --skill-dir DIR   read *.md files here, inject as system prompt\n"
+"  -S, --skill-dir DIR   index <name>/SKILL.md metadata; read_file loads bodies\n"
 "  -p, --prompt TEXT     user prompt (default: read stdin)\n"
 "      --no-tools        disable all tools and tool backend initialization\n"
 "      --transport NAME  curl (default) | echo (offline test)\n"
-"      --max-steps N     agent loop bound (default 10)\n"
+"      --max-steps N     agent loop bound; 0 = unlimited (default 0)\n"
+"      --reasoning-effort LEVEL  off | low | medium | high\n"
 "      --goal-check      confirm the goal is met (one extra round)\n"
 "  -r, --resume FILE     restore a full-turn session snapshot\n"
 "      --save FILE       atomically save a full-turn session snapshot\n"
 "  -v, --verbose         print step/tool/trace to stderr\n"
 "  -i, --interactive     force interactive REPL (default when tty)\n"
-"      --stream          stream tokens as they arrive (once-run mode)\n"
+"      --stream          use SSE streaming (default)\n"
+"      --no-stream       use buffered JSON responses\n"
 "      --version         print version and exit\n"
-"      --init            write $HOME/.motiris/{env,config.json} templates\n"
-"  set config KEY VALUE  atomically update one scalar config.json value\n"
+"      --init            create config, AGENTS/SOUL and default Skills\n"
+"      --config KEY VALUE  atomically update one scalar config.json value\n"
+"  set config KEY VALUE  same as --config KEY VALUE\n"
 "      --sessions [TERM] list session logs (grep TERM if given)\n"
 "      --cron [FILE]     run scheduled jobs (JSON array); --once = run\n"
 "                        due jobs once and exit\n"
@@ -61,103 +64,58 @@ static char *read_stdin(void) {
   return buf;
 }
 
-/* Text-only --no-tools skill injection: bounded direct file I/O, no shell. */
-#define SKILL_TEXT_MAX_FILES 128
-#define SKILL_TEXT_MAX_ENTRIES 4096
-#define SKILL_TEXT_MAX_BYTES (1024 * 1024)
-
-static int skill_text_append(char **buf, size_t *len, size_t *cap,
-                             const char *text, size_t n) {
-  if (*len >= SKILL_TEXT_MAX_BYTES ||
-      n > SKILL_TEXT_MAX_BYTES - *len - 1)
-    return -1;
-  size_t needed = *len + n + 1;
-  if (needed > *cap) {
-    size_t next = *cap;
-    while (next < needed) {
-      if (next > SKILL_TEXT_MAX_BYTES / 2) {
-        next = SKILL_TEXT_MAX_BYTES + 1;
-        break;
-      }
-      next *= 2;
-    }
-    char *grown = realloc(*buf, next);
-    if (!grown) return -1;
-    *buf = grown;
-    *cap = next;
-  }
-  memcpy(*buf + *len, text, n);
-  *len += n;
-  (*buf)[*len] = '\0';
-  return 0;
-}
-
-static char *load_skill_dir(const char *dir) {
-  if (!dir || !*dir || strlen(dir) > 4096) return NULL;
-  DIR *d = opendir(dir);
-  if (!d) return NULL;
-  size_t cap = 8192, len = 0, count = 0, entries = 0;
-  char *buf = malloc(cap);
-  if (!buf) { closedir(d); return NULL; }
-  buf[0] = '\0';
-
-  struct dirent *e;
-  while (count < SKILL_TEXT_MAX_FILES && entries < SKILL_TEXT_MAX_ENTRIES &&
-         (e = readdir(d)) != NULL) {
-    entries++;
-    size_t name_len = strlen(e->d_name);
-    if (e->d_name[0] == '.' || name_len < 4 ||
-        strcmp(e->d_name + name_len - 3, ".md"))
-      continue;
-    size_t path_size = strlen(dir) + name_len + 2;
-    char *path = malloc(path_size);
-    if (!path) break;
-    snprintf(path, path_size, "%s/%s", dir, e->d_name);
-    struct stat st;
-    if (stat(path, &st) || !S_ISREG(st.st_mode)) {
-      free(path);
-      continue;
-    }
-    FILE *f = fopen(path, "r");
-    if (!f) { free(path); continue; }
-
-    size_t saved = len;
-    int failed = skill_text_append(&buf, &len, &cap, "# ", 2) ||
-                 skill_text_append(&buf, &len, &cap, path, strlen(path)) ||
-                 skill_text_append(&buf, &len, &cap, "\n", 1);
-    char chunk[8192];
-    size_t n;
-    while (!failed && (n = fread(chunk, 1, sizeof chunk, f)) > 0)
-      failed = skill_text_append(&buf, &len, &cap, chunk, n) != 0;
-    if (ferror(f)) failed = 1;
-    if (!failed)
-      failed = skill_text_append(&buf, &len, &cap, "\n", 1) != 0;
-    fclose(f);
-    free(path);
-    if (failed) {
-      len = saved;
-      buf[len] = '\0';
-      break;
-    }
-    count++;
-  }
-  closedir(d);
-  return buf;
-}
-
 int motiris_repl(MotirisAgent *a);
+
+static int parse_max_steps(const char *text) {
+  if (!text || *text < '0' || *text > '9') return -1;
+  char *end = NULL;
+  errno = 0;
+  long value = strtol(text, &end, 10);
+  if (errno == ERANGE || !end || *end || value < 0 || value > INT_MAX)
+    return -1;
+  return (int)value;
+}
+
+typedef struct { int deltas, last; } CliOutput;
+
+static void cli_delta_print(const char *text, void *ud) {
+  CliOutput *out = ud;
+  if (text && *text) {
+    out->deltas = 1;
+    out->last = (unsigned char)text[strlen(text) - 1];
+  }
+  fputs(text, stdout);
+  fflush(stdout);
+}
+
+static void cli_reasoning_print(const char *text, void *ud) {
+  MotirisAgent *a = ud;
+  if (!motiris_thinking_visible(a)) return;
+  fputs(text, stderr);
+  fflush(stderr);
+}
+
+static void register_startup_skills(MotirisAgent *a, const char *explicit_dir) {
+  motiris_register_default_skill_tools(a, explicit_dir);
+  motiris_append_skill_context(a);
+}
 
 int main(int argc, char **argv) {
   const char *model = NULL, *base_url = NULL, *key = NULL;
   const char *system = NULL, *prompt = NULL, *skill_dir = NULL;
   const char *resume = NULL, *save = NULL, *transport = NULL, *plugin_dir = NULL;
   const char *gateway_listen = NULL;
-  int no_tools = 0, no_plugin = 0, verbose = 0, max_steps = 0;
-  int interactive = 0, stream = 0, gateway_mode = 0, goal_check = 0;
+  int no_tools = 0, no_plugin = 0, verbose = 0, max_steps = -1;
+  int interactive = 0, stream = -1, gateway_mode = 0, goal_check = 0;
   int cron_mode = 0, cron_once = 0;
-  const char *cron_file = NULL;
+  const char *cron_file = NULL, *reasoning_effort = NULL;
 
   /* Configuration editing is deliberately independent of agent/env startup. */
+  if (argc > 1 && !strcmp(argv[1], "--config")) {
+    if (argc == 4) return motiris_set_config(argv[2], argv[3]) ? 2 : 0;
+    fprintf(stderr, "usage: motiris --config KEY VALUE\n");
+    return 2;
+  }
   if (argc > 1 && !strcmp(argv[1], "set")) {
     if (argc == 5 && !strcmp(argv[2], "config"))
       return motiris_set_config(argv[3], argv[4]) ? 2 : 0;
@@ -192,7 +150,15 @@ int main(int argc, char **argv) {
     switch (a[2]) {
       case 'm': /* --model | --max-steps */
         if (!strcmp(a, "--model")) { model = NEED(); break; }
-        if (!strcmp(a, "--max-steps")) { max_steps = atoi(NEED()); break; }
+        if (!strcmp(a, "--max-steps")) {
+          max_steps = parse_max_steps(NEED());
+          if (max_steps < 0) {
+            fprintf(stderr, "motiris: --max-steps must be an integer in 0..%d\n",
+                    INT_MAX);
+            return 2;
+          }
+          break;
+        }
         goto unknown;
       case 'b': /* --base-url */
         if (!strcmp(a, "--base-url")) { base_url = NEED(); break; }
@@ -216,6 +182,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--sessions")) {
           const char *term = (i + 1 < argc && argv[i + 1][0] != '-')
               ? argv[++i] : NULL;
+          motiris_session_auto_list(NULL, term);
           return motiris_session_list("gateway", term) ? 1 : 0;
         }
         if (!strcmp(a, "--skill-dir")) { skill_dir = NEED(); break; }
@@ -224,15 +191,20 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--prompt")) { prompt = NEED(); break; }
         if (!strcmp(a, "--plugin-dir")) { plugin_dir = NEED(); break; }
         goto unknown;
-      case 'r': /* --resume */
+      case 'r': /* --resume | --reasoning-effort */
         if (!strcmp(a, "--resume")) { resume = NEED(); break; }
+        if (!strcmp(a, "--reasoning-effort")) {
+          reasoning_effort = NEED();
+          break;
+        }
         goto unknown;
       case 't': /* --transport */
         if (!strcmp(a, "--transport")) { transport = NEED(); break; }
         goto unknown;
-      case 'n': /* --no-tools | --no-plugin */
+      case 'n': /* --no-tools | --no-plugin | --no-stream */
         if (!strcmp(a, "--no-tools")) { no_tools = 1; break; }
         if (!strcmp(a, "--no-plugin")) { no_plugin = 1; break; }
+        if (!strcmp(a, "--no-stream")) { stream = 0; break; }
         goto unknown;
       case 'c': /* --cron */
         if (!strcmp(a, "--cron")) {
@@ -299,10 +271,18 @@ int main(int argc, char **argv) {
   if (key) motiris_set_api_key(ag, key);
   if (system) motiris_set_system(ag, system);
   if (transport) motiris_set_transport(ag, transport);
-  if (max_steps > 0) motiris_set_max_steps(ag, max_steps);
+  if (max_steps >= 0) motiris_set_max_steps(ag, max_steps);
+  if (reasoning_effort && motiris_set_reasoning_effort(ag, reasoning_effort)) {
+    fprintf(stderr, "motiris: %s\n", motiris_last_error(ag));
+    motiris_free(ag);
+    return 2;
+  }
   if (goal_check) motiris_set_goal_check(ag, 1);
   motiris_set_verbose(ag, verbose);
-  if (stream) motiris_set_stream(ag, 1);
+  if (stream >= 0) motiris_set_stream(ag, stream);
+  CliOutput cli_output = {0, 0};
+  motiris_set_stream_cb(ag, cli_delta_print, &cli_output);
+  motiris_set_reasoning_cb(ag, cli_reasoning_print, ag);
   if (no_plugin) motiris_set_plugins_enabled(ag, 0);
   if (plugin_dir) motiris_set_plugin_dir(ag, plugin_dir);
   if (motiris_tools_enabled(ag))
@@ -315,23 +295,8 @@ int main(int argc, char **argv) {
     motiris_register_subagent_tools(ag);
     motiris_register_browser_tools(ag);
   }
-  if (skill_dir) motiris_register_skill_tools(ag, skill_dir);
+  register_startup_skills(ag, skill_dir);
   if (motiris_plugins_enabled(ag)) motiris_load_plugins(ag, NULL);
-
-  /* legacy --skill-dir injection kept only when tools are off */
-  if (skill_dir && !motiris_tools_enabled(ag)) {
-    char *sk = load_skill_dir(skill_dir);
-    if (sk && *sk) {
-      if (system) {
-        size_t n = strlen(system) + strlen(sk) + 4;
-        char *both = malloc(n);
-        snprintf(both, n, "%s\n\n%s", system, sk);
-        motiris_set_system(ag, both);
-        free(both);
-      } else motiris_set_system(ag, sk);
-    }
-    free(sk);
-  }
 
   /* Restore only a validated full-turn snapshot; U/A/T traces and malformed
    * input are not trusted as control records. */
@@ -371,6 +336,7 @@ int main(int argc, char **argv) {
   }
 
   int rc = motiris_run(ag);
+  if (cli_output.deltas && cli_output.last != '\n') putchar('\n');
   if (rc) fprintf(stderr, "motiris: %s\n", motiris_last_error(ag));
   if (save && !rc) {
     const char *error = NULL;
