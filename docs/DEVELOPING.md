@@ -5,7 +5,8 @@ extension points, and the traps that have already burned time.
 
 ## Architecture
 
-Single C11 binary, zero runtime deps beyond libcurl.so.4. Components
+Single C11 binary; host builds use libcurl.so.4 and the platform C/POSIX
+thread runtime (`-pthread`, folded into libc on current glibc). Components
 are static archives linked into `motiris`:
 
 ```
@@ -156,6 +157,45 @@ backend, dynamic queue or idle work is introduced. These are host application
 bounds and relative measurements, not MCU Flash/RAM headroom. No MCU/RTOS
 cross-toolchain, target or hardware validation was performed.
 
+### Generation-time input, rendering and cancellation
+
+A supported TTY keeps one incremental linenoise editor on the REPL main thread
+for the whole session. Each ordinary turn runs `motiris_run` on one joinable
+pthread. The worker exclusively owns the Agent until join; the main thread
+exclusively owns terminal I/O, line editing/history, slash commands, cards and
+post-run token/session/checkpoint access. Non-TTY and unsupported-terminal
+paths retain the synchronous loop.
+
+Worker callbacks deep-copy answer/final/reasoning/tool events into a bounded
+128-event/256-KiB queue (4-KiB text chunks, condition-variable backpressure)
+and wake the main thread through a nonblocking, close-on-exec self-pipe. The
+main thread hides/reshows the prompt around ordered rendering and temporarily
+restores `OPOST` while hidden so newlines do not staircase. The aggregated
+`motiris_set_final_cb` path covers echo, spawned-curl and `--no-stream`
+answers without a direct core stdout write. The callback replaces only that
+buffered print; streamed deltas still suppress the aggregate.
+
+Enter accepts at most 32 lines/64 KiB into a local FIFO. It never implicitly
+cancels or edits an already-sent provider request. Queued ordinary input is
+added to Agent history only at dispatch; local commands execute at idle
+boundaries in the same order. Accepted lines enter linenoise history once,
+but file saves wait until no worker is active because history saving changes
+process `umask`. Unsubmitted drafts stay only in the editor. Raw Ctrl+C and a
+lone Escape request the existing cooperative cancel flag without clearing the
+draft/FIFO; after join, rollback and session finalization, the next line runs
+automatically. Arbitrary tool calls still cannot be forcibly interrupted.
+Escape/UTF-8/bracketed-paste parsers retain partial state across bounded reads.
+
+Approval is a condition-variable handoff: the worker waits while the main
+thread runs the existing card as sole input reader, then resumes with the
+same draft. EOF/HUP closes the event queue, denies/wakes a pending approval,
+requests cancellation, joins the worker and restores signals/termios. No
+`pthread_cancel`, concurrent linenoise access or concurrent Agent getters are
+allowed. `tests/repl_generation_input.py` covers live editing, FIFO natural
+continuation, local-command ordering, lone-Esc cancellation, exact user
+history and draft preservation; existing cancel/cards/menu/render tests cover
+Ctrl+C, approval arbitration and non-TTY compatibility.
+
 ### Provider routing, single rendering and bounded responses
 
 Every nonempty configured provider list, including a singleton, selects the
@@ -206,7 +246,8 @@ before visible deltas. Tool-call indices must be finite integers in `0..255`;
 missing, negative, fractional and huge indices return `invalid stream response`
 before any numeric cast. Authenticated spawned-curl argv storage includes its
 NULL terminator, and pipe/fork setup closes prior descriptors on failure.
-No thread, runtime, global state or direct dependency was added.
+The response-limit accounting itself adds no thread, runtime, global Agent
+state or direct dependency; the independent TTY REPL worker is described above.
 
 The cJSON tree for a line/response and final serialization add phase-wise
 copies derived from those bounded inputs; exact libc/libcurl/cJSON node
@@ -999,6 +1040,9 @@ Agent callbacks and run boundaries:
 - `motiris_set_reasoning_cb` — provider-only reasoning side channel; never
   canonicalized or persisted. `motiris_set_print_answer` lets Gateway suppress
   duplicate core stdout without changing REPL/CLI output.
+- `motiris_set_final_cb` — receives an aggregate only when no answer deltas
+  arrived; when set, it replaces that answer's core stdout print so a UI host
+  can serialize buffered/echo/fallback output with its own renderer.
 - `motiris_set_tool_hook` / `motiris_add_tool_hook` — called after each
   tool executes with (name, args, result_json, ud); result may contain
   `"error"` — the repl renders that as a red ✗ line.
@@ -1106,7 +1150,11 @@ may still use its own atomic replacement.
   fails locally without a model turn, and `/exit` remains the single exit command. A slow-SSE PTY case also sends
   Ctrl+C during generation, verifies the REPL survives and returns its prompt,
   then appends an instruction and checks that the next request has both user
-  messages but no partial assistant content.
+  messages but no partial assistant content. The generation-input PTY case
+  additionally types/edits during SSE, queues multiple turns plus a local
+  command, verifies FIFO requests and natural continuation, interrupts with
+  lone Esc, runs the next queued turn, and submits the preserved draft without
+  persisting partial assistant text.
 - Smoke #16: repl shows tool lines + token stats (streamed tool_calls
   + usage through the mock).
 - Smoke #17: plugin tool hook fires (needs examples/hello_plugin.so).

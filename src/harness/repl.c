@@ -22,6 +22,10 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <termios.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <strings.h>
 
 #include <linenoise.h>
 
@@ -66,9 +70,16 @@ static const char *const CMDS_DESC[] = {
 /* Automatic full-turn checkpoint id (tty only). */
 static char *sess_id = NULL;
 static volatile sig_atomic_t generation_interrupted;
+static volatile sig_atomic_t terminal_hangup;
 
 static void generation_sigint(int sig) {
   (void)sig;
+  generation_interrupted = 1;
+}
+
+static void terminal_sighup(int sig) {
+  (void)sig;
+  terminal_hangup = 1;
   generation_interrupted = 1;
 }
 
@@ -207,6 +218,12 @@ static int card_read_key(void) {
   ssize_t n = read(STDIN_FILENO, &c, 1);
   if (n < 0 && errno == EINTR)
     return card_interrupted ? 'q' : 0;
+  if (n < 0) return 'q';
+  if (n == 0) {
+    struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+    if (poll(&pfd, 1, 0) > 0 &&
+        (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) return 'q';
+  }
   if (n <= 0) return card_interrupted ? 'q' : 0;
   if (c == 3 || c == 'q' || c == 'Q') return 'q';
   if (c == '\r' || c == '\n') return '\n';
@@ -478,11 +495,11 @@ static void print_hotkeys(void) {
   printf("  " C_GREEN "↑ / ↓" C_RESET
          "      select a command in the / menu; browse history otherwise\n");
   printf("  " C_GREEN "enter" C_RESET
-         "      submit input or run the selected command\n");
+         "      accept input; queue it during a reply, run it when idle\n");
   printf("  " C_GREEN "tab" C_RESET
          "        complete a /-command\n");
-  printf("  " C_GREEN "ctrl+c" C_RESET
-         "     cancel a running reply\n");
+  printf("  " C_GREEN "ctrl+c / esc" C_RESET
+         " cancel a running reply; keep the draft and queued input\n");
   printf("  " C_GREEN "ctrl+d" C_RESET
          "     quit at an empty prompt\n");
   printf("  " C_GREEN "ctrl+u" C_RESET
@@ -782,6 +799,837 @@ static void tts_new_reply(MotirisAgent *a) {
 }
 #endif
 
+/* Traditional synchronous loop: pipes, unsupported terminals and raw-setup
+ * fallback retain the original rendering, cancellation and checkpoint path. */
+static int repl_sync_loop(MotirisAgent *a, ReplState *state,
+                          const char *hist, int color) {
+  char *line;
+  while ((line = linenoise("motiris> ")) != NULL) {
+    if (!*line) { free(line); continue; }
+    linenoiseHistoryAdd(line);
+    linenoiseHistorySave(hist);
+
+    int cmd = handle_command(a, state, line);
+    if (cmd == 1) { free(line); break; }
+    if (cmd == 0) { free(line); continue; }
+
+    motiris_add_user(a, line);
+    free(line);
+
+    printf(C_DIM "→ you" C_RESET "\n");
+    if (color) printf(C_CYAN);
+    state->reasoning_active = 0;
+    long ti0 = motiris_tokens_in(a), to0 = motiris_tokens_out(a);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = run_interruptible(a);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000L
+            + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+    long di = motiris_tokens_in(a) - ti0;
+    long dout = motiris_tokens_out(a) - to0;
+    if (state->reasoning_active) {
+      printf(C_RESET "\n");
+      state->reasoning_active = 0;
+    }
+    if (color) printf(C_RESET "\n");
+    if (rc == MOTIRIS_RUN_CANCELLED)
+      fprintf(stderr, C_YELLOW "generation cancelled; enter a new instruction"
+              C_RESET "\n");
+    else if (rc) fprintf(stderr, C_RED "motiris: %s" C_RESET "\n",
+                         motiris_last_error(a));
+#ifdef MOTIRIS_TTS_TOOLS
+    if (!rc) tts_new_reply(a);
+#endif
+#ifndef MOTIRIS_NO_PERSISTENCE
+    {
+      const char *error = NULL;
+      if (motiris_session_auto_save(a, state->session_id, "repl", NULL, &error))
+        fprintf(stderr, C_YELLOW "automatic session not saved: %s" C_RESET "\n",
+                error ? error : "snapshot failed");
+    }
+#endif
+    if (sess_id && !rc) {
+      const char *error = NULL;
+      if (motiris_session_checkpoint("sessions", sess_id, a, sess_id, &error))
+        fprintf(stderr, C_YELLOW "session checkpoint not saved: %s" C_RESET "\n",
+                error ? error : "snapshot failed");
+    }
+    if (di || dout)
+      printf(C_DIM "[tokens " C_RESET C_CYAN "↑%ld" C_RESET C_DIM
+             " " C_RESET C_GREEN "↓%ld" C_RESET C_DIM
+             " · total %ld · %ldms · %s]" C_RESET "\n",
+             di, dout, motiris_tokens_in(a) + motiris_tokens_out(a),
+             ms, motiris_model(a));
+    printf("\n");
+  }
+  return 0;
+}
+
+/* ---------------- incrementally edited tty session ----------------
+ *
+ * The main thread owns the terminal, editor, history, commands and all agent
+ * access outside a run. A joinable worker owns the agent during motiris_run.
+ * Its callbacks only enqueue bounded, deep-copied events and wake the main
+ * thread through a nonblocking close-on-exec self-pipe. */
+#define REPL_FIFO_MAX 32
+#define REPL_FIFO_BYTES (64u * 1024u)
+#define REPL_UI_EVENT_MAX 128
+#define REPL_UI_EVENT_BYTES (256u * 1024u)
+#define REPL_UI_CHUNK 4096u
+#define REPL_EDIT_INITIAL 4096u
+
+typedef enum {
+  REPL_UI_DELTA,
+  REPL_UI_REASONING,
+  REPL_UI_FINAL,
+  REPL_UI_TOOL
+} ReplUiEventType;
+
+typedef struct {
+  ReplUiEventType type;
+  char *text;
+  size_t len;
+} ReplUiEvent;
+
+typedef struct {
+  MotirisAgent *agent;
+  int pipefd[2];
+  pthread_mutex_t lock;
+  pthread_cond_t space;
+  pthread_cond_t approval_condition;
+  ReplUiEvent events[REPL_UI_EVENT_MAX];
+  size_t event_head;
+  size_t event_count;
+  size_t event_bytes;
+  int closing;
+  int finished;
+  int run_rc;
+  char *approval_name;
+  char *approval_args;
+  int approval_pending;
+  int approval_done;
+  MotirisApprovalDecision approval_decision;
+} ReplAsync;
+
+typedef struct {
+  char *lines[REPL_FIFO_MAX];
+  size_t lengths[REPL_FIFO_MAX];
+  size_t head;
+  size_t count;
+  size_t bytes;
+} ReplFifo;
+
+typedef struct {
+  MotirisAgent *agent;
+  ReplState *state;
+  ReplAsync async;
+  ReplFifo fifo;
+  struct linenoiseState editor;
+  struct sigaction previous_sigint;
+  struct sigaction previous_sighup;
+  const char *hist;
+  pthread_t worker;
+  struct timespec started;
+  long tokens_in;
+  long tokens_out;
+  int worker_active;
+  int history_dirty;
+  int sigint_installed;
+  int sighup_installed;
+  int hidden;
+  int exiting;
+  int color;
+} ReplTTY;
+
+static int repl_async_fd_flags(int fd) {
+  int flags = fcntl(fd, F_GETFD);
+  if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) return -1;
+  flags = fcntl(fd, F_GETFL);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+  return 0;
+}
+
+static int repl_async_init(ReplAsync *async, MotirisAgent *agent) {
+  memset(async, 0, sizeof *async);
+  async->agent = agent;
+  async->pipefd[0] = async->pipefd[1] = -1;
+  if (pipe(async->pipefd) != 0) return -1;
+  if (repl_async_fd_flags(async->pipefd[0]) != 0 ||
+      repl_async_fd_flags(async->pipefd[1]) != 0) {
+    close(async->pipefd[0]);
+    close(async->pipefd[1]);
+    async->pipefd[0] = async->pipefd[1] = -1;
+    return -1;
+  }
+  if (pthread_mutex_init(&async->lock, NULL) != 0) {
+    close(async->pipefd[0]);
+    close(async->pipefd[1]);
+    async->pipefd[0] = async->pipefd[1] = -1;
+    return -1;
+  }
+  if (pthread_cond_init(&async->space, NULL) != 0) {
+    pthread_mutex_destroy(&async->lock);
+    close(async->pipefd[0]);
+    close(async->pipefd[1]);
+    async->pipefd[0] = async->pipefd[1] = -1;
+    return -1;
+  }
+  if (pthread_cond_init(&async->approval_condition, NULL) != 0) {
+    pthread_cond_destroy(&async->space);
+    pthread_mutex_destroy(&async->lock);
+    close(async->pipefd[0]);
+    close(async->pipefd[1]);
+    async->pipefd[0] = async->pipefd[1] = -1;
+    return -1;
+  }
+  return 0;
+}
+
+static void repl_async_wake(ReplAsync *async) {
+  unsigned char byte = 0;
+  if (write(async->pipefd[1], &byte, 1) < 0) {
+    /* A full pipe is already a pending wakeup; EINTR is harmless here. */
+  }
+}
+
+static void repl_async_destroy(ReplAsync *async) {
+  while (async->event_count) {
+    ReplUiEvent *event = &async->events[async->event_head];
+    free(event->text);
+    event->text = NULL;
+    async->event_head = (async->event_head + 1) % REPL_UI_EVENT_MAX;
+    async->event_count--;
+  }
+  free(async->approval_name);
+  free(async->approval_args);
+  async->approval_name = async->approval_args = NULL;
+  pthread_cond_destroy(&async->approval_condition);
+  pthread_cond_destroy(&async->space);
+  pthread_mutex_destroy(&async->lock);
+  if (async->pipefd[0] >= 0) close(async->pipefd[0]);
+  if (async->pipefd[1] >= 0) close(async->pipefd[1]);
+  async->pipefd[0] = async->pipefd[1] = -1;
+}
+
+static int repl_async_push(ReplAsync *async, ReplUiEventType type,
+                           const char *text, size_t len) {
+  char *copy = malloc(len + 1);
+  if (!copy) return -1;
+  memcpy(copy, text, len);
+  copy[len] = '\0';
+
+  pthread_mutex_lock(&async->lock);
+  while (!async->closing &&
+         (async->event_count == REPL_UI_EVENT_MAX ||
+          len > REPL_UI_EVENT_BYTES - async->event_bytes))
+    pthread_cond_wait(&async->space, &async->lock);
+  if (async->closing) {
+    pthread_mutex_unlock(&async->lock);
+    free(copy);
+    return -1;
+  }
+  size_t slot = (async->event_head + async->event_count) % REPL_UI_EVENT_MAX;
+  async->events[slot].type = type;
+  async->events[slot].text = copy;
+  async->events[slot].len = len;
+  async->event_count++;
+  async->event_bytes += len;
+  pthread_mutex_unlock(&async->lock);
+  repl_async_wake(async);
+  return 0;
+}
+
+static void repl_async_text(ReplAsync *async, ReplUiEventType type,
+                            const char *text) {
+  if (!text) return;
+  size_t remaining = strlen(text);
+  while (remaining) {
+    size_t len = remaining > REPL_UI_CHUNK ? REPL_UI_CHUNK : remaining;
+    if (repl_async_push(async, type, text, len) != 0) return;
+    text += len;
+    remaining -= len;
+  }
+}
+
+static int repl_async_pop(ReplAsync *async, ReplUiEvent *event) {
+  pthread_mutex_lock(&async->lock);
+  if (!async->event_count) {
+    pthread_mutex_unlock(&async->lock);
+    return 0;
+  }
+  *event = async->events[async->event_head];
+  async->events[async->event_head].text = NULL;
+  async->events[async->event_head].len = 0;
+  async->event_head = (async->event_head + 1) % REPL_UI_EVENT_MAX;
+  async->event_count--;
+  async->event_bytes -= event->len;
+  pthread_cond_signal(&async->space);
+  pthread_mutex_unlock(&async->lock);
+  return 1;
+}
+
+static void repl_async_delta(const char *text, void *ud) {
+  repl_async_text(ud, REPL_UI_DELTA, text);
+}
+
+static void repl_async_final(const char *text, void *ud) {
+  repl_async_text(ud, REPL_UI_FINAL, text);
+}
+
+static void repl_async_reasoning(const char *text, void *ud) {
+  ReplAsync *async = ud;
+  if (!motiris_thinking_visible(async->agent)) return;
+  repl_async_text(async, REPL_UI_REASONING, text);
+}
+
+static void repl_async_tool(const char *name, const char *args,
+                            const char *result, void *ud) {
+  char abuf[80], rbuf[96], line[512];
+  clip(abuf, sizeof abuf, args ? args : "{}", 60);
+  clip(rbuf, sizeof rbuf, result ? result : "", 72);
+  int is_err = result && strstr(result, "\"error\"");
+  if (is_err)
+    snprintf(line, sizeof line,
+             "  " C_YELLOW "⚙ %s" C_RESET "(%s) " C_RED "✗ %s" C_RESET,
+             name, abuf, rbuf);
+  else
+    snprintf(line, sizeof line,
+             "  " C_YELLOW "⚙ %s" C_RESET "(%s) " C_DIM "→ %s" C_RESET,
+             name, abuf, rbuf);
+  repl_async_text(ud, REPL_UI_TOOL, line);
+}
+
+static char *repl_bounded_copy(const char *text) {
+  if (!text) text = "";
+  size_t len = strnlen(text, REPL_UI_CHUNK);
+  char *copy = malloc(len + 1);
+  if (!copy) return NULL;
+  memcpy(copy, text, len);
+  copy[len] = '\0';
+  return copy;
+}
+
+static MotirisApprovalDecision repl_async_approval(const char *name,
+                                                    const char *args,
+                                                    void *ud) {
+  ReplAsync *async = ud;
+  char *name_copy = repl_bounded_copy(name);
+  char *args_copy = repl_bounded_copy(args);
+  if (!name_copy || !args_copy) {
+    free(name_copy);
+    free(args_copy);
+    return MOTIRIS_APPROVAL_DENY;
+  }
+
+  pthread_mutex_lock(&async->lock);
+  while (async->approval_pending && !async->closing)
+    pthread_cond_wait(&async->approval_condition, &async->lock);
+  if (async->closing) {
+    pthread_mutex_unlock(&async->lock);
+    free(name_copy);
+    free(args_copy);
+    return MOTIRIS_APPROVAL_DENY;
+  }
+  async->approval_name = name_copy;
+  async->approval_args = args_copy;
+  async->approval_decision = MOTIRIS_APPROVAL_DENY;
+  async->approval_done = 0;
+  async->approval_pending = 1;
+  pthread_mutex_unlock(&async->lock);
+  repl_async_wake(async);
+
+  pthread_mutex_lock(&async->lock);
+  while (!async->approval_done && !async->closing)
+    pthread_cond_wait(&async->approval_condition, &async->lock);
+  MotirisApprovalDecision decision = async->closing
+      ? MOTIRIS_APPROVAL_DENY : async->approval_decision;
+  free(async->approval_name);
+  free(async->approval_args);
+  async->approval_name = async->approval_args = NULL;
+  async->approval_pending = 0;
+  async->approval_done = 0;
+  pthread_mutex_unlock(&async->lock);
+  return decision;
+}
+
+static int repl_async_cancelled(void *ud) {
+  (void)ud;
+  return generation_interrupted != 0;
+}
+
+static void *repl_async_worker(void *ud) {
+  ReplAsync *async = ud;
+  motiris_set_cancel_cb(async->agent, repl_async_cancelled, async);
+  int rc = motiris_run(async->agent);
+  motiris_set_cancel_cb(async->agent, NULL, NULL);
+  pthread_mutex_lock(&async->lock);
+  async->run_rc = rc;
+  async->finished = 1;
+  pthread_mutex_unlock(&async->lock);
+  repl_async_wake(async);
+  return NULL;
+}
+
+static int repl_async_approval_pending(ReplAsync *async) {
+  pthread_mutex_lock(&async->lock);
+  int pending = async->approval_pending;
+  pthread_mutex_unlock(&async->lock);
+  return pending;
+}
+
+static int repl_async_collect_ready(ReplAsync *async) {
+  pthread_mutex_lock(&async->lock);
+  int ready = async->finished && async->event_count == 0;
+  pthread_mutex_unlock(&async->lock);
+  return ready;
+}
+
+static void repl_async_prepare_run(ReplAsync *async) {
+  pthread_mutex_lock(&async->lock);
+  async->finished = 0;
+  async->run_rc = 0;
+  pthread_mutex_unlock(&async->lock);
+}
+
+static void repl_async_request_shutdown(ReplAsync *async) {
+  pthread_mutex_lock(&async->lock);
+  async->closing = 1;
+  async->approval_decision = MOTIRIS_APPROVAL_DENY;
+  async->approval_done = 1;
+  async->approval_pending = 0;
+  pthread_cond_broadcast(&async->approval_condition);
+  pthread_cond_broadcast(&async->space);
+  pthread_mutex_unlock(&async->lock);
+  repl_async_wake(async);
+}
+
+static int repl_fifo_push(ReplFifo *fifo, char *line) {
+  size_t len = strlen(line);
+  if (fifo->count == REPL_FIFO_MAX || len > REPL_FIFO_BYTES - fifo->bytes)
+    return -1;
+  size_t slot = (fifo->head + fifo->count) % REPL_FIFO_MAX;
+  fifo->lines[slot] = line;
+  fifo->lengths[slot] = len;
+  fifo->count++;
+  fifo->bytes += len;
+  return 0;
+}
+
+static char *repl_fifo_pop(ReplFifo *fifo) {
+  if (!fifo->count) return NULL;
+  char *line = fifo->lines[fifo->head];
+  fifo->bytes -= fifo->lengths[fifo->head];
+  fifo->lines[fifo->head] = NULL;
+  fifo->lengths[fifo->head] = 0;
+  fifo->head = (fifo->head + 1) % REPL_FIFO_MAX;
+  fifo->count--;
+  return line;
+}
+
+static void repl_fifo_clear(ReplFifo *fifo) {
+  char *line;
+  while ((line = repl_fifo_pop(fifo)) != NULL) free(line);
+}
+
+static void repl_tty_output_mode(int cooked) {
+  struct termios terminal;
+  if (tcgetattr(STDIN_FILENO, &terminal) != 0) return;
+  if (cooked) terminal.c_oflag |= OPOST;
+  else terminal.c_oflag &= (tcflag_t)~OPOST;
+  tcsetattr(STDIN_FILENO, TCSANOW, &terminal);
+}
+
+static void repl_tty_hide(ReplTTY *tty) {
+  if (tty->hidden) return;
+  fflush(stdout);
+  linenoiseHide(&tty->editor);
+  repl_tty_output_mode(1);
+  tty->hidden = 1;
+}
+
+static void repl_tty_show(ReplTTY *tty) {
+  if (!tty->hidden) return;
+  fflush(stdout);
+  repl_tty_output_mode(0);
+  tty->hidden = 0;
+  linenoiseShow(&tty->editor);
+  /* Keep an empty idle prompt byte-compatible with linenoiseEditStart(). */
+  if (!tty->editor.len && !tty->editor.menu_rows &&
+      !tty->editor.in_completion) {
+    static const char prompt[] = "\rmotiris> ";
+    if (write(STDOUT_FILENO, prompt, sizeof prompt - 1) < 0) {}
+  }
+}
+
+static void repl_tty_render_event(ReplTTY *tty, const ReplUiEvent *event) {
+  ReplState *state = tty->state;
+  if (event->type == REPL_UI_REASONING) {
+    if (!state->reasoning_active) {
+      printf(C_DIM "\n[thinking]\n" C_RESET);
+      state->reasoning_active = 1;
+    }
+    printf(C_DIM);
+    fwrite(event->text, 1, event->len, stdout);
+    printf(C_RESET);
+  } else if (event->type == REPL_UI_TOOL) {
+    fwrite(event->text, 1, event->len, stdout);
+    printf("\n");
+  } else {
+    if (state->reasoning_active) {
+      printf(C_RESET "\n");
+      state->reasoning_active = 0;
+    }
+    fwrite(event->text, 1, event->len, stdout);
+  }
+  fflush(stdout);
+}
+
+static void repl_tty_drain_events(ReplTTY *tty) {
+  ReplUiEvent event;
+  int rendered = 0;
+  while (repl_async_pop(&tty->async, &event)) {
+    if (!rendered) {
+      repl_tty_hide(tty);
+      rendered = 1;
+    }
+    repl_tty_render_event(tty, &event);
+    free(event.text);
+  }
+  if (rendered) repl_tty_show(tty);
+}
+
+static void repl_tty_answer_approval(ReplTTY *tty) {
+  repl_tty_drain_events(tty);
+  repl_tty_hide(tty);
+  MotirisApprovalDecision decision = approval_card(tty->async.approval_name,
+                                                    tty->async.approval_args,
+                                                    tty->state);
+  pthread_mutex_lock(&tty->async.lock);
+  if (tty->async.approval_pending) {
+    tty->async.approval_decision = decision;
+    tty->async.approval_done = 1;
+    tty->async.approval_pending = 0;
+    pthread_cond_signal(&tty->async.approval_condition);
+  }
+  pthread_mutex_unlock(&tty->async.lock);
+  repl_tty_show(tty);
+}
+
+static void repl_tty_editor_next(ReplTTY *tty, const char *restore) {
+  linenoiseEditNext(&tty->editor);
+  if (restore) {
+    size_t len = strlen(restore);
+    if (len <= tty->editor.buflen) {
+      memcpy(tty->editor.buf, restore, len + 1);
+      tty->editor.len = tty->editor.pos = len;
+    }
+  }
+}
+
+static void repl_tty_accept(ReplTTY *tty, char *line) {
+  repl_tty_hide(tty);
+  if (!*line) {
+    free(line);
+    repl_tty_editor_next(tty, NULL);
+    repl_tty_show(tty);
+    return;
+  }
+
+  if (repl_fifo_push(&tty->fifo, line) != 0) {
+    printf(C_YELLOW "input queue full; line kept in editor" C_RESET "\n");
+    repl_tty_editor_next(tty, line);
+    free(line);
+    repl_tty_show(tty);
+    return;
+  }
+
+  printf("%s\n", line);
+  linenoiseHistoryAdd(line);
+  tty->history_dirty = 1;
+  if (tty->worker_active)
+    printf(C_DIM "[queued %zu]" C_RESET "\n", tty->fifo.count);
+  if (!tty->worker_active && tty->history_dirty) {
+    linenoiseHistorySave(tty->hist);
+    tty->history_dirty = 0;
+  }
+  repl_tty_editor_next(tty, NULL);
+  repl_tty_show(tty);
+}
+
+static void repl_tty_finish_turn(ReplTTY *tty, int rc) {
+  MotirisAgent *a = tty->agent;
+  ReplState *state = tty->state;
+  struct timespec finished;
+  clock_gettime(CLOCK_MONOTONIC, &finished);
+  long ms = (finished.tv_sec - tty->started.tv_sec) * 1000L
+          + (finished.tv_nsec - tty->started.tv_nsec) / 1000000L;
+  long di = motiris_tokens_in(a) - tty->tokens_in;
+  long dout = motiris_tokens_out(a) - tty->tokens_out;
+  if (state->reasoning_active) {
+    printf(C_RESET "\n");
+    state->reasoning_active = 0;
+  }
+  if (tty->color) printf(C_RESET "\n");
+  if (rc == MOTIRIS_RUN_CANCELLED)
+    fprintf(stderr, C_YELLOW "generation cancelled; enter a new instruction"
+            C_RESET "\n");
+  else if (rc) fprintf(stderr, C_RED "motiris: %s" C_RESET "\n",
+                       motiris_last_error(a));
+#ifdef MOTIRIS_TTS_TOOLS
+  if (!rc) tts_new_reply(a);
+#endif
+#ifndef MOTIRIS_NO_PERSISTENCE
+  {
+    const char *error = NULL;
+    if (motiris_session_auto_save(a, state->session_id, "repl", NULL, &error))
+      fprintf(stderr, C_YELLOW "automatic session not saved: %s" C_RESET "\n",
+              error ? error : "snapshot failed");
+  }
+#endif
+  if (sess_id && !rc) {
+    const char *error = NULL;
+    if (motiris_session_checkpoint("sessions", sess_id, a, sess_id, &error))
+      fprintf(stderr, C_YELLOW "session checkpoint not saved: %s" C_RESET "\n",
+              error ? error : "snapshot failed");
+  }
+  if (di || dout)
+    printf(C_DIM "[tokens " C_RESET C_CYAN "↑%ld" C_RESET C_DIM
+           " " C_RESET C_GREEN "↓%ld" C_RESET C_DIM
+           " · total %ld · %ldms · %s]" C_RESET "\n",
+           di, dout, motiris_tokens_in(a) + motiris_tokens_out(a),
+           ms, motiris_model(a));
+  printf("\n");
+}
+
+static void repl_tty_dispatch(ReplTTY *tty) {
+  char *line = repl_fifo_pop(&tty->fifo);
+  if (!line) return;
+  repl_tty_hide(tty);
+  int cmd = handle_command(tty->agent, tty->state, line);
+  if (cmd == 1) {
+    free(line);
+    tty->exiting = 1;
+    repl_tty_show(tty);
+    return;
+  }
+  if (cmd == 0) {
+    free(line);
+    repl_tty_show(tty);
+    return;
+  }
+
+  motiris_add_user(tty->agent, line);
+  free(line);
+  printf(C_DIM "→ you" C_RESET "\n");
+  if (tty->color) printf(C_CYAN);
+  tty->state->reasoning_active = 0;
+  tty->tokens_in = motiris_tokens_in(tty->agent);
+  tty->tokens_out = motiris_tokens_out(tty->agent);
+  clock_gettime(CLOCK_MONOTONIC, &tty->started);
+  generation_interrupted = 0;
+  repl_async_prepare_run(&tty->async);
+  int rc = pthread_create(&tty->worker, NULL, repl_async_worker, &tty->async);
+  if (rc != 0) {
+    if (tty->color) printf(C_RESET "\n");
+    fprintf(stderr, C_RED "motiris: cannot start generation: %s" C_RESET "\n",
+            strerror(rc));
+#ifndef MOTIRIS_NO_PERSISTENCE
+    /* The user message is already canonical; preserve it even though no
+     * assistant turn could be started. Later queued input remains FIFO. */
+    const char *error = NULL;
+    if (motiris_session_auto_save(tty->agent, tty->state->session_id,
+                                  "repl", NULL, &error))
+      fprintf(stderr, C_YELLOW "automatic session not saved: %s" C_RESET "\n",
+              error ? error : "snapshot failed");
+#endif
+    printf("\n");
+    repl_tty_show(tty);
+    return;
+  }
+  tty->worker_active = 1;
+  repl_tty_show(tty);
+}
+
+static void repl_tty_save_history(ReplTTY *tty) {
+  if (!tty->history_dirty || tty->worker_active) return;
+  linenoiseHistorySave(tty->hist);
+  tty->history_dirty = 0;
+}
+
+static void repl_tty_collect(ReplTTY *tty) {
+  if (!tty->worker_active) return;
+  pthread_join(tty->worker, NULL);
+  tty->worker_active = 0;
+  repl_tty_save_history(tty);
+  repl_tty_hide(tty);
+  repl_tty_finish_turn(tty, tty->async.run_rc);
+  repl_tty_show(tty);
+}
+
+static void repl_tty_drain_pipe(ReplTTY *tty) {
+  unsigned char buf[64];
+  for (;;) {
+    ssize_t n = read(tty->async.pipefd[0], buf, sizeof buf);
+    if (n > 0) continue;
+    if (n < 0 && errno == EINTR) continue;
+    break;
+  }
+}
+
+static int repl_tty_input_hup(void) {
+  struct pollfd input = { .fd = STDIN_FILENO, .events = POLLIN };
+  int ready;
+  do {
+    ready = poll(&input, 1, 0);
+  } while (ready < 0 && errno == EINTR);
+  return ready > 0 && (input.revents & (POLLHUP | POLLERR | POLLNVAL));
+}
+
+static int repl_tty_supported(void) {
+  if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return 0;
+  const char *term = getenv("TERM");
+  return !term || (strcasecmp(term, "dumb") && strcasecmp(term, "cons25") &&
+                   strcasecmp(term, "emacs"));
+}
+
+static int repl_tty_loop(MotirisAgent *a, ReplState *state,
+                         const char *hist, int color) {
+  ReplTTY tty;
+  memset(&tty, 0, sizeof tty);
+  tty.agent = a;
+  tty.state = state;
+  tty.hist = hist;
+  tty.color = color;
+  if (repl_async_init(&tty.async, a) != 0) return -1;
+
+  char *edit_buf = malloc(REPL_EDIT_INITIAL);
+  if (!edit_buf) {
+    repl_async_destroy(&tty.async);
+    return -1;
+  }
+  if (linenoiseEditStart(&tty.editor, STDIN_FILENO, STDOUT_FILENO,
+                         edit_buf, REPL_EDIT_INITIAL, "motiris> ") != 0) {
+    linenoiseEditStop(&tty.editor);
+    free(tty.editor.buf);
+    repl_async_destroy(&tty.async);
+    return -1;
+  }
+  tty.editor.buflen_max = REPL_FIFO_BYTES;
+  if (linenoiseEditSetNonblocking(&tty.editor, 1) != 0) {
+    linenoiseEditStop(&tty.editor);
+    free(tty.editor.buf);
+    repl_async_destroy(&tty.async);
+    return -1;
+  }
+
+  struct sigaction action = {0};
+  action.sa_handler = generation_sigint;
+  sigemptyset(&action.sa_mask);
+  generation_interrupted = 0;
+  if (sigaction(SIGINT, &action, &tty.previous_sigint) == 0)
+    tty.sigint_installed = 1;
+  action.sa_handler = terminal_sighup;
+  terminal_hangup = 0;
+  if (sigaction(SIGHUP, &action, &tty.previous_sighup) == 0)
+    tty.sighup_installed = 1;
+
+  motiris_set_stream_cb(a, repl_async_delta, &tty.async);
+  motiris_set_reasoning_cb(a, repl_async_reasoning, &tty.async);
+  motiris_set_final_cb(a, repl_async_final, &tty.async);
+  motiris_set_print_answer(a, 0);
+  motiris_set_approval_callback(a, repl_async_approval, &tty.async);
+  motiris_set_tool_hook(a, repl_async_tool, &tty.async);
+
+  while (!tty.exiting) {
+    /* Do not dispatch more queued work after a terminal hangup, including
+     * when an approval/config card was the reader that observed the EOF. */
+    if (terminal_hangup || repl_tty_input_hup()) {
+      tty.exiting = 1;
+      continue;
+    }
+    if (repl_async_approval_pending(&tty.async)) {
+      repl_tty_answer_approval(&tty);
+      continue;
+    }
+    if (tty.worker_active && repl_async_collect_ready(&tty.async)) {
+      repl_tty_collect(&tty);
+      continue;
+    }
+    if (!tty.worker_active && tty.fifo.count) {
+      repl_tty_dispatch(&tty);
+      continue;
+    }
+
+    struct pollfd fds[2] = {
+      { .fd = STDIN_FILENO, .events = POLLIN },
+      { .fd = tty.async.pipefd[0], .events = POLLIN }
+    };
+    int ready = poll(fds, 2, -1);
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      repl_tty_hide(&tty);
+      fprintf(stderr, C_RED "motiris: terminal poll: %s" C_RESET "\n",
+              strerror(errno));
+      repl_tty_show(&tty);
+      tty.exiting = 1;
+      continue;
+    }
+    if (fds[1].revents & POLLIN) {
+      repl_tty_drain_pipe(&tty);
+      repl_tty_drain_events(&tty);
+    }
+    if (fds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+      tty.exiting = 1;
+      continue;
+    }
+    if (fds[0].revents & POLLIN) {
+      errno = 0;
+      char *line = linenoiseEditFeed(&tty.editor);
+      if (line == linenoiseEditMore) {
+        /* Keep editing the same draft. */
+      } else if (line) {
+        repl_tty_accept(&tty, line);
+      } else if (errno == EAGAIN || errno == ECANCELED) {
+        if (tty.worker_active) generation_interrupted = 1;
+      } else {
+        int error = errno;
+        if (error && error != ENOENT && error != EIO) {
+          repl_tty_hide(&tty);
+          fprintf(stderr, C_RED "motiris: terminal input: %s" C_RESET "\n",
+                  strerror(error));
+          repl_tty_show(&tty);
+        }
+        tty.exiting = 1;
+        continue;
+      }
+    }
+    if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL))
+      tty.exiting = 1;
+  }
+
+  generation_interrupted = 1;
+  repl_async_request_shutdown(&tty.async);
+  if (tty.worker_active) {
+    pthread_join(tty.worker, NULL);
+    tty.worker_active = 0;
+    repl_tty_drain_events(&tty);
+    repl_tty_save_history(&tty);
+    repl_tty_hide(&tty);
+    repl_tty_finish_turn(&tty, tty.async.run_rc);
+    repl_tty_show(&tty);
+  }
+  repl_tty_save_history(&tty);
+  repl_fifo_clear(&tty.fifo);
+  repl_tty_show(&tty);
+  linenoiseEditStop(&tty.editor);
+  free(tty.editor.buf);
+  if (tty.sigint_installed) sigaction(SIGINT, &tty.previous_sigint, NULL);
+  if (tty.sighup_installed) sigaction(SIGHUP, &tty.previous_sighup, NULL);
+  repl_async_destroy(&tty.async);
+  return 0;
+}
+
 int motiris_repl(MotirisAgent *a) {
   ReplState state = {
     .agent = a,
@@ -825,66 +1673,8 @@ int motiris_repl(MotirisAgent *a) {
     printf(C_DIM "  try: /help (commands) · /sessions (review past) · "
            "/skills (list skills)\n" C_RESET);
 
-  char *line;
-  while ((line = linenoise("motiris> ")) != NULL) {
-    if (!*line) { free(line); continue; }
-    linenoiseHistoryAdd(line);
-    linenoiseHistorySave(hist);
-
-    int cmd = handle_command(a, &state, line);
-    if (cmd == 1) { free(line); break; }
-    if (cmd == 0) { free(line); continue; }
-
-    motiris_add_user(a, line);
-    free(line);
-
-    printf(C_DIM "→ you" C_RESET "\n");
-    if (color) printf(C_CYAN);
-    state.reasoning_active = 0;
-    long ti0 = motiris_tokens_in(a), to0 = motiris_tokens_out(a);
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = run_interruptible(a);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    long ms = (t1.tv_sec - t0.tv_sec) * 1000L
-            + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
-    long di = motiris_tokens_in(a) - ti0;
-    long dout = motiris_tokens_out(a) - to0;
-    if (state.reasoning_active) {
-      printf(C_RESET "\n");
-      state.reasoning_active = 0;
-    }
-    if (color) printf(C_RESET "\n");
-    if (rc == MOTIRIS_RUN_CANCELLED)
-      fprintf(stderr, C_YELLOW "generation cancelled; enter a new instruction"
-              C_RESET "\n");
-    else if (rc) fprintf(stderr, C_RED "motiris: %s" C_RESET "\n",
-                         motiris_last_error(a));
-#ifdef MOTIRIS_TTS_TOOLS
-    if (!rc) tts_new_reply(a);
-#endif
-#ifndef MOTIRIS_NO_PERSISTENCE
-    {
-      const char *error = NULL;
-      if (motiris_session_auto_save(a, state.session_id, "repl", NULL, &error))
-        fprintf(stderr, C_YELLOW "automatic session not saved: %s" C_RESET "\n",
-                error ? error : "snapshot failed");
-    }
-#endif
-    if (sess_id && !rc) {
-      const char *error = NULL;
-      if (motiris_session_checkpoint("sessions", sess_id, a, sess_id, &error))
-        fprintf(stderr, C_YELLOW "session checkpoint not saved: %s" C_RESET "\n",
-                error ? error : "snapshot failed");
-    }
-    if (di || dout)
-      printf(C_DIM "[tokens " C_RESET C_CYAN "↑%ld" C_RESET C_DIM
-             " " C_RESET C_GREEN "↓%ld" C_RESET C_DIM
-             " · total %ld · %ldms · %s]" C_RESET "\n",
-             di, dout, motiris_tokens_in(a) + motiris_tokens_out(a),
-             ms, motiris_model(a));
-    printf("\n");
-  }
+  if (!repl_tty_supported() || repl_tty_loop(a, &state, hist, color) != 0)
+    repl_sync_loop(a, &state, hist, color);
   printf(C_DIM "bye" C_RESET "\n");
   free(sess_id);
   sess_id = NULL;

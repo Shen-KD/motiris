@@ -8,6 +8,12 @@ published by `.github/workflows/release.yml`.
 
 ### Added
 
+- Generation-time TTY input: linenoise remains editable while a joinable agent
+  worker runs, Enter accepts a bounded 32-line/64-KiB FIFO without implicit
+  interruption, and natural completion/cancellation dispatches queued input in
+  order. Esc/Ctrl+C preserve the unsubmitted draft and queue; approval cards,
+  buffered answers, history and session finalization remain serialized on the
+  main thread. Non-TTY REPL behavior is unchanged.
 - Agent defaults and interaction: `max_steps=0` (unlimited), SSE streaming,
   configurable reasoning effort, separate provider-only thinking deltas,
   `/thinking`, `/reasoning`, `/approval` and `/config` cards, and fail-closed

@@ -116,6 +116,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <poll.h>
 #include "linenoise.h"
 
 #define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
@@ -623,6 +624,59 @@ static void disableRawMode(int fd) {
         if (write(rawmode_output, "\x1b[?2004l", 8) == -1) {}
         rawmode = 0;
     }
+}
+
+/* Change only the read timing of an already active raw-mode session. TCSANOW
+ * is intentional: flushing here could discard an escape sequence or paste
+ * whose first byte caused the event loop to call us. */
+int linenoiseEditSetNonblocking(struct linenoiseState *l, int enabled) {
+    struct termios raw;
+    int nonblocking = enabled != 0;
+
+    if (getenv("LINENOISE_ASSUME_TTY")) {
+        l->nonblocking = nonblocking;
+        return 0;
+    }
+    if (!isatty(l->ifd)) {
+        errno = ENOTTY;
+        return -1;
+    }
+    if (tcgetattr(l->ifd,&raw) == -1) return -1;
+    raw.c_cc[VMIN] = nonblocking ? 0 : 1;
+    raw.c_cc[VTIME] = nonblocking ? 1 : 0;
+    if (tcsetattr(l->ifd,TCSANOW,&raw) == -1) return -1;
+    l->nonblocking = nonblocking;
+    return 0;
+}
+
+/* Read one byte. In nonblocking mode both poll and the termios timer bound
+ * the wait: poll also covers LINENOISE_ASSUME_TTY tests and non-terminal file
+ * descriptors for which VMIN/VTIME cannot be configured. A zero return means
+ * that no byte arrived before the bound (or that a nonblocking fd would
+ * block), while -1 is EOF or an actual read error. */
+static int linenoiseReadByte(struct linenoiseState *l, char *c) {
+    ssize_t nread;
+
+    if (l->nonblocking) {
+        struct pollfd pfd;
+        int ready;
+
+        pfd.fd = l->ifd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        ready = poll(&pfd,1,100);
+        if (ready == 0 || (ready == -1 && errno == EINTR)) return 0;
+        if (ready == -1) return -1;
+    }
+
+    nread = read(l->ifd,c,1);
+    if (nread == 1) return 1;
+    /* poll() handled the nonblocking timeout above. A zero-byte read after
+     * readiness is EOF/hangup, not an invitation to spin in EditMore. */
+    if (nread == 0) return -1;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+    if (l->nonblocking && errno == EINTR) return 0;
+    return -1;
 }
 
 /* Use the ESC [6n escape sequence to query the horizontal cursor position
@@ -1758,10 +1812,29 @@ void linenoiseEditDeletePrevWord(struct linenoiseState *l) {
  * fails. If stdin_fd or stdout_fd are set to -1, the default is to use
  * STDIN_FILENO and STDOUT_FILENO.
  */
+static void linenoiseParserClear(struct linenoiseState *l) {
+    free(l->paste_buf);
+    l->paste_buf = NULL;
+    l->paste_cap = l->paste_len = l->paste_match = 0;
+    l->in_paste = l->paste_overflowed = 0;
+    l->escape_len = 0;
+    l->utf8_len = l->utf8_need = 0;
+    memset(l->escape_buf,0,sizeof(l->escape_buf));
+    memset(l->utf8_buf,0,sizeof(l->utf8_buf));
+}
+
+static void linenoiseParserInit(struct linenoiseState *l) {
+    l->nonblocking = 0;
+    l->paste_buf = NULL;
+    linenoiseParserClear(l);
+}
+
 int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, char *buf, size_t buflen, const char *prompt) {
     /* Populate the linenoise state that we pass to functions implementing
      * specific editing functionalities. */
+    linenoiseParserInit(l);
     l->in_completion = 0;
+    l->completion_idx = 0;
     l->ifd = stdin_fd != -1 ? stdin_fd : STDIN_FILENO;
     l->ofd = stdout_fd != -1 ? stdout_fd : STDOUT_FILENO;
     l->buf = buf;
@@ -1799,6 +1872,24 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
 
     if (write(l->ofd,prompt,l->plen) == -1) return -1;
     return 0;
+}
+
+/* Reuse an active incremental editing session after Enter. The submitted
+ * line's temporary history slot was removed by linenoiseEditFeed(); install a
+ * fresh empty slot for history navigation in the new draft. Rendering state
+ * such as oldrows/menu_rows is retained so the next repaint can still clear
+ * what is currently on screen, but this function itself performs no I/O. */
+void linenoiseEditNext(struct linenoiseState *l) {
+    linenoiseParserClear(l);
+    l->in_completion = 0;
+    l->completion_idx = 0;
+    l->oldpos = l->pos = 0;
+    l->len = 0;
+    l->history_index = 0;
+    l->menu_index = 0;
+    linenoiseFoldClear(l);
+    l->buf[0] = '\0';
+    linenoiseHistoryAdd("");
 }
 
 /* Make sure the temporary paste buffer can hold len+need bytes. Return -1 on
@@ -1849,50 +1940,10 @@ static int pasteBufferAppend(struct linenoiseState *l, char **buf, size_t *cap,
     return 0;
 }
 
-/* Read a bracketed paste until ESC[201~ and insert the real bytes. If folding
- * is needed, remember the inserted range so only rendering is shortened. */
-static void linenoiseEditPaste(struct linenoiseState *l) {
-    static const char END[] = "\x1b[201~";
-    const size_t ENDLEN = sizeof(END)-1;
-    char *buf = NULL;
-    size_t cap = 0, len = 0, match = 0;
-    size_t maxlen = l->buflen_max ? l->buflen_max : l->buflen;
-    int overflowed = 0;
-
-    maxlen = maxlen > l->len ? maxlen - l->len : 0;
-    if (maxlen > PASTE_MAX_BYTES) maxlen = PASTE_MAX_BYTES;
-    /* Once all fold slots are used, consume later pastes without storing them. */
-    if (l->fold_count == LINENOISE_MAX_FOLDS) maxlen = 0;
-
-    while (1) {
-        char c;
-        if (read(l->ifd, &c, 1) != 1) break;
-
-        /* Track a possible ESC[201~ terminator without copying it into the
-         * paste. If it turns out to be ordinary input, flush the partial
-         * match below. */
-        if (c == END[match]) {
-            match++;
-            if (match == ENDLEN) break;
-            continue;
-        }
-
-        if (match > 0) {
-            if (!overflowed &&
-                pasteBufferAppend(l,&buf,&cap,&len,END,match,maxlen) == -1)
-                overflowed = 1;
-            match = 0;
-            if (c == END[0]) {
-                match = 1;
-                continue;
-            }
-        }
-
-        if (!overflowed &&
-            pasteBufferAppend(l,&buf,&cap,&len,&c,1,maxlen) == -1)
-            overflowed = 1;
-    }
-
+/* Insert a completed paste. This consumes buf, which may be NULL for an
+ * empty paste. */
+static void linenoiseEditPasteFinish(struct linenoiseState *l, char *buf,
+                                     size_t len, int overflowed) {
     if (overflowed) {
         free(buf);
         linenoiseBeep();
@@ -1900,9 +1951,9 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
     }
     if (buf == NULL) return;
 
+    /* Normalize pasted CR and CRLF to LF, so the edit buffer uses one
+     * internal newline representation. */
     {
-        /* Normalize pasted CR and CRLF to LF, so the edit buffer uses one
-         * internal newline representation. */
         size_t r = 0, w = 0;
         while (r < len) {
             if (buf[r] == '\r') {
@@ -1930,7 +1981,185 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
     free(buf);
 }
 
+static char *linenoiseEditPasteFinishState(struct linenoiseState *l) {
+    char *buf = l->paste_buf;
+    size_t len = l->paste_len;
+    int overflowed = l->paste_overflowed;
+
+    l->paste_buf = NULL;
+    l->paste_cap = l->paste_len = l->paste_match = 0;
+    l->in_paste = l->paste_overflowed = 0;
+    linenoiseEditPasteFinish(l,buf,len,overflowed);
+    return linenoiseEditMore;
+}
+
+/* Read a bracketed paste until ESC[201~ and insert the real bytes. In
+ * nonblocking mode a timeout retains both the bytes and a partial terminator
+ * match in linenoiseState, so no unterminated paste is ever inserted. */
+static char *linenoiseEditPaste(struct linenoiseState *l) {
+    static const char END[] = "\x1b[201~";
+    const size_t ENDLEN = sizeof(END)-1;
+    size_t maxlen = l->buflen_max ? l->buflen_max : l->buflen;
+
+    if (!l->in_paste) {
+        l->in_paste = 1;
+        l->paste_cap = l->paste_len = l->paste_match = 0;
+        l->paste_overflowed = 0;
+    }
+
+    maxlen = maxlen > l->len ? maxlen - l->len : 0;
+    if (maxlen > PASTE_MAX_BYTES) maxlen = PASTE_MAX_BYTES;
+    /* Once all fold slots are used, consume later pastes without storing them. */
+    if (l->fold_count == LINENOISE_MAX_FOLDS) maxlen = 0;
+
+    while (1) {
+        char c;
+        int rc = linenoiseReadByte(l,&c);
+        if (rc != 1) {
+            if (l->nonblocking)
+                return rc == 0 ? linenoiseEditMore : NULL;
+            /* Preserve the old blocking behavior on EOF/read failure: the
+             * bytes collected before it are treated as the complete paste. */
+            return linenoiseEditPasteFinishState(l);
+        }
+
+        /* Track a possible ESC[201~ terminator without copying it into the
+         * paste. If it turns out to be ordinary input, flush the partial
+         * match below. */
+        if (c == END[l->paste_match]) {
+            l->paste_match++;
+            if (l->paste_match == ENDLEN)
+                return linenoiseEditPasteFinishState(l);
+            continue;
+        }
+
+        if (l->paste_match > 0) {
+            if (!l->paste_overflowed &&
+                pasteBufferAppend(l,&l->paste_buf,&l->paste_cap,
+                                  &l->paste_len,END,l->paste_match,maxlen) == -1)
+                l->paste_overflowed = 1;
+            l->paste_match = 0;
+            if (c == END[0]) {
+                l->paste_match = 1;
+                continue;
+            }
+        }
+
+        if (!l->paste_overflowed &&
+            pasteBufferAppend(l,&l->paste_buf,&l->paste_cap,
+                              &l->paste_len,&c,1,maxlen) == -1)
+            l->paste_overflowed = 1;
+    }
+}
+
 char *linenoiseEditMore = "If you see this, you are misusing the API: when linenoiseEditFeed() is called, if it returns linenoiseEditMore the user is yet editing the line. See the README file for more information.";
+
+/* Continue an escape sequence whose initial ESC has already been consumed.
+ * A timeout immediately after ESC is an explicit cancellation in nonblocking
+ * mode. Once a sequence prefix (ESC[ or ESC O) exists, retain it across calls
+ * so fragmented terminal input cannot turn into uninitialized key data. */
+static char *linenoiseEditEscape(struct linenoiseState *l) {
+    while (1) {
+        char c;
+        int rc = linenoiseReadByte(l,&c);
+        if (rc != 1) {
+            if (rc == 0) {
+                if (l->nonblocking && l->escape_len == 1) {
+                    l->escape_len = 0;
+                    errno = ECANCELED;
+                    return NULL;
+                }
+                return linenoiseEditMore;
+            }
+            l->escape_len = 0;
+            return NULL;
+        }
+
+        if (l->escape_len >= sizeof(l->escape_buf)) {
+            l->escape_len = 0;
+            return linenoiseEditMore;
+        }
+        l->escape_buf[l->escape_len++] = c;
+
+        if (l->escape_len == 2 && c != '[' && c != 'O') {
+            l->escape_len = 0;
+            return linenoiseEditMore;
+        }
+        if (l->escape_len < 3) continue;
+
+        if (l->escape_buf[1] == 'O') {
+            if (c == 'H') linenoiseEditMoveHome(l);
+            else if (c == 'F') linenoiseEditMoveEnd(l);
+            l->escape_len = 0;
+            return linenoiseEditMore;
+        }
+
+        if (c >= '0' && c <= '9') {
+            if (l->escape_len == sizeof(l->escape_buf)) {
+                l->escape_len = 0;
+                return linenoiseEditMore;
+            }
+            continue;
+        }
+
+        if (c == '~') {
+            size_t plen = l->escape_len-3;
+            if (plen == 1 && l->escape_buf[2] == '3') {
+                linenoiseEditDelete(l);
+            } else if (plen == 3 && memcmp(l->escape_buf+2,"200",3) == 0) {
+                l->escape_len = 0;
+                return linenoiseEditPaste(l);
+            }
+        } else if (l->escape_len == 3) {
+            switch(c) {
+            case 'A': /* Up */
+                if (linenoiseMenuHasSelection(l))
+                    linenoiseMenuMove(l,-1);
+                else
+                    linenoiseEditHistoryNext(l,LINENOISE_HISTORY_PREV);
+                break;
+            case 'B': /* Down */
+                if (linenoiseMenuHasSelection(l))
+                    linenoiseMenuMove(l,1);
+                else
+                    linenoiseEditHistoryNext(l,LINENOISE_HISTORY_NEXT);
+                break;
+            case 'C': /* Right */
+                linenoiseEditMoveRight(l);
+                break;
+            case 'D': /* Left */
+                linenoiseEditMoveLeft(l);
+                break;
+            case 'H': /* Home */
+                linenoiseEditMoveHome(l);
+                break;
+            case 'F': /* End */
+                linenoiseEditMoveEnd(l);
+                break;
+            }
+        }
+        l->escape_len = 0;
+        return linenoiseEditMore;
+    }
+}
+
+/* Finish a UTF-8 character whose lead byte was seen in an earlier call.
+ * utf8_len always describes initialized bytes; incomplete input is never
+ * passed to linenoiseEditInsert(). */
+static char *linenoiseEditUTF8(struct linenoiseState *l) {
+    while (l->utf8_len < l->utf8_need) {
+        int rc = linenoiseReadByte(l,l->utf8_buf+l->utf8_len);
+        if (rc != 1) return rc == 0 ? linenoiseEditMore : NULL;
+        l->utf8_len++;
+    }
+
+    {
+        size_t len = l->utf8_need;
+        l->utf8_len = l->utf8_need = 0;
+        if (linenoiseEditInsert(l,l->utf8_buf,len)) return NULL;
+    }
+    return linenoiseEditMore;
+}
 
 /* This function is part of the multiplexed API of linenoise, see the top
  * comment on linenoiseEditStart() for more information. Call this function
@@ -1946,9 +2175,11 @@ char *linenoiseEditMore = "If you see this, you are misusing the API: when linen
  * On special conditions, NULL is returned and errno is populated:
  *
  * EAGAIN if the user pressed Ctrl-C
+ * ECANCELED if the user pressed lone Esc in nonblocking mode
  * ENOENT if the user pressed Ctrl-D
  *
- * Some other errno: I/O error.
+ * Ctrl-C and lone Esc leave the current draft intact. Some other errno:
+ * I/O error.
  */
 char *linenoiseEditFeed(struct linenoiseState *l) {
     /* Not a TTY, pass control to line reading without character
@@ -1956,20 +2187,25 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
     if (!isatty(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return linenoiseNoTTY();
 
     char c;
-    int nread;
-    char seq[3];
+    int rc;
 
-    nread = read(l->ifd,&c,1);
-    if (nread < 0) {
-        return (errno == EAGAIN || errno == EWOULDBLOCK) ? linenoiseEditMore : NULL;
-    } else if (nread == 0) {
-        return NULL;
-    }
+    /* Finish parser work before consuming a new key. These states can only
+     * become visible across calls in nonblocking mode (or if the caller
+     * changes the mode in the middle of a sequence). */
+    if (l->in_paste) return linenoiseEditPaste(l);
+    if (l->escape_len) return linenoiseEditEscape(l);
+    if (l->utf8_len) return linenoiseEditUTF8(l);
+
+    rc = linenoiseReadByte(l,&c);
+    if (rc == 0) return linenoiseEditMore;
+    if (rc < 0) return NULL;
 
     /* Only autocomplete when the callback is set. completeLine()
      * returns the character to be handled next, or zero when the
-     * key was consumed to navigate completions. */
-    if ((l->in_completion || c == 9 /* TAB */) && completionCallback != NULL) {
+     * key was consumed to navigate completions. In nonblocking mode ESC
+     * remains available as an explicit cancellation key. */
+    if ((l->in_completion || c == 9 /* TAB */) && completionCallback != NULL &&
+        !(l->nonblocking && c == ESC)) {
         int retval = completeLine(l,c);
         /* Read next character when 0 */
         if (retval == 0) return linenoiseEditMore;
@@ -2053,95 +2289,22 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
         break;
     case ESC:    /* escape sequence */
-        /* Read the next two bytes representing the escape sequence.
-         * Use two calls to handle slow terminals returning the two
-         * chars at different times. */
-        if (read(l->ifd,seq,1) == -1) break;
-        if (read(l->ifd,seq+1,1) == -1) break;
-
-        /* ESC [ sequences. */
-        if (seq[0] == '[') {
-            if (seq[1] >= '0' && seq[1] <= '9') {
-                char param[8];
-                size_t plen = 1;
-                char final = 0;
-
-                param[0] = seq[1];
-                while (plen < sizeof(param)) {
-                    char p;
-                    if (read(l->ifd,&p,1) != 1) break;
-                    if (p >= '0' && p <= '9') {
-                        param[plen++] = p;
-                    } else {
-                        final = p;
-                        break;
-                    }
-                }
-                if (final == '~') {
-                    if (plen == 1 && param[0] == '3') {
-                        linenoiseEditDelete(l);
-                    } else if (plen == 3 && memcmp(param,"200",3) == 0) {
-                        linenoiseEditPaste(l);
-                    }
-                }
-            } else {
-                switch(seq[1]) {
-                case 'A': /* Up */
-                    if (linenoiseMenuHasSelection(l))
-                        linenoiseMenuMove(l,-1);
-                    else
-                        linenoiseEditHistoryNext(l, LINENOISE_HISTORY_PREV);
-                    break;
-                case 'B': /* Down */
-                    if (linenoiseMenuHasSelection(l))
-                        linenoiseMenuMove(l,1);
-                    else
-                        linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
-                    break;
-                case 'C': /* Right */
-                    linenoiseEditMoveRight(l);
-                    break;
-                case 'D': /* Left */
-                    linenoiseEditMoveLeft(l);
-                    break;
-                case 'H': /* Home */
-                    linenoiseEditMoveHome(l);
-                    break;
-                case 'F': /* End*/
-                    linenoiseEditMoveEnd(l);
-                    break;
-                }
-            }
-        }
-
-        /* ESC O sequences. */
-        else if (seq[0] == 'O') {
-            switch(seq[1]) {
-            case 'H': /* Home */
-                linenoiseEditMoveHome(l);
-                break;
-            case 'F': /* End*/
-                linenoiseEditMoveEnd(l);
-                break;
-            }
-        }
-        break;
+        l->escape_buf[0] = ESC;
+        l->escape_len = 1;
+        return linenoiseEditEscape(l);
     default:
-        /* Handle UTF-8 multi-byte sequences. When we receive the first byte
-         * of a multi-byte UTF-8 character, read the remaining bytes to
-         * complete the sequence before inserting. */
+        /* Retain incomplete UTF-8 sequences rather than inserting the
+         * uninitialized tail of a temporary stack array on timeout/EOF. */
         {
-            char utf8[4];
-            int utf8len = utf8ByteLen(c);
-            utf8[0] = c;
-            if (utf8len > 1) {
-                /* Read remaining bytes of the UTF-8 sequence. */
-                int i;
-                for (i = 1; i < utf8len; i++) {
-                    if (read(l->ifd, utf8+i, 1) != 1) break;
-                }
+            size_t utf8len = (size_t)utf8ByteLen(c);
+            if (utf8len == 1) {
+                if (linenoiseEditInsert(l,&c,1)) return NULL;
+            } else {
+                l->utf8_buf[0] = c;
+                l->utf8_len = 1;
+                l->utf8_need = utf8len;
+                return linenoiseEditUTF8(l);
             }
-            if (linenoiseEditInsert(l, utf8, utf8len)) return NULL;
         }
         break;
     case CTRL_U: /* Ctrl+u, delete the whole line. */
@@ -2180,6 +2343,9 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
  * returns something different than NULL. At this point the user input
  * is in the buffer, and we can restore the terminal in normal mode. */
 void linenoiseEditStop(struct linenoiseState *l) {
+    /* Parser storage belongs to the editing session even when the input was
+     * a non-TTY or setup failed part way through. */
+    linenoiseParserClear(l);
     if (!isatty(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return;
     if (l->menu_rows && !mlmode) {
         linenoiseMenuCallback *mc = menuCallback;
@@ -2214,7 +2380,16 @@ static char *linenoiseBlockingEdit(int stdin_fd, int stdout_fd, const char *prom
         return NULL;
     }
     l.buflen_max = LINENOISE_MAX_LINE;
-    while((res = linenoiseEditFeed(&l)) == linenoiseEditMore);
+    while (1) {
+        errno = 0;
+        res = linenoiseEditFeed(&l);
+        if (res == linenoiseEditMore) continue;
+        /* Esc cancels an outer operation in event-driven clients. The
+         * traditional blocking line reader has no such outer operation, so
+         * it must keep editing rather than mistaking cancellation for EOF. */
+        if (res == NULL && errno == ECANCELED) continue;
+        break;
+    }
     linenoiseEditStop(&l);
     free(l.buf);
     return res;

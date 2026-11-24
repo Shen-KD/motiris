@@ -214,7 +214,10 @@ description: Save, restore and reset built-in automatic UUID sessions.
 # Motiris sessions
 The index is `session/session.json`; traces are `session/session-<uuid>.json`
 under MOTIRIS_HOME. REPL turns save automatically. Use `/save`, `/load` and
-`/new`; Gateway restores by chat_id. Reasoning side-channel text is not traced.
+`/new`; Gateway restores by chat_id. During generation Enter queues up to 32
+lines (64 KiB total); Esc/Ctrl+C cancels without clearing the draft or queue.
+Queued text is traced only when dispatched; drafts are never traced. Reasoning
+side-channel text is not traced.
 EOF
   write_default "$CFG_DIR/skills/motiris-context-compaction/SKILL.md" <<'EOF'
 ---

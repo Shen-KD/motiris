@@ -39,6 +39,8 @@ struct MotirisAgent {
   int stream;
   void (*on_delta)(const char *, void *);
   void *delta_ud;
+  void (*on_final)(const char *, void *);
+  void *final_ud;
   void (*on_reasoning)(const char *, void *);
   void *reasoning_ud;
   char reasoning_effort[8];
@@ -215,6 +217,8 @@ void motiris_set_stream(MotirisAgent *a, int on) { a->stream = !!on; }
 int motiris_stream_enabled(MotirisAgent *a) { return a->stream; }
 void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                            void *ud) { a->on_delta = cb; a->delta_ud = ud; }
+void motiris_set_final_cb(MotirisAgent *a, void (*cb)(const char *, void *),
+                          void *ud) { a->on_final = cb; a->final_ud = ud; }
 void motiris_set_reasoning_cb(MotirisAgent *a,
                               void (*cb)(const char *, void *), void *ud) {
   a->on_reasoning = cb;
@@ -1069,7 +1073,8 @@ int motiris_run(MotirisAgent *a) {
       return 0;
     }
     if (content && *content) {
-      if (!delta_seen && a->print_answer) printf("%s\n", content);
+      if (!delta_seen && a->on_final) a->on_final(content, a->final_ud);
+      else if (!delta_seen && a->print_answer) printf("%s\n", content);
     } else if (!finish || strcmp(finish, "stop"))
       fprintf(stderr, "[motiris] warning: model stopped without output\n");
     if (a->goal_check && !confirm_asked) {

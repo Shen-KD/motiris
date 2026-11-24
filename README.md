@@ -164,8 +164,10 @@ motiris --sessions [TERM]                                # list/search logs
 # repl (-i): / lists commands; ↑/↓ select, Enter runs, /exit leaves
 # commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM]
 #           /save /load /config /approval /reasoning /thinking /hotkey /exit
-# Ctrl+C during a reply cancels generation, keeps the user instruction,
-# discards partial assistant/tool messages, and accepts a follow-up instruction
+# During a reply, keep typing: Enter queues lines in FIFO order (32 / 64 KiB).
+# Queued turns and slash commands run automatically; Enter never interrupts.
+# Esc/Ctrl+C cancels generation without clearing the draft or queued input.
+# Cancellation keeps the user instruction and discards partial assistant/tools.
 # interactive turns auto-save to ~/.motiris/session/session-<uuid>.json
 # token-protected: MOTIRIS_GATEWAY_TOKEN=sekret motiris --gateway :8899
 ```
@@ -248,8 +250,13 @@ fail closed without executing the tool.
 
 REPL streaming prints a final answer once: the agent suppresses the aggregated
 copy only when the selected backend actually delivered text deltas, while buffered,
-echo and spawned-curl fallback still print their final message. Goal-check
-confirmation deltas are staged silently so a streamed `DONE` is not exposed.
+echo and spawned-curl fallback still print their final message. On a TTY the
+incremental line editor stays active during generation. The main thread owns the
+terminal, input FIFO and cards; a joinable worker owns only the agent run and
+sends bounded output events back for rendering. `motiris_set_final_cb` routes a
+buffered aggregate through that same path. Non-TTY input retains the synchronous
+REPL. Goal-check confirmation deltas are staged silently so a streamed `DONE`
+is not exposed.
 If a provider fails after emitting text, the run returns the error instead of
 mixing that partial text with another provider's answer.
 

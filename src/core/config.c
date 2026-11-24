@@ -431,7 +431,10 @@ int motiris_init_config(void) {
     "REPL turns save automatically. Use /save to save now, /load for an indexed\n"
     "restore into an empty context, and /new to start a fresh UUID without carrying\n"
     "approval grants. Gateway sessions restore and reset by chat_id. Use the session\n"
-    "tools for legacy checkpoint logs. Never put reasoning side-channel text in traces.\n";
+    "tools for legacy checkpoint logs. During generation Enter queues up to 32 lines\n"
+    "(64 KiB total); Esc/Ctrl+C cancels without clearing the draft or queue. Queued\n"
+    "text is traced only when dispatched; unsubmitted drafts are never traced.\n"
+    "Never put reasoning side-channel text in traces.\n";
   static const char compaction_skill_template[] =
     "---\nname: motiris-context-compaction\n"
     "description: Configure optional deterministic bounded context compaction.\n---\n"
