@@ -226,8 +226,11 @@ def main():
         # unsubmitted and intact.
         repl.output.clear()
         repl.send("\x1b")
-        cancelled = repl.read_until("generation cancelled")
-        assert "unfinished draft" in cancelled, cancelled
+        repl.read_until("generation cancelled")
+        # Cancellation is printed before the preserved draft is redrawn; wait
+        # for that separate terminal update instead of assuming one read has
+        # already captured both writes.
+        repl.read_until("unfinished draft")
         repl.read_until("queued-after-cancel")
         deadline = time.monotonic() + 2
         while len(provider.requests) < 4 and time.monotonic() < deadline:

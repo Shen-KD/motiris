@@ -120,11 +120,16 @@ def test_repl_autosave(env):
     try:
         read_until(master, b"motiris>")
         os.write(master, b"pty user\r")
-        output = read_until(master, b"echo round complete")
-        if output.rfind(b"motiris>") < output.find(b"echo round complete"):
-            read_until(master, b"motiris>")
-        # The checkpoint is flushed before the next prompt.  Stop the PTY
-        # child here rather than depending on terminal-specific Enter keys.
+        read_until(master, b"echo round complete")
+        # The asynchronous TTY path keeps the prompt editable while a worker
+        # finishes, so a redrawn prompt is not a checkpoint barrier. Wait for
+        # the atomic snapshot itself before stopping the PTY child.
+        sessions = home / ".local/share/motiris/sessions"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if list(sessions.glob("*.log")) or proc.poll() is not None:
+                break
+            time.sleep(0.02)
         proc.terminate()
         proc.wait(timeout=5)
     finally:
