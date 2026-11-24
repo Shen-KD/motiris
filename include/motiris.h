@@ -130,6 +130,10 @@ void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
  * answer, allowing terminal/UI hosts to serialize output with their prompts. */
 void motiris_set_final_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                           void *ud);
+/* Diagnostic sink for verbose/warning lines. Without a callback they retain
+ * their stderr behavior; terminal workers can serialize them with UI output. */
+void motiris_set_diagnostic_cb(MotirisAgent *a, void (*cb)(const char *, void *),
+                               void *ud);
 /* Provider-supplied reasoning is a side channel: it is never appended to
  * canonical assistant content, history or checkpoints. */
 void motiris_set_reasoning_cb(MotirisAgent *a,

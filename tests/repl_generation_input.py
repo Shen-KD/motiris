@@ -27,6 +27,7 @@ class Provider(ThreadingHTTPServer):
         self.condition = threading.Condition()
         self.release_first = False
         self.release_third = False
+        self.release_buffered_flag = False
 
     def wait_release(self, third=False):
         with self.condition:
@@ -43,6 +44,18 @@ class Provider(ThreadingHTTPServer):
                 self.release_first = True
             self.condition.notify_all()
 
+    def wait_buffered(self):
+        with self.condition:
+            while not self.release_buffered_flag:
+                self.condition.wait(timeout=15)
+                if not self.release_buffered_flag:
+                    return
+
+    def release_buffered(self):
+        with self.condition:
+            self.release_buffered_flag = True
+            self.condition.notify_all()
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
@@ -53,6 +66,18 @@ class Handler(BaseHTTPRequestHandler):
         request = json.loads(body)
         self.server.requests.append(request)
         call = len(self.server.requests)
+        if call == 7:
+            self.server.wait_buffered()
+            body = json.dumps({"choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "buffered-visible"},
+            }]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
@@ -76,8 +101,11 @@ class Handler(BaseHTTPRequestHandler):
                 delta("-third-discarded")
             elif call == 4:
                 delta("queued-after-cancel")
-            else:
+            elif call == 5:
                 delta("draft-answer")
+            else:
+                delta("screen-one")
+                delta("-screen-two")
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -85,17 +113,65 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Repl:
-    def __init__(self, env):
+    def __init__(self, env, extra_args=()):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execve(str(BIN), [str(BIN), "-i", "--no-tools", "--no-plugin",
                                  "--max-steps", "1", "--transport", "libcurl",
                                  "--model", "generation-input", "--base-url",
-                                 env["URL"]], env)
+                                 env["URL"], *extra_args], env)
         self.output = bytearray()
 
     def plain(self):
         return ANSI.sub("", self.output.decode(errors="replace")).replace("\r", "")
+
+    def visible_lines(self):
+        """Apply the cursor/erasure sequences used by linenoise to the screen."""
+        data = self.output.decode(errors="replace")
+        rows = {}
+        row = col = 0
+        i = 0
+        while i < len(data):
+            if data[i] == "\x1b" and i + 1 < len(data) and data[i + 1] == "[":
+                match = re.match(r"\x1b\[([0-9;?]*)([@-~])", data[i:])
+                if match:
+                    params, final = match.groups()
+                    if params.startswith("?"):
+                        i += len(match.group(0))
+                        continue
+                    amount = int(params.split(";")[0] or "1")
+                    if final == "A":
+                        row = max(0, row - amount)
+                    elif final == "B":
+                        row += amount
+                    elif final == "C":
+                        col += amount
+                    elif final == "D":
+                        col = max(0, col - amount)
+                    elif final == "K":
+                        line = rows.get(row, {})
+                        if params in ("", "0"):
+                            line = {key: value for key, value in line.items()
+                                    if key < col}
+                        elif params == "1":
+                            line = {key: value for key, value in line.items()
+                                    if key > col}
+                        elif params == "2":
+                            line = {}
+                        rows[row] = line
+                    i += len(match.group(0))
+                    continue
+            if data[i] == "\r":
+                col = 0
+            elif data[i] == "\n":
+                row += 1
+            elif data[i] >= " ":
+                rows.setdefault(row, {})[col] = data[i]
+                col += 1
+            i += 1
+        return ["".join(rows.get(r, {}).get(c, " ")
+                       for c in range(max(rows.get(r, {}), default=-1) + 1))
+                for r in range(max(rows) + 1)] if rows else []
 
     def read_until(self, needle, timeout=10):
         deadline = time.monotonic() + timeout
@@ -254,10 +330,52 @@ def main():
 
         repl.send("/exit\r")
         repl.wait_exit()
+        visible = "\n".join(repl.visible_lines())
+        assert "draft-answer" in visible, visible
+
+        # With no concurrent editing, consecutive deltas must remain one
+        # visible answer after the final prompt and exit redraws.
+        repl.close()
+        repl = Repl(env, ("-v",))
+        repl.read_until("motiris> ")
+        repl.output.clear()
+        repl.send("screen instruction\r")
+        repl.read_until("-screen-two")
+        repl.send("/exit\r")
+        repl.wait_exit()
+        lines = repl.visible_lines()
+        visible = "\n".join(lines)
+        assert "screen-one-screen-two" in visible, visible
+        assert "screen-one-screen-two[motiris]" not in visible, visible
+        assert any(line.startswith("[motiris] response:") for line in lines), visible
+
+        # Buffered verbose diagnostics are emitted while the idle prompt is
+        # visible. They must use the same serialized renderer as the answer,
+        # not write directly over the prompt from the worker.
+        repl.close()
+        repl = Repl(env, ("-v", "--no-stream"))
+        repl.read_until("motiris> ")
+        repl.output.clear()
+        repl.send("buffered screen\r")
+        repl.read_until("motiris> ")
+        deadline = time.monotonic() + 2
+        while len(provider.requests) < 7 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert len(provider.requests) == 7, len(provider.requests)
+        provider.release_buffered()
+        repl.read_until("buffered-visible")
+        repl.send("/exit\r")
+        repl.wait_exit()
+        lines = repl.visible_lines()
+        visible = "\n".join(lines)
+        assert "buffered-visible" in visible, visible
+        assert "motiris> [motiris] response" not in visible, visible
+        assert any(line.startswith("[motiris] response:") for line in lines), visible
         print("repl-generation-input: live editing, FIFO, Esc interrupt and draft preservation passed")
     finally:
         provider.release()
         provider.release(third=True)
+        provider.release_buffered()
         if repl:
             repl.close()
         provider.shutdown()

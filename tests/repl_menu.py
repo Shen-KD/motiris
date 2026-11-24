@@ -180,6 +180,19 @@ def main():
             repl.send("\x15")
             repl.read_until("motiris> ")
 
+            # Idle Escape dismisses Tab completion without applying the
+            # highlighted command to the next typed character.
+            repl.send("/s")
+            repl.read_until("list available skills [TERM]")
+            repl.send("\t")
+            repl.read_until("motiris> /sessions")
+            repl.send("\x1b")
+            # The dismissal redraw restores the two-column `/s` cursor.
+            repl.read_until(b"\r\x1b[11C")
+            repl.send("x\r")
+            output = plain(repl.read_until("unknown command: /sx"))
+            assert "/sessionsx" not in output, output
+
             repl.send("/hotkey\r")
             output = plain(repl.read_until("clear the screen"))
             for text in ("interactive keys", "select a command", "enter",

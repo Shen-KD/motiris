@@ -10,6 +10,7 @@
  */
 #include "motiris.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,8 @@ struct MotirisAgent {
   void *delta_ud;
   void (*on_final)(const char *, void *);
   void *final_ud;
+  void (*on_diagnostic)(const char *, void *);
+  void *diagnostic_ud;
   void (*on_reasoning)(const char *, void *);
   void *reasoning_ud;
   char reasoning_effort[8];
@@ -72,6 +75,29 @@ struct MotirisAgent {
   cJSON *run_start;       /* latest user turn; never evicted during its run */
   int history_error;
 };
+
+static void agent_diagnostic(MotirisAgent *a, const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  if (!a->on_diagnostic) {
+    vfprintf(stderr, format, ap);
+    va_end(ap);
+    return;
+  }
+  va_list measure;
+  va_copy(measure, ap);
+  int length = vsnprintf(NULL, 0, format, measure);
+  va_end(measure);
+  if (length >= 0) {
+    char *message = malloc((size_t)length + 1);
+    if (message) {
+      vsnprintf(message, (size_t)length + 1, format, ap);
+      a->on_diagnostic(message, a->diagnostic_ud);
+      free(message);
+    }
+  }
+  va_end(ap);
+}
 
 /* transport.c */
 char *motiris_transport_send(const char *backend, const char *url,
@@ -166,6 +192,11 @@ MotirisAgent *motiris_new(void) {
                                      HISTORY_MAX_MESSAGES, HISTORY_MAX_MESSAGES);
   a->replay_max_bytes = env_limit("MOTIRIS_REPLAY_MAX_BYTES",
                                   HISTORY_MAX_BYTES, HISTORY_MAX_BYTES);
+  /* Validate on the creating thread. transport.c applies the same setting
+   * silently per request so worker threads never write configuration warnings
+   * directly over an interactive prompt. */
+  (void)env_limit("MOTIRIS_RESPONSE_MAX_BYTES",
+                  HISTORY_MAX_BYTES, HISTORY_MAX_BYTES);
   a->tools_on = 1;
   a->plugins_on = 1;
   const char *gc = getenv("MOTIRIS_GOAL_CHECK");
@@ -219,6 +250,11 @@ void motiris_set_stream_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                            void *ud) { a->on_delta = cb; a->delta_ud = ud; }
 void motiris_set_final_cb(MotirisAgent *a, void (*cb)(const char *, void *),
                           void *ud) { a->on_final = cb; a->final_ud = ud; }
+void motiris_set_diagnostic_cb(MotirisAgent *a,
+                               void (*cb)(const char *, void *), void *ud) {
+  a->on_diagnostic = cb;
+  a->diagnostic_ud = ud;
+}
 void motiris_set_reasoning_cb(MotirisAgent *a,
                               void (*cb)(const char *, void *), void *ud) {
   a->on_reasoning = cb;
@@ -440,8 +476,8 @@ static size_t drop_oldest_turn(MotirisAgent *a, cJSON *active,
   while (a->messages->child != end)
     cJSON_Delete(cJSON_DetachItemFromArray(a->messages, 0));
   if (a->verbose)
-    fprintf(stderr, "[motiris] history retention: evicted %zu messages, %zu bytes\n",
-            count, bytes);
+    agent_diagnostic(a, "[motiris] history retention: evicted %zu messages, %zu bytes\n",
+                     count, bytes);
   *dropped_bytes = bytes;
   return count;
 }
@@ -659,8 +695,8 @@ static cJSON *replay_start(MotirisAgent *a, int *ok) {
   if (a->verbose && start != first) {
     size_t total = 0;
     for (cJSON *m = first; m; m = m->next) total++;
-    fprintf(stderr, "[motiris] replay retention: sending %zu of %zu messages, %zu bytes\n",
-            count, total, bytes);
+    agent_diagnostic(a, "[motiris] replay retention: sending %zu of %zu messages, %zu bytes\n",
+                     count, total, bytes);
   }
   *ok = 1;
   return start;
@@ -851,8 +887,8 @@ int motiris_run(MotirisAgent *a) {
         key = default_key;
       }
       if (a->verbose)
-        fprintf(stderr, "[motiris] step %lu: %s via %s\n", step + 1, model,
-                a->nproviders > 0 ? pname(a, pi) : "default provider");
+        agent_diagnostic(a, "[motiris] step %lu: %s via %s\n", step + 1, model,
+                         a->nproviders > 0 ? pname(a, pi) : "default provider");
 
       char *body = build_request(a, model);
       if (!body) return 1;
@@ -901,15 +937,15 @@ int motiris_run(MotirisAgent *a) {
         sprintf(last_err, "transport error: %s", err ? err : "(unknown)");
         free(err);
         if (a->verbose && a->nproviders > 0)
-          fprintf(stderr, "[motiris] provider %s failed: %s\n",
-                  pname(a, pi), last_err);
+          agent_diagnostic(a, "[motiris] provider %s failed: %s\n",
+                           pname(a, pi), last_err);
         /* Any visible provider output cannot be mixed with a fallback. */
         if (delta_seen || reasoning_seen) break;
         continue;
       }
       if (a->verbose) {
-        fprintf(stderr, "[motiris] response: %.200s%s\n", resp,
-                strlen(resp) > 200 ? "..." : "");
+        agent_diagnostic(a, "[motiris] response: %.200s%s\n", resp,
+                         strlen(resp) > 200 ? "..." : "");
       }
 
       j = cJSON_Parse(resp);
@@ -932,8 +968,8 @@ int motiris_run(MotirisAgent *a) {
         cJSON_Delete(j);
         j = NULL;
         if (a->verbose && a->nproviders > 0)
-          fprintf(stderr, "[motiris] provider %s failed: %s\n",
-                  pname(a, pi), last_err);
+          agent_diagnostic(a, "[motiris] provider %s failed: %s\n",
+                           pname(a, pi), last_err);
         if (delta_seen || reasoning_seen) break;
         continue;
       }
@@ -1038,8 +1074,8 @@ int motiris_run(MotirisAgent *a) {
           if (!allowed) {
             result = string_result("error: tool call denied by approval policy");
           } else {
-            if (a->verbose) fprintf(stderr, "[motiris] tool call: %s(%s)\n",
-                                            name, args ? args : "");
+            if (a->verbose) agent_diagnostic(a, "[motiris] tool call: %s(%s)\n",
+                                             name, args ? args : "");
             result = t->call(args ? args : "{}", t->ud);
             if (!result) result = string_result(
                 "error: tool returned nothing");
@@ -1076,7 +1112,7 @@ int motiris_run(MotirisAgent *a) {
       if (!delta_seen && a->on_final) a->on_final(content, a->final_ud);
       else if (!delta_seen && a->print_answer) printf("%s\n", content);
     } else if (!finish || strcmp(finish, "stop"))
-      fprintf(stderr, "[motiris] warning: model stopped without output\n");
+      agent_diagnostic(a, "[motiris] warning: model stopped without output\n");
     if (a->goal_check && !confirm_asked) {
       /* one confirmation round: ask the model whether the goal is met;
        * it may reply DONE or keep working (tools included), bounded by

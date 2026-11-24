@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <strings.h>
 
 #include <linenoise.h>
@@ -69,23 +70,27 @@ static const char *const CMDS_DESC[] = {
 
 /* Automatic full-turn checkpoint id (tty only). */
 static char *sess_id = NULL;
-static volatile sig_atomic_t generation_interrupted;
-static volatile sig_atomic_t terminal_hangup;
+/* Lock-free C11 atomics are valid for both signal flags and worker visibility;
+ * volatile sig_atomic_t alone does not synchronize the two REPL threads. */
+static _Atomic int generation_interrupted;
+static _Atomic int terminal_hangup;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "REPL signal handlers require lock-free int atomics");
 
 static void generation_sigint(int sig) {
   (void)sig;
-  generation_interrupted = 1;
+  atomic_store_explicit(&generation_interrupted, 1, memory_order_relaxed);
 }
 
 static void terminal_sighup(int sig) {
   (void)sig;
-  terminal_hangup = 1;
-  generation_interrupted = 1;
+  atomic_store_explicit(&terminal_hangup, 1, memory_order_relaxed);
+  atomic_store_explicit(&generation_interrupted, 1, memory_order_relaxed);
 }
 
 static int generation_cancelled(void *ud) {
   (void)ud;
-  return generation_interrupted != 0;
+  return atomic_load_explicit(&generation_interrupted, memory_order_relaxed);
 }
 
 /* Raw linenoise editing handles Ctrl+C itself. During a model run the
@@ -95,7 +100,7 @@ static int run_interruptible(MotirisAgent *a) {
   struct sigaction action = {0}, previous;
   action.sa_handler = generation_sigint;
   sigemptyset(&action.sa_mask);
-  generation_interrupted = 0;
+  atomic_store_explicit(&generation_interrupted, 0, memory_order_relaxed);
   if (sigaction(SIGINT, &action, &previous) != 0) return motiris_run(a);
   motiris_set_cancel_cb(a, generation_cancelled, NULL);
   int rc = motiris_run(a);
@@ -173,11 +178,11 @@ typedef struct {
   int active;
 } CardTerminal;
 
-static volatile sig_atomic_t card_interrupted;
+static _Atomic int card_interrupted;
 
 static void card_sigint(int sig) {
   (void)sig;
-  card_interrupted = 1;
+  atomic_store_explicit(&card_interrupted, 1, memory_order_relaxed);
 }
 
 static int card_terminal_start(CardTerminal *terminal) {
@@ -193,7 +198,7 @@ static int card_terminal_start(CardTerminal *terminal) {
   struct sigaction action = {0};
   action.sa_handler = card_sigint;
   sigemptyset(&action.sa_mask);
-  card_interrupted = 0;
+  atomic_store_explicit(&card_interrupted, 0, memory_order_relaxed);
   if (sigaction(SIGINT, &action, &terminal->sigint)) {
     tcsetattr(STDIN_FILENO, TCSANOW, &terminal->termios);
     return 0;
@@ -217,14 +222,15 @@ static int card_read_key(void) {
   unsigned char c;
   ssize_t n = read(STDIN_FILENO, &c, 1);
   if (n < 0 && errno == EINTR)
-    return card_interrupted ? 'q' : 0;
+    return atomic_load_explicit(&card_interrupted, memory_order_relaxed) ? 'q' : 0;
   if (n < 0) return 'q';
   if (n == 0) {
     struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
     if (poll(&pfd, 1, 0) > 0 &&
         (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) return 'q';
   }
-  if (n <= 0) return card_interrupted ? 'q' : 0;
+  if (n <= 0)
+    return atomic_load_explicit(&card_interrupted, memory_order_relaxed) ? 'q' : 0;
   if (c == 3 || c == 'q' || c == 'Q') return 'q';
   if (c == '\r' || c == '\n') return '\n';
   if (c == 's' || c == 'S') return 's';
@@ -883,7 +889,8 @@ typedef enum {
   REPL_UI_DELTA,
   REPL_UI_REASONING,
   REPL_UI_FINAL,
-  REPL_UI_TOOL
+  REPL_UI_TOOL,
+  REPL_UI_DIAGNOSTIC
 } ReplUiEventType;
 
 typedef struct {
@@ -938,6 +945,7 @@ typedef struct {
   int sigint_installed;
   int sighup_installed;
   int hidden;
+  int output_needs_newline;
   int exiting;
   int color;
 } ReplTTY;
@@ -988,9 +996,12 @@ static int repl_async_init(ReplAsync *async, MotirisAgent *agent) {
 
 static void repl_async_wake(ReplAsync *async) {
   unsigned char byte = 0;
-  if (write(async->pipefd[1], &byte, 1) < 0) {
-    /* A full pipe is already a pending wakeup; EINTR is harmless here. */
-  }
+  ssize_t written;
+  do {
+    written = write(async->pipefd[1], &byte, 1);
+  } while (written < 0 && errno == EINTR);
+  /* A full pipe is already a pending wakeup. Other descriptor errors are
+   * handled by the main loop's poll/HUP path. */
 }
 
 static void repl_async_destroy(ReplAsync *async) {
@@ -1077,6 +1088,10 @@ static void repl_async_final(const char *text, void *ud) {
   repl_async_text(ud, REPL_UI_FINAL, text);
 }
 
+static void repl_async_diagnostic(const char *text, void *ud) {
+  repl_async_text(ud, REPL_UI_DIAGNOSTIC, text);
+}
+
 static void repl_async_reasoning(const char *text, void *ud) {
   ReplAsync *async = ud;
   if (!motiris_thinking_visible(async->agent)) return;
@@ -1155,7 +1170,7 @@ static MotirisApprovalDecision repl_async_approval(const char *name,
 
 static int repl_async_cancelled(void *ud) {
   (void)ud;
-  return generation_interrupted != 0;
+  return atomic_load_explicit(&generation_interrupted, memory_order_relaxed);
 }
 
 static void *repl_async_worker(void *ud) {
@@ -1253,6 +1268,7 @@ static void repl_tty_show(ReplTTY *tty) {
   fflush(stdout);
   repl_tty_output_mode(0);
   tty->hidden = 0;
+  tty->output_needs_newline = 0;
   linenoiseShow(&tty->editor);
   /* Keep an empty idle prompt byte-compatible with linenoiseEditStart(). */
   if (!tty->editor.len && !tty->editor.menu_rows &&
@@ -1272,9 +1288,15 @@ static void repl_tty_render_event(ReplTTY *tty, const ReplUiEvent *event) {
     printf(C_DIM);
     fwrite(event->text, 1, event->len, stdout);
     printf(C_RESET);
-  } else if (event->type == REPL_UI_TOOL) {
-    fwrite(event->text, 1, event->len, stdout);
-    printf("\n");
+  } else if (event->type == REPL_UI_TOOL ||
+             event->type == REPL_UI_DIAGNOSTIC) {
+    if (tty->output_needs_newline) {
+      printf("\n");
+      tty->output_needs_newline = 0;
+    }
+    fwrite(event->text, 1, event->len,
+           event->type == REPL_UI_DIAGNOSTIC ? stderr : stdout);
+    if (event->type == REPL_UI_TOOL) printf("\n");
   } else {
     if (state->reasoning_active) {
       printf(C_RESET "\n");
@@ -1282,6 +1304,9 @@ static void repl_tty_render_event(ReplTTY *tty, const ReplUiEvent *event) {
     }
     fwrite(event->text, 1, event->len, stdout);
   }
+  tty->output_needs_newline = event->type != REPL_UI_TOOL &&
+                              event->len && event->text[event->len - 1] != '\n';
+  fflush(stderr);
   fflush(stdout);
 }
 
@@ -1296,7 +1321,9 @@ static void repl_tty_drain_events(ReplTTY *tty) {
     repl_tty_render_event(tty, &event);
     free(event.text);
   }
-  if (rendered) repl_tty_show(tty);
+  /* Do not overwrite an unfinished answer with the prompt. The next key
+   * restores the editor on a fresh line; turn completion does the same. */
+  if (rendered && !tty->worker_active) repl_tty_show(tty);
 }
 
 static void repl_tty_answer_approval(ReplTTY *tty) {
@@ -1427,7 +1454,7 @@ static void repl_tty_dispatch(ReplTTY *tty) {
   tty->tokens_in = motiris_tokens_in(tty->agent);
   tty->tokens_out = motiris_tokens_out(tty->agent);
   clock_gettime(CLOCK_MONOTONIC, &tty->started);
-  generation_interrupted = 0;
+  atomic_store_explicit(&generation_interrupted, 0, memory_order_relaxed);
   repl_async_prepare_run(&tty->async);
   int rc = pthread_create(&tty->worker, NULL, repl_async_worker, &tty->async);
   if (rc != 0) {
@@ -1526,17 +1553,18 @@ static int repl_tty_loop(MotirisAgent *a, ReplState *state,
   struct sigaction action = {0};
   action.sa_handler = generation_sigint;
   sigemptyset(&action.sa_mask);
-  generation_interrupted = 0;
+  atomic_store_explicit(&generation_interrupted, 0, memory_order_relaxed);
   if (sigaction(SIGINT, &action, &tty.previous_sigint) == 0)
     tty.sigint_installed = 1;
   action.sa_handler = terminal_sighup;
-  terminal_hangup = 0;
+  atomic_store_explicit(&terminal_hangup, 0, memory_order_relaxed);
   if (sigaction(SIGHUP, &action, &tty.previous_sighup) == 0)
     tty.sighup_installed = 1;
 
   motiris_set_stream_cb(a, repl_async_delta, &tty.async);
   motiris_set_reasoning_cb(a, repl_async_reasoning, &tty.async);
   motiris_set_final_cb(a, repl_async_final, &tty.async);
+  motiris_set_diagnostic_cb(a, repl_async_diagnostic, &tty.async);
   motiris_set_print_answer(a, 0);
   motiris_set_approval_callback(a, repl_async_approval, &tty.async);
   motiris_set_tool_hook(a, repl_async_tool, &tty.async);
@@ -1544,7 +1572,8 @@ static int repl_tty_loop(MotirisAgent *a, ReplState *state,
   while (!tty.exiting) {
     /* Do not dispatch more queued work after a terminal hangup, including
      * when an approval/config card was the reader that observed the EOF. */
-    if (terminal_hangup || repl_tty_input_hup()) {
+    if (atomic_load_explicit(&terminal_hangup, memory_order_relaxed) ||
+        repl_tty_input_hup()) {
       tty.exiting = 1;
       continue;
     }
@@ -1584,6 +1613,10 @@ static int repl_tty_loop(MotirisAgent *a, ReplState *state,
       continue;
     }
     if (fds[0].revents & POLLIN) {
+      if (tty.hidden) {
+        if (tty.output_needs_newline) printf("\n");
+        repl_tty_show(&tty);
+      }
       errno = 0;
       char *line = linenoiseEditFeed(&tty.editor);
       if (line == linenoiseEditMore) {
@@ -1591,7 +1624,16 @@ static int repl_tty_loop(MotirisAgent *a, ReplState *state,
       } else if (line) {
         repl_tty_accept(&tty, line);
       } else if (errno == EAGAIN || errno == ECANCELED) {
-        if (tty.worker_active) generation_interrupted = 1;
+        if (tty.worker_active) {
+          atomic_store_explicit(&generation_interrupted, 1, memory_order_relaxed);
+        } else if (errno == ECANCELED && tty.editor.in_completion) {
+          /* Nonblocking Escape bypasses completeLine so it can cancel a
+           * worker. At idle it must still dismiss the highlighted completion
+           * without applying it to the next key. */
+          tty.editor.in_completion = 0;
+          repl_tty_hide(&tty);
+          repl_tty_show(&tty);
+        }
       } else {
         int error = errno;
         if (error && error != ENOENT && error != EIO) {
@@ -1608,12 +1650,14 @@ static int repl_tty_loop(MotirisAgent *a, ReplState *state,
       tty.exiting = 1;
   }
 
-  generation_interrupted = 1;
+  atomic_store_explicit(&generation_interrupted, 1, memory_order_relaxed);
   repl_async_request_shutdown(&tty.async);
   if (tty.worker_active) {
     pthread_join(tty.worker, NULL);
-    tty.worker_active = 0;
+    /* Drain while worker_active still suppresses prompt redraw. The normal
+     * finish path below establishes the fresh-line boundary exactly once. */
     repl_tty_drain_events(&tty);
+    tty.worker_active = 0;
     repl_tty_save_history(&tty);
     repl_tty_hide(&tty);
     repl_tty_finish_turn(&tty, tty.async.run_rc);

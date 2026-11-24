@@ -166,14 +166,19 @@ exclusively owns terminal I/O, line editing/history, slash commands, cards and
 post-run token/session/checkpoint access. Non-TTY and unsupported-terminal
 paths retain the synchronous loop.
 
-Worker callbacks deep-copy answer/final/reasoning/tool events into a bounded
-128-event/256-KiB queue (4-KiB text chunks, condition-variable backpressure)
-and wake the main thread through a nonblocking, close-on-exec self-pipe. The
-main thread hides/reshows the prompt around ordered rendering and temporarily
-restores `OPOST` while hidden so newlines do not staircase. The aggregated
-`motiris_set_final_cb` path covers echo, spawned-curl and `--no-stream`
+Worker callbacks deep-copy answer/final/reasoning/tool/diagnostic events into
+a bounded 128-event/256-KiB queue (4-KiB text chunks, condition-variable
+backpressure) and wake the main thread through a nonblocking, close-on-exec
+self-pipe. The
+main thread hides the prompt while writing ordered output, then restores the
+current draft on a fresh line at the next key or turn boundary instead of
+overwriting an unfinished answer. It temporarily restores `OPOST` while hidden
+so newlines do not staircase. The aggregated `motiris_set_final_cb` path covers
+echo, spawned-curl and `--no-stream`
 answers without a direct core stdout write. The callback replaces only that
-buffered print; streamed deltas still suppress the aggregate.
+buffered print; streamed deltas still suppress the aggregate. Core verbose and
+warning lines likewise use `motiris_set_diagnostic_cb` in the asynchronous TTY,
+while other hosts retain their default stderr diagnostics.
 
 Enter accepts at most 32 lines/64 KiB into a local FIFO. It never implicitly
 cancels or edits an already-sent provider request. Queued ordinary input is
@@ -184,7 +189,9 @@ process `umask`. Unsubmitted drafts stay only in the editor. Raw Ctrl+C and a
 lone Escape request the existing cooperative cancel flag without clearing the
 draft/FIFO; after join, rollback and session finalization, the next line runs
 automatically. Arbitrary tool calls still cannot be forcibly interrupted.
-Escape/UTF-8/bracketed-paste parsers retain partial state across bounded reads.
+Lock-free C11 atomics give cancellation flags signal/cross-thread visibility,
+and self-pipe writes retry `EINTR`. Escape/UTF-8/bracketed-paste parsers retain
+partial state across bounded reads.
 
 Approval is a condition-variable handoff: the worker waits while the main
 thread runs the existing card as sole input reader, then resumes with the
@@ -193,7 +200,8 @@ requests cancellation, joins the worker and restores signals/termios. No
 `pthread_cancel`, concurrent linenoise access or concurrent Agent getters are
 allowed. `tests/repl_generation_input.py` covers live editing, FIFO natural
 continuation, local-command ordering, lone-Esc cancellation, exact user
-history and draft preservation; existing cancel/cards/menu/render tests cover
+history, draft preservation and final-screen answer visibility across buffered
+and consecutive streamed deltas; existing cancel/cards/menu/render tests cover
 Ctrl+C, approval arbitration and non-TTY compatibility.
 
 ### Provider routing, single rendering and bounded responses
@@ -233,7 +241,8 @@ response duplicate remains bounded by the existing response/receive limits and
 adds no retained global or per-session metadata.
 
 `MOTIRIS_RESPONSE_MAX_BYTES` configures `C` from 1 through 16 MiB (default and
-hard maximum 16 MiB). Invalid values warn and use the default. Buffered
+hard maximum 16 MiB). Invalid values warn at Agent construction and use the
+default, avoiding direct worker-thread diagnostics. Buffered
 libcurl and spawned-curl bodies, each SSE line, aggregate content and each
 tool-argument string retain at most `C` bytes plus a private NUL; total SSE
 wire input is at most `4*C` to include JSON/framing, and at most 256 tool calls
