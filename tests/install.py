@@ -72,6 +72,8 @@ def main():
             assert not (default / "config/plugins/context_compaction/context_compaction.so").exists()
             for name in ("motiris-config", "motiris-session", "motiris-context-compaction"):
                 assert (default / ("config/skills/%s/SKILL.md" % name)).is_file(), name
+            session_skill = (default / "config/skills/motiris-session/SKILL.md").read_text()
+            assert "drafts are never traced" in session_skill, session_skill
             assert "verified before extraction" in result.stdout, result.stdout
 
             selected = root / "selected"

@@ -75,6 +75,18 @@ struct linenoiseState {
     int fold_count;    /* Number of folded ranges. */
     size_t fold_start[LINENOISE_MAX_FOLDS]; /* Folded range start offsets. */
     size_t fold_end[LINENOISE_MAX_FOLDS];   /* Folded range end offsets. */
+    int nonblocking;    /* Bounded incremental reads and Esc cancellation. */
+    char escape_buf[12]; /* Incomplete escape sequence, including ESC. */
+    size_t escape_len;  /* Number of initialized bytes in escape_buf. */
+    char utf8_buf[4];   /* Incomplete UTF-8 sequence. */
+    size_t utf8_len;    /* Number of initialized bytes in utf8_buf. */
+    size_t utf8_need;   /* Total bytes required for the UTF-8 sequence. */
+    int in_paste;       /* Waiting for the bracketed paste terminator. */
+    char *paste_buf;    /* Dynamically allocated partial paste bytes. */
+    size_t paste_cap;   /* Allocated paste_buf capacity. */
+    size_t paste_len;   /* Number of initialized paste_buf bytes. */
+    size_t paste_match; /* Partial match length for ESC[201~. */
+    int paste_overflowed; /* Discard input until the paste terminator. */
 };
 
 typedef struct linenoiseCompletions {
@@ -84,7 +96,13 @@ typedef struct linenoiseCompletions {
 
 /* Non blocking API. */
 int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, char *buf, size_t buflen, const char *prompt);
+/* Switch incremental reads between blocking and 100 ms bounded operation.
+ * In nonblocking mode a lone Esc returns NULL with errno set to ECANCELED. */
+int linenoiseEditSetNonblocking(struct linenoiseState *l, int enabled);
 char *linenoiseEditFeed(struct linenoiseState *l);
+/* Start another draft after Enter without leaving raw mode or repainting.
+ * The editing buffer, its capacity/growth limit, and the prompt are retained. */
+void linenoiseEditNext(struct linenoiseState *l);
 void linenoiseEditStop(struct linenoiseState *l);
 void linenoiseHide(struct linenoiseState *l);
 void linenoiseShow(struct linenoiseState *l);

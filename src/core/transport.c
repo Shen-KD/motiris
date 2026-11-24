@@ -55,12 +55,8 @@ static size_t response_limit(void) {
   if (!s || !*s) return RESPONSE_MAX_BYTES;
   char *end = NULL;
   unsigned long value = strtoul(s, &end, 10);
-  if (!end || *end || end == s || !value || value > RESPONSE_MAX_BYTES) {
-    fprintf(stderr,
-            "motiris: invalid MOTIRIS_RESPONSE_MAX_BYTES=%s; using %u\n",
-            s, RESPONSE_MAX_BYTES);
-    return RESPONSE_MAX_BYTES;
-  }
+  if (!end || *end || end == s || !value || value > RESPONSE_MAX_BYTES)
+    return RESPONSE_MAX_BYTES; /* validated and reported by motiris_new */
   return (size_t)value;
 }
 

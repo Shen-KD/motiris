@@ -19,6 +19,7 @@ MOTIRIS_VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null || echo 0.
 CPPFLAGS += -DMOTIRIS_SHA=\"$(MOTIRIS_SHA)\" -DMOTIRIS_DT=\"$(MOTIRIS_DT)\" \
             -DMOTIRIS_VERSION=\"$(MOTIRIS_VERSION)\"
 LDFLAGS ?= -Wl,-l:libcurl.so.4
+THREAD_FLAGS = -pthread
 PREFIX  ?= /usr/local
 
 FILE_TOOLS ?= 1
@@ -67,7 +68,7 @@ HARNESS_OBJ = $(HARNESS_SRC:.c=.o)
 HDR = include/motiris.h
 
 %.o: %.c $(HDR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(THREAD_FLAGS) -c $< -o $@
 
 src/harness/repl.o src/harness/tts.o: src/harness/tts.h
 src/tools/browser.o src/tools/subagent.o src/tools/childproc.o: \
@@ -99,7 +100,7 @@ motiris: libmotiris_core.a libmotiris_tools.a libmotiris_harness.a \
 		deps/linenoise/linenoise.o \
 		-Wl,--start-group libmotiris_core.a libmotiris_tools.a \
 		libmotiris_harness.a -Wl,--end-group \
-		$(LDFLAGS) -ldl -Wl,--export-dynamic
+		$(LDFLAGS) $(THREAD_FLAGS) -ldl -Wl,--export-dynamic
 	-strip $@
 
 examples/hello_plugin.so: examples/hello_plugin.c include/motiris.h

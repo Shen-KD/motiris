@@ -106,6 +106,8 @@ def test_init_and_persistence(env, config):
     assert data["reasoning_effort"] == "medium", data
     assert data["show_thinking"] is False, data
     assert "motiris set config" in (config / "skills/motiris-config/SKILL.md").read_text()
+    session_skill = (config / "skills/motiris-session/SKILL.md").read_text()
+    assert "unsubmitted drafts are never traced" in session_skill, session_skill
     assert "MOTIRIS_PLUGIN_DIR=%s/plugins" % config in (config / "env").read_text()
 
     before = {path: path.read_bytes() for path in paths}
