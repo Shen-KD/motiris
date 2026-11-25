@@ -90,6 +90,7 @@ OUT=$(MOTIRIS_MODEL=foo-model ./motiris -p hi --transport echo -v 2>&1)
 echo "$OUT" | grep -q 'foo-model via' || { echo FAIL; exit 1; }
 python3 tests/config_set.py
 python3 tests/config_env.py
+python3 tests/model_card_core.py
 python3 tests/install.py
 
 fi

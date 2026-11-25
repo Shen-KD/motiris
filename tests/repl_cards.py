@@ -2,6 +2,7 @@
 """REPL approval/config command and terminal-card regressions."""
 
 import fcntl
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -9,10 +10,12 @@ import pty
 import re
 import select
 import signal
+import stat
 import struct
 import subprocess
 import tempfile
 import termios
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -55,7 +58,8 @@ def test_non_tty_commands(env):
     output = run_pipe(env, [
         "/thinking", "/thinking on", "/thinking off", "/reasoning high",
         "/reasoning", "/approval", "/approval ask", "/approval",
-        "/approval nonsense", "/approval off", "/approval", "/config", "/exit",
+        "/approval nonsense", "/approval off", "/approval", "/config",
+        "/model", "/exit",
     ])
     assert "thinking: on" in output and "thinking: off" in output, output
     assert "reasoning: high" in output, output
@@ -65,6 +69,47 @@ def test_non_tty_commands(env):
     assert "stream: on" in output, output
     assert "max_steps: 0" in output, output
     assert "interactive terminal" in output, output
+    assert "model_id: gpt-4o-mini" in output, output
+    assert "think_mode: provider" in output and "max_tokens: 0" in output, output
+    assert "endpoint: https://api.openai.com/v1/chat/completions" in output, output
+    assert "api_key: (not set)" in output, output
+
+
+def test_model_summary_escapes_terminal_controls(env, home):
+    home = home / "escape-summary"
+    env = environment(home)
+    malicious_model = "model\x1b]0;MODEL_PWN\x07"
+    malicious_endpoint = "http://example.test/v1/chat/completions\x1b]0;URL_PWN\x07"
+    (home / "config" / "config.json").write_text(json.dumps({
+        "model": malicious_model, "base_url": malicious_endpoint,
+    }))
+    proc = subprocess.run(
+        [str(BIN), "-i", "--transport", "echo", "--no-plugin", "-v"],
+        input="/model\nhello\n/exit\n", text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, env=env, timeout=10)
+    assert proc.returncode == 0, proc.stdout
+    raw = proc.stdout.encode()
+    assert b"\x1b]0;MODEL_PWN\x07" not in raw, raw
+    assert b"\x1b]0;URL_PWN\x07" not in raw, raw
+
+
+def test_model_editor_escapes_terminal_controls(env):
+    malicious = "model\x1b]0;EDITOR_PWN\x07"
+    repl = Repl(env, command=[
+        str(BIN), "-i", "--transport", "echo", "--no-plugin", "-m", malicious,
+    ])
+    try:
+        repl.read_until("motiris> ")
+        repl.clear()
+        repl.send("/model\r\r")
+        repl.read_until("Esc: cancel")
+        assert b"\x1b]0;EDITOR_PWN\x07" not in bytes(repl.output), bytes(repl.output)
+        repl.send("\x1bq")
+        repl.read_until("motiris> ")
+        repl.send("/exit\r")
+        repl.read_until("bye")
+    finally:
+        repl.close()
 
 
 def test_non_tty_approval_fails_closed(env):
@@ -189,6 +234,178 @@ def test_config_card(env, home):
         repl.close()
 
 
+class ModelProvider(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self):
+        super().__init__(("127.0.0.1", 0), ModelHandler)
+        self.requests = []
+        self.status = 200
+
+
+class ModelHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body_in = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.server.requests.append({
+            "path": self.path, "body": body_in,
+            "authorization": self.headers.get_all("Authorization") or [],
+        })
+        body = json.dumps({"data": [
+            {"id": "model-alpha"}, {"id": "org/exact:model"},
+        ]}).encode()
+        self.send_response(self.server.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        pass
+
+
+def test_model_card(env, home):
+    provider = ModelProvider()
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    secret = "card-secret-sentinel"
+    endpoint = "http://127.0.0.1:%d/v1/chat/completions" % provider.server_port
+    repl = Repl(env, command=[
+        str(BIN), "-i", "--transport", "libcurl", "--no-plugin",
+        "-b", "http://127.0.0.1:1/v1/chat/completions",
+    ])
+    try:
+        repl.read_until("motiris> ")
+        repl.clear()
+        repl.send("/model\r")
+        initial = plain(repl.read_until("save changes"))
+        for text in ("Model configuration", "model_id:", "gpt-4o-mini",
+                     "think_mode:", "provider", "max_tokens:", "0",
+                     "reasoning:", "endpoint:", "api_key:", "(not set)",
+                     "refresh models", "save changes", "close"):
+            assert text in initial, (text, initial)
+        assert provider.requests == [], "opening /model performed network I/O"
+
+        # Every text field is edited inside the raw card, not through linenoise.
+        repl.send("\r\x15manual-model\r")
+        repl.read_until(re.compile(r"model_id:\s+manual-model"))
+        repl.send("\x1b[B\r")  # think_mode provider -> on
+        repl.read_until(re.compile(r"think_mode:\s+on\b"))
+        repl.send("\x1b[B\r\x154096\r")
+        repl.read_until(re.compile(r"max_tokens:\s+4096\b"))
+        repl.send("\x1b[B\r")  # reasoning provider -> low
+        repl.read_until(re.compile(r"reasoning:\s+low\b"))
+        repl.send("\x1b[B\r\x15" + endpoint + "\r")
+        repl.read_until(re.compile(r"endpoint:\s+http://127\.0\.0\.1:"))
+        repl.send("\x1b[B\r" + secret + "\r")
+        masked = plain(repl.read_until(re.compile(r"api_key:\s+\(set\)")))
+        assert secret not in masked, masked
+        assert provider.requests == [], "editing fields performed network I/O"
+
+        # Closing does not discard a pending session credential: reopening and
+        # saving later must still persist it without retyping.
+        repl.send("q")
+        repl.read_until("motiris> ")
+        repl.clear()
+        repl.send("/model\r")
+        repl.read_until("save changes")
+        assert provider.requests == [], "reopening /model performed network I/O"
+
+        # Only the explicit refresh action performs one authenticated GET.
+        repl.send("\x1b[B" * 6 + "\r")
+        refreshed = plain(repl.read_until("2 models loaded"))
+        assert secret not in refreshed
+        assert len(provider.requests) == 1
+        assert provider.requests[0]["path"] == "/v1/models"
+        assert provider.requests[0]["body"] == b""
+        assert provider.requests[0]["authorization"] == ["Bearer " + secret]
+
+        # Left/right on model_id selects exact IDs returned by the provider.
+        repl.send("\x1b[A" * 6 + "\x1b[C")
+        repl.read_until(re.compile(r"model_id:\s+model-alpha"))
+        repl.send("\x1b[C")
+        repl.read_until(re.compile(r"model_id:\s+org/exact:model"))
+        repl.send("\x1b[B" * 7 + "\r")  # save changes
+        repl.read_until("model configuration saved")
+        repl.read_until("motiris> ")
+        saved = json.loads((home / "config" / "config.json").read_text())
+        assert saved["model"] == "org/exact:model", saved
+        assert saved["think_mode"] == "on" and saved["max_tokens"] == 4096, saved
+        assert saved["reasoning_effort"] == "low", saved
+        assert saved["base_url"] == endpoint and saved["api_key_env"] == "MOTIRIS_API_KEY", saved
+        assert secret not in json.dumps(saved)
+        env_path = home / "config" / "env"
+        assert ("MOTIRIS_API_KEY=" + secret) in env_path.read_text()
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+        assert secret not in plain(repl.output)
+
+        # Reopening is idle; a failed manual refresh is sanitized and bounded.
+        before = len(provider.requests)
+        repl.clear()
+        repl.send("/model\r")
+        repl.read_until("save changes")
+        assert len(provider.requests) == before
+        provider.status = 401
+        repl.send("\x1b[B" * 6 + "\r")
+        failed = plain(repl.read_until("refresh failed: http status 401"))
+        assert secret not in failed and len(failed) < 10000
+        repl.send("q")
+        repl.read_until("motiris> ")
+        repl.send("/exit\r")
+        repl.read_until("bye")
+        assert repl.proc.wait(timeout=5) == 0
+        assert secret not in (home / "history").read_text()
+    finally:
+        repl.close()
+        provider.shutdown()
+        provider.server_close()
+        thread.join(timeout=5)
+
+    # A new process reloads model settings and the mode-0600 env credential.
+    output = run_pipe(env, ["/model", "/exit"])
+    assert "model_id: org/exact:model" in output, output
+    assert "think_mode: on" in output and "max_tokens: 4096" in output, output
+    assert "reasoning: low" in output and "api_key: (set)" in output, output
+    assert secret not in output
+
+
+def test_model_card_failed_save_retains_key(env, home):
+    secret = "retry-secret-sentinel"
+    repl = Repl(env)
+    config = home / "config"
+    try:
+        repl.read_until("motiris> ")
+        repl.send("/model\r")
+        repl.read_until("save changes")
+        repl.send("\x1b[B" * 5 + "\r" + secret + "\r")
+        repl.read_until(re.compile(r"api_key:\s+\(set\)"))
+        config_json = config / "config.json"
+        if config_json.exists():
+            config_json.unlink()
+        config_json.mkdir()  # deterministic regular-file rejection, even for UID 0
+        repl.clear()
+        repl.send("s")
+        failed = plain(repl.read_until("values could not be saved"))
+        assert secret not in failed
+        repl.read_until("motiris> ")
+        assert ("MOTIRIS_API_KEY=" + secret) in (config / "env").read_text()
+        config_json.rmdir()
+        repl.send("/model\r")
+        repl.read_until("save changes")
+        repl.clear()
+        repl.send("s")
+        repl.read_until("model configuration saved")
+        assert ("MOTIRIS_API_KEY=" + secret) in (config / "env").read_text()
+        saved = json.loads((config / "config.json").read_text())
+        assert saved["api_key_env"] == "MOTIRIS_API_KEY", saved
+        repl.read_until("motiris> ")
+        repl.send("/exit\r")
+        repl.read_until("bye")
+    finally:
+        if (config / "config.json").is_dir():
+            (config / "config.json").rmdir()
+        repl.close()
+
+
 def test_approval_card(env):
     # Use one real terminal per decision. Cross-turn grants, /new isolation and
     # allow-once repetition are covered by the direct strict core-nofs tests.
@@ -214,10 +431,14 @@ def main():
     with tempfile.TemporaryDirectory(prefix="motiris-repl-cards-") as tmp:
         env = environment(Path(tmp))
         test_non_tty_commands(env)
+        test_model_summary_escapes_terminal_controls(env, Path(tmp))
+        test_model_editor_escapes_terminal_controls(env)
         test_non_tty_approval_fails_closed(env)
         test_config_card(env, Path(tmp))
+        test_model_card(env, Path(tmp))
+        test_model_card_failed_save_retains_key(env, Path(tmp))
         test_approval_card(env)
-    print("repl-cards: non-TTY commands, both cards and fail-closed approval passed")
+    print("repl-cards: non-TTY commands, config/model cards and fail-closed approval passed")
 
 
 if __name__ == "__main__":

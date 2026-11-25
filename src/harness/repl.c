@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <termios.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -47,7 +48,7 @@
 
 static const char *const CMDS[] = {
   "/help", "/new", "/tools", "/sessions", "/load", "/save", "/resume",
-  "/skills", "/thinking", "/reasoning", "/approval", "/config",
+  "/skills", "/thinking", "/reasoning", "/approval", "/config", "/model",
   "/hotkey", "/exit"
 };
 static const char *const CMDS_DESC[] = {
@@ -63,6 +64,7 @@ static const char *const CMDS_DESC[] = {
   "set reasoning effort [off|low|medium|high]",
   "show or set tool approval [off|ask]",
   "configure this session interactively",
+  "configure model and provider interactively",
   "show interactive key bindings",
   "leave the repl",
 };
@@ -113,7 +115,18 @@ typedef struct {
   MotirisAgent *agent;
   int reasoning_active;
   char *session_id;
+  /* A newly entered credential stays pending across model-card close/reopen
+   * and failed saves. It is cleansed only after complete save or REPL exit. */
+  char *pending_api_key;
 } ReplState;
+
+static void clear_pending_api_key(ReplState *state) {
+  if (!state->pending_api_key) return;
+  size_t length = strlen(state->pending_api_key);
+  memset(state->pending_api_key, 0, length);
+  free(state->pending_api_key);
+  state->pending_api_key = NULL;
+}
 
 static void delta_print(const char *text, void *ud) {
   ReplState *state = ud;
@@ -366,6 +379,302 @@ static void config_card(ReplState *state) {
   }
 }
 
+/* ---------------- default-provider model card ---------------- */
+#define MODEL_CARD_ROWS 9
+#define MODEL_CARD_KEY_MAX 489
+
+typedef struct {
+  cJSON *models;
+  int model_index;
+  char status[160];
+} ModelCard;
+
+static void model_card_status(ModelCard *card, const char *status) {
+  snprintf(card->status, sizeof card->status, "%s", status ? status : "");
+}
+
+static void model_card_clear_models(ModelCard *card) {
+  cJSON_Delete(card->models);
+  card->models = NULL;
+  card->model_index = -1;
+}
+
+static void draw_model_card(MotirisAgent *a, const ModelCard *card,
+                            int selected) {
+  const char *effort = motiris_reasoning_effort(a);
+  char tokens[32], model[96], endpoint[96], status[128];
+  char refresh[64];
+  snprintf(tokens, sizeof tokens, "%d%s", motiris_max_tokens(a),
+           motiris_max_tokens(a) ? "" : " (provider)");
+  clip(model, sizeof model, motiris_model(a) ? motiris_model(a) : "", 72);
+  clip(endpoint, sizeof endpoint, motiris_base_url(a), 72);
+  clip(status, sizeof status, card->status, 100);
+  int count = cJSON_GetArraySize(card->models);
+  if (count > 0) snprintf(refresh, sizeof refresh, "%d models loaded", count);
+  else snprintf(refresh, sizeof refresh, "manual GET /models");
+
+  printf("\033[2J\033[H" C_BOLD "Model configuration" C_RESET "\r\n"
+         "Enter: edit/change  arrows: navigate  s: save  q: close\r\n\r\n");
+  card_row(selected == 0, "model_id:", model);
+  card_row(selected == 1, "think_mode:", motiris_think_mode(a));
+  card_row(selected == 2, "max_tokens:", tokens);
+  card_row(selected == 3, "reasoning:", effort && *effort ? effort : "provider");
+  card_row(selected == 4, "endpoint:", endpoint);
+  card_row(selected == 5, "api_key:",
+           motiris_api_key_configured(a) ? "(set)" : "(not set)");
+  card_row(selected == 6, "refresh models", refresh);
+  card_row(selected == 7, "save changes", "config.json + mode-0600 env");
+  card_row(selected == 8, "close", "keep session values");
+  if (count > 0)
+    printf("\r\nleft/right on model_id: select a fetched model (%s%d/%d)\r\n",
+           card->model_index >= 0 ? "" : "none, ",
+           card->model_index >= 0 ? card->model_index + 1 : 0, count);
+  if (motiris_provider_count(a) > 0)
+    printf(C_YELLOW "default provider only; providers[] fallback is independent"
+           C_RESET "\r\n");
+  printf(C_DIM "%s" C_RESET "\r\n", status);
+  fflush(stdout);
+}
+
+/* Raw-card line editor: q and s remain ordinary input, Escape/Ctrl+C cancels,
+ * Ctrl+U clears and Backspace removes one UTF-8 codepoint. Secrets are never
+ * echoed; an empty secret keeps the existing credential. */
+static int card_edit_text(const char *label, char *value, size_t cap,
+                          int secret) {
+  size_t length = strlen(value);
+  for (;;) {
+    printf("\033[2J\033[H" C_BOLD "Edit %s" C_RESET "\r\n\r\n", label);
+    if (secret) printf("(hidden input, %zu bytes)\r\n", length);
+    else {
+      char display[256];
+      clip(display, sizeof display, value, 200);
+      printf("%s\r\n", display);
+    }
+    printf("\r\nEnter: apply  Ctrl+U: clear  Backspace: delete  Esc: cancel\r\n");
+    if (secret) printf("empty input keeps the current API key\r\n");
+    fflush(stdout);
+
+    unsigned char c;
+    ssize_t n = read(STDIN_FILENO, &c, 1);
+    if (n < 0 && errno == EINTR) {
+      if (atomic_load_explicit(&card_interrupted, memory_order_relaxed)) return 0;
+      continue;
+    }
+    if (n < 0) return 0;
+    if (n == 0) {
+      struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+      if (poll(&pfd, 1, 0) > 0 &&
+          (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) return 0;
+      if (atomic_load_explicit(&card_interrupted, memory_order_relaxed)) return 0;
+      continue;
+    }
+    if (c == 3 || c == 27) return 0;
+    if (c == '\r' || c == '\n') return 1;
+    if (c == 21) { value[0] = '\0'; length = 0; continue; }
+    if (c == 8 || c == 127) {
+      if (length) {
+        length--;
+        while (length && ((unsigned char)value[length] & 0xc0) == 0x80) length--;
+        value[length] = '\0';
+      }
+      continue;
+    }
+    if (c >= 32 && c != 127 && length + 1 < cap) {
+      value[length++] = (char)c;
+      value[length] = '\0';
+    }
+  }
+}
+
+static int model_card_edit_text(MotirisAgent *a, ReplState *state,
+                                ModelCard *card, int field) {
+  char value[2048];
+  value[0] = '\0';
+  size_t cap = 512 + 1;
+  int secret = 0;
+  const char *label = "";
+  if (field == 0) {
+    label = "model_id";
+    snprintf(value, sizeof value, "%s", motiris_model(a));
+  } else if (field == 4) {
+    label = "endpoint";
+    cap = sizeof value;
+    snprintf(value, sizeof value, "%s", motiris_base_url(a));
+  } else {
+    label = "api_key";
+    cap = MODEL_CARD_KEY_MAX + 1;
+    secret = 1;
+  }
+  int accepted = card_edit_text(label, value, cap, secret);
+  if (!accepted || !*value) {
+    if (secret) memset(value, 0, sizeof value);
+    return 0;
+  }
+  if (field == 0) {
+    motiris_set_model(a, value);
+    model_card_status(card, "model updated for this session");
+  } else if (field == 4) {
+    motiris_set_base_url(a, value);
+    model_card_clear_models(card);
+    model_card_status(card, "endpoint updated; refresh to discover models");
+  } else {
+    char *pending = strdup(value);
+    memset(value, 0, sizeof value);
+    if (!pending) {
+      model_card_status(card, "out of memory; API key unchanged");
+      return 0;
+    }
+    clear_pending_api_key(state);
+    state->pending_api_key = pending;
+    motiris_set_api_key(a, state->pending_api_key);
+    model_card_clear_models(card);
+    model_card_status(card, "API key updated without terminal echo");
+  }
+  return 1;
+}
+
+static void model_card_edit_tokens(MotirisAgent *a, ModelCard *card) {
+  char value[32];
+  snprintf(value, sizeof value, "%d", motiris_max_tokens(a));
+  if (!card_edit_text("max_tokens (0 = provider)", value, sizeof value, 0)) return;
+  char *end = NULL;
+  errno = 0;
+  long parsed = strtol(value, &end, 10);
+  if (errno == ERANGE || !end || *end || end == value || parsed < 0 ||
+      parsed > INT_MAX || motiris_set_max_tokens(a, (int)parsed)) {
+    model_card_status(card, "invalid max_tokens; expected 0..2147483647");
+    return;
+  }
+  model_card_status(card, "max_tokens updated for this session");
+}
+
+static void model_card_cycle_think(MotirisAgent *a) {
+  static const char *const modes[] = { "provider", "on", "off" };
+  const char *current = motiris_think_mode(a);
+  int index = 0;
+  for (int i = 0; i < 3; i++)
+    if (!strcmp(current, modes[i])) { index = i; break; }
+  (void)motiris_set_think_mode(a, modes[(index + 1) % 3]);
+}
+
+static void model_card_cycle_reasoning(MotirisAgent *a) {
+  static const char *const efforts[] = { "", "low", "medium", "high" };
+  const char *current = motiris_reasoning_effort(a);
+  int index = 0;
+  for (int i = 0; i < 4; i++)
+    if (!strcmp(current, efforts[i])) { index = i; break; }
+  (void)motiris_set_reasoning_effort(a, efforts[(index + 1) % 4]);
+}
+
+static void model_card_select_model(MotirisAgent *a, ModelCard *card,
+                                    int direction) {
+  int count = cJSON_GetArraySize(card->models);
+  if (!count) {
+    model_card_status(card, "refresh models before using left/right selection");
+    return;
+  }
+  if (card->model_index < 0) card->model_index = direction > 0 ? 0 : count - 1;
+  else card->model_index = (card->model_index + direction + count) % count;
+  const char *id = cJSON_GetStringValue(cJSON_GetArrayItem(
+      card->models, card->model_index));
+  if (id) {
+    motiris_set_model(a, id);
+    model_card_status(card, "fetched model selected for this session");
+  }
+}
+
+static int card_refresh_cancelled(void *ud) {
+  (void)ud;
+  return atomic_load_explicit(&card_interrupted, memory_order_relaxed);
+}
+
+static void model_card_refresh(MotirisAgent *a, ModelCard *card) {
+  model_card_clear_models(card);
+  model_card_status(card, "refreshing models...");
+  draw_model_card(a, card, 6);
+  motiris_set_cancel_cb(a, card_refresh_cancelled, NULL);
+  cJSON *models = motiris_fetch_models(a);
+  motiris_set_cancel_cb(a, NULL, NULL);
+  if (!models) {
+    char message[160];
+    clip(message, sizeof message, motiris_last_error(a), 110);
+    snprintf(card->status, sizeof card->status, "refresh failed: %.140s", message);
+    return;
+  }
+  card->models = models;
+  card->model_index = -1;
+  const char *current = motiris_model(a);
+  int count = cJSON_GetArraySize(models);
+  for (int i = 0; i < count; i++) {
+    const char *id = cJSON_GetStringValue(cJSON_GetArrayItem(models, i));
+    if (id && current && !strcmp(id, current)) { card->model_index = i; break; }
+  }
+  model_card_status(card, "refresh complete; left/right on model_id to select");
+}
+
+static int save_model_card(MotirisAgent *a, ReplState *state) {
+  char tokens[32], effort[16];
+  snprintf(tokens, sizeof tokens, "%d", motiris_max_tokens(a));
+  const char *current = motiris_reasoning_effort(a);
+  snprintf(effort, sizeof effort, "%s", current && *current ? current : "off");
+  int failed = 0;
+  failed += motiris_set_config("model", motiris_model(a)) != 0;
+  failed += motiris_set_config("think_mode", motiris_think_mode(a)) != 0;
+  failed += motiris_set_config("max_tokens", tokens) != 0;
+  failed += motiris_set_config("reasoning_effort", effort) != 0;
+  failed += motiris_set_config("base_url", motiris_base_url(a)) != 0;
+  if (state->pending_api_key) {
+    if (!motiris_set_env("MOTIRIS_API_KEY", state->pending_api_key))
+      failed += motiris_set_config("api_key_env", "MOTIRIS_API_KEY") != 0;
+    else failed++;
+  }
+  if (failed) {
+    printf(C_RED "model configuration: %d values could not be saved" C_RESET "\n",
+           failed);
+    return -1;
+  }
+  printf(C_DIM "model configuration saved" C_RESET "\n");
+  clear_pending_api_key(state);
+  return 0;
+}
+
+static void model_card(ReplState *state) {
+  MotirisAgent *a = state->agent;
+  ModelCard card;
+  memset(&card, 0, sizeof card);
+  card.model_index = -1;
+  model_card_status(&card, "session changes are immediate; s saves settings");
+  CardTerminal terminal;
+  if (!card_terminal_start(&terminal)) return;
+  int selected = 0, save = 0, done = 0;
+  while (!done) {
+    draw_model_card(a, &card, selected);
+    int key = card_read_key();
+    if (key == 'q') break;
+    if (key == 'u') { selected = (selected + MODEL_CARD_ROWS - 1) % MODEL_CARD_ROWS; continue; }
+    if (key == 'd') { selected = (selected + 1) % MODEL_CARD_ROWS; continue; }
+    if (key == 's') { save = 1; break; }
+    if ((key == 'l' || key == 'r') && selected == 0) {
+      model_card_select_model(a, &card, key == 'r' ? 1 : -1);
+      continue;
+    }
+    if (key == 'l' || key == 'r') continue;
+    if (key != '\n') continue;
+
+    if (selected == 0 || selected == 4 || selected == 5)
+      (void)model_card_edit_text(a, state, &card, selected);
+    else if (selected == 1) model_card_cycle_think(a);
+    else if (selected == 2) model_card_edit_tokens(a, &card);
+    else if (selected == 3) model_card_cycle_reasoning(a);
+    else if (selected == 6) model_card_refresh(a, &card);
+    else if (selected == 7) { save = 1; done = 1; }
+    else if (selected == 8) done = 1;
+  }
+  card_terminal_stop(&terminal);
+  if (save) (void)save_model_card(a, state);
+  model_card_clear_models(&card);
+}
+
 static void draw_approval_card(const char *name, const char *args, int selected) {
   static const char *const choices[] = {
     "allow once", "allow for session", "deny"
@@ -589,6 +898,21 @@ static int handle_command(MotirisAgent *a, ReplState *state,
       config_card(state);
     return 0;
   }
+  if (!strcmp(line, "/model")) {
+    const char *effort = motiris_reasoning_effort(a);
+    char model[256], endpoint[256];
+    clip(model, sizeof model, motiris_model(a) ? motiris_model(a) : "", 200);
+    clip(endpoint, sizeof endpoint, motiris_base_url(a), 200);
+    printf("model_id: %s\nthink_mode: %s\nmax_tokens: %d\nreasoning: %s\nendpoint: %s\napi_key: %s\n",
+           model, motiris_think_mode(a), motiris_max_tokens(a),
+           effort && *effort ? effort : "provider", endpoint,
+           motiris_api_key_configured(a) ? "(set)" : "(not set)");
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
+      printf(C_DIM "interactive terminal required to edit model\n" C_RESET);
+    else
+      model_card(state);
+    return 0;
+  }
   if (!strcmp(line, "/tools")) {
     printf("the tool list (shell, time, file/web/memory/skills/subagent,\n");
     printf("browser, MCP <server>:<tool>) is provided to the model each turn;\n");
@@ -701,8 +1025,10 @@ static void print_banner(MotirisAgent *a) {
          ", one tiny binary\n");
 
   const char *m = motiris_model(a);
+  char safe_model[96];
+  clip(safe_model, sizeof safe_model, m && *m ? m : "(none)", 72);
   printf("  " C_BOLD C_GREEN "%-7s" C_RESET " " C_CYAN "%s" C_RESET "\n",
-         "model", m && *m ? m : "(none)");
+         "model", safe_model);
 
   int nsk = motiris_skill_count();
   if (nsk > 0) {
@@ -861,12 +1187,15 @@ static int repl_sync_loop(MotirisAgent *a, ReplState *state,
         fprintf(stderr, C_YELLOW "session checkpoint not saved: %s" C_RESET "\n",
                 error ? error : "snapshot failed");
     }
+    char safe_model[96];
+    clip(safe_model, sizeof safe_model,
+         motiris_model(a) ? motiris_model(a) : "(none)", 72);
     if (di || dout)
       printf(C_DIM "[tokens " C_RESET C_CYAN "↑%ld" C_RESET C_DIM
              " " C_RESET C_GREEN "↓%ld" C_RESET C_DIM
              " · total %ld · %ldms · %s]" C_RESET "\n",
              di, dout, motiris_tokens_in(a) + motiris_tokens_out(a),
-             ms, motiris_model(a));
+             ms, safe_model);
     printf("\n");
   }
   return 0;
@@ -1420,12 +1749,15 @@ static void repl_tty_finish_turn(ReplTTY *tty, int rc) {
       fprintf(stderr, C_YELLOW "session checkpoint not saved: %s" C_RESET "\n",
               error ? error : "snapshot failed");
   }
+  char safe_model[96];
+  clip(safe_model, sizeof safe_model,
+       motiris_model(a) ? motiris_model(a) : "(none)", 72);
   if (di || dout)
     printf(C_DIM "[tokens " C_RESET C_CYAN "↑%ld" C_RESET C_DIM
            " " C_RESET C_GREEN "↓%ld" C_RESET C_DIM
            " · total %ld · %ldms · %s]" C_RESET "\n",
            di, dout, motiris_tokens_in(a) + motiris_tokens_out(a),
-           ms, motiris_model(a));
+           ms, safe_model);
   printf("\n");
 }
 
@@ -1723,5 +2055,6 @@ int motiris_repl(MotirisAgent *a) {
   free(sess_id);
   sess_id = NULL;
   free(state.session_id);
+  clear_pending_api_key(&state);
   return 0;
 }

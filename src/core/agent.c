@@ -79,24 +79,24 @@ struct MotirisAgent {
 };
 
 static void agent_diagnostic(MotirisAgent *a, const char *format, ...) {
-  va_list ap;
+  va_list ap, measure;
   va_start(ap, format);
-  if (!a->on_diagnostic) {
-    vfprintf(stderr, format, ap);
-    va_end(ap);
-    return;
-  }
-  va_list measure;
   va_copy(measure, ap);
   int length = vsnprintf(NULL, 0, format, measure);
   va_end(measure);
-  if (length >= 0) {
-    char *message = malloc((size_t)length + 1);
-    if (message) {
-      vsnprintf(message, (size_t)length + 1, format, ap);
-      a->on_diagnostic(message, a->diagnostic_ud);
-      free(message);
+  if (length < 0) { va_end(ap); return; }
+  char *message = malloc((size_t)length + 1);
+  if (message) {
+    vsnprintf(message, (size_t)length + 1, format, ap);
+    /* Model/provider names and response excerpts can be externally configured.
+     * Keep diagnostic whitespace, but never emit terminal control sequences. */
+    for (char *p = message; *p; p++) {
+      unsigned char c = (unsigned char)*p;
+      if ((c < 32 && c != '\n' && c != '\t') || c == 127) *p = ' ';
     }
+    if (a->on_diagnostic) a->on_diagnostic(message, a->diagnostic_ud);
+    else fputs(message, stderr);
+    free(message);
   }
   va_end(ap);
 }

@@ -1033,10 +1033,24 @@ implements bounded extractive summaries without recursive model calls. Its
 `SKILL.md` is installed with the plugin and updated with behavior changes.
 
 Optional vision: `VISION_TOOLS=1` registers `vision_analyze` through the same
-per-agent registry in CLI, REPL, gateway and cron builds. The optional getters
-`motiris_base_url` / `motiris_api_key` / `motiris_transport_name` expose the
-selected default provider without making the agent struct public. Vision-specific
-`MOTIRIS_VISION_*` overrides are read per call; no global session state is added.
+per-agent registry in CLI, REPL, gateway and cron builds.
+`motiris_base_url` / `motiris_transport_name` expose the selected default
+provider without making the agent struct public; `motiris_api_key` remains
+limited to the optional vision build, while the model card uses only the boolean
+`motiris_api_key_configured` query. Vision-specific `MOTIRIS_VISION_*` overrides
+are read per call; no global session state is added.
+
+The REPL `/model` card edits the default provider through public Agent APIs.
+`think_mode=provider` omits the field, `on`/`off` send a JSON boolean, and
+`max_tokens=0` omits the numeric field. `motiris_fetch_models` is explicit and
+synchronous: it derives `/models`, shares default credential/auth bounds with
+generation, and returns a caller-owned cJSON array. Its bounded libcurl-only GET
+uses no redirect following, a 15-second timeout, a 1 MiB response cap, at most
+128 IDs and 512 bytes per ID. The card owns and frees that array, sanitizes
+terminal rendering and invalidates it on endpoint/key changes or refresh failure.
+Saving uses the existing atomic config editor plus `motiris_set_env`, which
+preserves unrelated env lines and replaces the mode-0600 file atomically without
+printing secrets. Plaintext `api_key` remains an invalid config.json key.
 
 Agent callbacks and run boundaries:
 
@@ -1122,7 +1136,10 @@ lives in plugin.c and is shared with toolscan.
 selected stub has no `fsync`/`rename` imports; the unrelated memory backend
 may still use its own atomic replacement.
 - Smoke #7: exported env precedence plus `set config` typed scalar updates.
-  The offline integration checks JSON escaping, provider/MCP/extension field
+  `tests/model_card_core.py` additionally compiles a strict C probe for
+  think/max-token request serialization and reload, explicit-only `/models`
+  discovery, endpoint/auth/error bounds, cancellation, and atomic mode-0600
+  secret env updates without value logging. The offline integration checks JSON escaping, provider/MCP/extension field
   preservation, mode 0600, HOME fallback, concurrent readers during atomic
   rename, invalid/malformed/non-object/oversized input preservation, FIFO
   rejection without blocking, and cleanup after an actual `RLIMIT_FSIZE`
@@ -1155,6 +1172,13 @@ may still use its own atomic replacement.
   displays all commands in aligned columns without Tab, `/s` and `/se` filter
   to the expected subsets, up/down move a wrapping reverse-video selection and
   Enter accepts it. No-match rows leave arrows on history navigation.
+  `tests/repl_cards.py` drives the `/model` raw-terminal editor through model,
+  think/token/reasoning, endpoint and hidden-key edits, proves zero I/O before
+  Refresh, checks one authenticated GET and exact discovered-ID selection, then
+  verifies config/env persistence, restart reload and sanitized 401 output.
+  Close/reopen and deterministic env-success/config-failure retries retain the
+  pending credential; malicious OSC payloads cover summary, banner, raw editor,
+  verbose diagnostics and terminal-safe rendering without changing stored IDs.
   `/hotkey` prints interactive key bindings, Ctrl-U clears old rows, `/quit`
   fails locally without a model turn, and `/exit` remains the single exit command. A slow-SSE PTY case also sends
   Ctrl+C during generation, verifies the REPL survives and returns its prompt,

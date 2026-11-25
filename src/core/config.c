@@ -5,7 +5,8 @@
  *                environment wins. Parsed (never sourced) - plain text.
  *   config.json  optional JSON: model, base_url, api_key_env,
  *                max_steps, transport, stream, approval, reasoning_effort,
- *                show_thinking, system, plugin_dir, tools, plugins.
+ *                think_mode, max_tokens, show_thinking, system, plugin_dir,
+ *                tools, plugins.
  *
  * Precedence: CLI flags > config.json > env file > built-in defaults.
  * Missing files are fine; run `motiris --init` to generate templates.
@@ -417,10 +418,14 @@ int motiris_init_config(void) {
     "# Motiris configuration\n\n"
     "Use `motiris set config KEY VALUE` or `motiris --config KEY VALUE` for JSON.\n"
     "Keys: stream (boolean), max_steps (0 unlimited or positive), approval (off|ask),\n"
-    "reasoning_effort (off|low|medium|high), show_thinking (boolean),\n"
+    "reasoning_effort (off|low|medium|high), think_mode (provider|on|off),\n"
+    "max_tokens (0 provider default or positive), show_thinking (boolean),\n"
     "workspace_guard (boolean; off permits any OS-accessible path).\n"
-    "In the REPL use /config, /approval, /reasoning and /thinking. Session card\n"
-    "changes are immediate; only the explicit save action persists them.\n"
+    "In the REPL use /config, /model, /approval, /reasoning and /thinking.\n"
+    "Session card changes are immediate; only the explicit save action persists\n"
+    "them. /model edits model_id/endpoint/parameters and performs model discovery\n"
+    "only when Refresh models is selected. API keys stay hidden and are saved\n"
+    "only in the mode-0600 env file, referenced by api_key_env.\n"
     "Compaction keys: context_compaction, compaction_threshold, compaction_keep,\n"
     "compaction_max_chars. Enable compaction only when its optional plugin exists.\n"
     "Skill discovery scans user < workspace < explicit directories. Only title,\n"

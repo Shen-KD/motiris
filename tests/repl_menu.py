@@ -119,7 +119,8 @@ def main():
             lines = terminal_lines(raw)
             for command in ("/help", "/new", "/tools", "/sessions",
                             "/load", "/save", "/resume", "/skills", "/thinking",
-                            "/reasoning", "/approval", "/config", "/hotkey", "/exit"):
+                            "/reasoning", "/approval", "/config", "/model",
+                            "/hotkey", "/exit"):
                 assert command in output, (command, output)
                 assert any(line.startswith("  " + command) for line in lines), (
                     command, lines)
