@@ -113,10 +113,10 @@ typedef struct {
   CancelCtx *cancel;
   Buf line;                       /* one SSE line, including bounded NUL */
   Buf content;                    /* concatenated delta.content */
-  Buf raw;                        /* buffered JSON fallback, before first SSE */
+  Buf raw;                        /* original 200 body / buffered JSON fallback */
   Buf error;                      /* original non-200 response bytes */
   CURL *curl;
-  int saw_sse;
+  int saw_sse, saw_choice, saw_complete;
   size_t received, wire_limit;    /* bounded JSON/SSE framing as well */
   int failed;
   cJSON *tool_calls;              /* array of {id,type,function} */
@@ -125,8 +125,13 @@ typedef struct {
 
 /* parse one "data: {json}" payload: extract delta and aggregate */
 static int stream_handle_data(StreamCtx *s, const char *payload) {
-  cJSON *j = cJSON_Parse(payload);
-  if (!j) return 0;
+  cJSON *j = cJSON_ParseWithOpts(payload, NULL, 1);
+  if (!j || !cJSON_IsObject(j) ||
+      cJSON_GetObjectItemCaseSensitive(j, "error")) {
+    s->failed = 4;
+    cJSON_Delete(j);
+    return -1;
+  }
   cJSON *use = cJSON_GetObjectItemCaseSensitive(j, "usage");
   if (cJSON_IsObject(use)) {
     cJSON_Delete(s->usage);
@@ -134,8 +139,14 @@ static int stream_handle_data(StreamCtx *s, const char *payload) {
   }
   cJSON *choice = cJSON_GetArrayItem(
       cJSON_GetObjectItemCaseSensitive(j, "choices"), 0);
+  if (cJSON_IsObject(choice)) {
+    s->saw_choice = 1;
+    if (cJSON_IsString(cJSON_GetObjectItemCaseSensitive(choice,
+                                                       "finish_reason")))
+      s->saw_complete = 1;
+  }
   cJSON *delta = choice ? cJSON_GetObjectItemCaseSensitive(choice, "delta") : NULL;
-  if (!delta) { cJSON_Delete(j); return 0; }
+  if (!cJSON_IsObject(delta)) { cJSON_Delete(j); return 0; }
 
   const char *reasoning = cJSON_GetStringValue(
       cJSON_GetObjectItemCaseSensitive(delta, "reasoning_content"));
@@ -247,14 +258,16 @@ static int stream_feed(StreamCtx *s, const char *p, size_t n) {
   for (size_t i = 0; i < n; i++) {
     char c = p[i];
     if (c == '\n') {
+      if (s->line.len && s->line.data[s->line.len - 1] == '\r') {
+        s->line.data[--s->line.len] = '\0';
+      }
       const char *line = s->line.data ? s->line.data : "";
       if (!strncmp(line, "data:", 5)) {
         s->saw_sse = 1;
         const char *payload = line + 5;
         while (*payload == ' ') payload++;
-        if (strcmp(payload, "[DONE]") && *payload &&
-            stream_handle_data(s, payload))
-          return -1;
+        if (!strcmp(payload, "[DONE]")) s->saw_complete = 1;
+        else if (*payload && stream_handle_data(s, payload)) return -1;
       }
       s->line.len = 0;
       if (s->line.data) s->line.data[0] = '\0';
@@ -421,15 +434,10 @@ static size_t stream_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
     }
     return n;
   }
-  /* Some OpenAI-compatible endpoints ignore stream:true and return JSON.
-   * Keep a bounded copy only until the first SSE record establishes framing. */
-  if (!s->saw_sse && !s->raw.failed) (void)buf_append(&s->raw, ptr, n);
+  /* Some endpoints ignore stream:true and return JSON. Retain the bounded 200
+   * body after SSE framing too, so protocol failures can report original bytes. */
+  if (!s->raw.failed) (void)buf_append(&s->raw, ptr, n);
   if (stream_feed(s, ptr, n)) return 0;
-  if (s->saw_sse && s->raw.data) {
-    free(s->raw.data);
-    s->raw.data = NULL;
-    s->raw.len = 0;
-  }
   return n;
 }
 
@@ -490,13 +498,14 @@ static char *libcurl_send_stream(const char *url, const char *auth,
       } else {
         size_t n = strlen(curl_easy_strerror(rc)) + 32;
         char *m = malloc(n);
-        snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
+        if (m) snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
         *err = m;
       }
     }
-    if (error_body && http != 200 && !s.error.failed) {
-      *error_body = s.error.data;
-      s.error.data = NULL;
+    Buf *original = http != 200 ? &s.error : &s.raw;
+    if (error_body && !original->failed && original->data) {
+      *error_body = original->data;
+      original->data = NULL;
     }
     free(s.content.data); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
     free(s.line.data); free(s.raw.data); free(s.error.data);
@@ -505,7 +514,7 @@ static char *libcurl_send_stream(const char *url, const char *auth,
   if (http != 200) {
     if (err) {
       char *m = malloc(96);
-      snprintf(m, 96, "http status %ld (stream)", http);
+      if (m) snprintf(m, 96, "http status %ld (stream)", http);
       *err = m;
     }
     if (error_body) {
@@ -527,6 +536,17 @@ static char *libcurl_send_stream(const char *url, const char *auth,
     }
     if (!s.raw.data) s.raw.data = strdup("");
     return s.raw.data;
+  }
+
+  if (!s.saw_choice || !s.saw_complete) {
+    if (err) *err = strdup("invalid stream response");
+    if (error_body && !s.raw.failed && s.raw.data) {
+      *error_body = s.raw.data;
+      s.raw.data = NULL;
+    }
+    free(s.content.data); free(s.line.data); free(s.raw.data); free(s.error.data);
+    cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
+    return NULL;
   }
 
   /* rebuild one complete chat message from the delta aggregates */
@@ -596,6 +616,7 @@ static int write_all(int fd, const char *s) {
   size_t len = strlen(s), off = 0;
   while (off < len) {
     ssize_t n = write(fd, s + off, len - off);
+    if (n < 0 && errno == EINTR) continue;
     if (n <= 0) return -1;
     off += (size_t)n;
   }
@@ -701,7 +722,11 @@ static char *spawn_curl(const char *url, const char *auth,
     free(out);
     return NULL;
   }
-  if (wr < 0) { free(out); return NULL; }
+  if (wr < 0) {
+    if (err) *err = strdup("curl request write failed");
+    free(out);
+    return NULL;
+  }
   long http = 0;
   int have_status = out && strip_spawn_status(out, &http) == 0;
   if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {

@@ -25,6 +25,13 @@ def chat(text):
         "role": "assistant", "content": text}}]})
 
 
+def sse_message(text):
+    return (b"data: " + compact({"choices": [{"delta": {
+        "content": text}}]}) + b"\n\n" +
+        b"data: " + compact({"choices": [{"delta": {},
+        "finish_reason": "stop"}]}) + b"\n\ndata: [DONE]\n\n")
+
+
 class Provider(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -251,6 +258,15 @@ NOFS_PROBE_SOURCE = r'''
 #include <string.h>
 
 static int fake_hits;
+static unsigned int host_delays[8];
+static int host_delay_count;
+
+static int host_wait(unsigned int seconds, void *ud) {
+  (void)ud;
+  if (host_delay_count < 8) host_delays[host_delay_count] = seconds;
+  host_delay_count++;
+  return 0;
+}
 
 static char *copy_text(const char *text) {
   size_t size = strlen(text) + 1;
@@ -304,8 +320,9 @@ char *motiris_transport_get(const char *backend, const char *url,
   return NULL;
 }
 
-static int run_one(int base) {
+static int run_one(int base, int use_host_wait) {
   fake_hits = 0;
+  host_delay_count = 0;
   MotirisAgent *a = motiris_new();
   if (!a) return 90;
   motiris_set_transport(a, "fake");
@@ -313,17 +330,20 @@ static int run_one(int base) {
   motiris_set_tools_enabled(a, 0);
   if (motiris_set_max_retries(a, 2) ||
       motiris_set_retry_base_seconds(a, base)) return 91;
+  if (use_host_wait) motiris_set_retry_wait_cb(a, host_wait, NULL);
   motiris_add_user(a, "strict nofs");
   int rc = motiris_run(a);
-  printf("NOFS base=%d rc=%d hits=%d messages=%d error=%s\n", base, rc,
-         fake_hits, cJSON_GetArraySize(motiris_messages(a)),
-         motiris_last_error(a));
+  printf("NOFS base=%d host=%d rc=%d hits=%d messages=%d delays=", base,
+         use_host_wait, rc, fake_hits, cJSON_GetArraySize(motiris_messages(a)));
+  for (int i = 0; i < host_delay_count; i++)
+    printf("%s%u", i ? "," : "", host_delays[i]);
+  printf(" error=%s\n", motiris_last_error(a));
   motiris_free(a);
   return 0;
 }
 
 int main(void) {
-  if (run_one(0) || run_one(1)) return 1;
+  if (run_one(0, 0) || run_one(1, 1) || run_one(1, 0)) return 1;
   return 0;
 }
 '''
@@ -481,6 +501,43 @@ class ProviderRetryTests(unittest.TestCase):
                                  (0, name + " ok\n"), proc.stderr)
                 self.assertEqual(self.provider.hits[path], 3, proc.stderr)
 
+    def test_strict_json_and_stream_protocol_failures_retry(self):
+        case = self.root / "strict-stream"
+        case.mkdir()
+        trailing = chat("must not accept prefix") + b" trailing-garbage"
+        self.provider.add("/trailing", [(200, trailing),
+                                        (200, chat("strict json ok"))])
+        proc = run_agent(case, {
+            "transport": "libcurl", "stream": False,
+            "base_url": self.provider.url("/trailing"),
+            "max_retries": 1, "retry_base_seconds": 0,
+        })
+        self.assertEqual((proc.returncode, proc.stdout),
+                         (0, "strict json ok\n"), proc.stderr)
+        self.assertEqual(self.provider.hits["/trailing"], 2)
+        self.assertIn(trailing.decode(), proc.stderr)
+
+        malformed = b'data: {"choices":[{"delta":{}}]} trailing\n\n'
+        api_error = b'data: {"error":{"message":"sse failure"}}\n\n'
+        incomplete = b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        for name, failure in (("malformed", malformed), ("api-error", api_error),
+                              ("incomplete", incomplete)):
+            with self.subTest(name=name):
+                path = "/stream-" + name
+                self.provider.add(path, [
+                    (200, failure, "text/event-stream"),
+                    (200, sse_message(name + " recovered"), "text/event-stream"),
+                ])
+                proc = run_agent(case, {
+                    "transport": "libcurl", "stream": True,
+                    "base_url": self.provider.url(path),
+                    "max_retries": 1, "retry_base_seconds": 0,
+                })
+                self.assertEqual((proc.returncode, proc.stdout),
+                                 (0, name + " recovered\n"), proc.stderr)
+                self.assertEqual(self.provider.hits[path], 2, proc.stderr)
+                self.assertIn(failure.decode(), proc.stderr)
+
     def test_backoff_sequence_full_shift_and_cancellation(self):
         case = self.root / "backoff"
         case.mkdir()
@@ -547,6 +604,26 @@ class ProviderRetryTests(unittest.TestCase):
                 self.assertIn("visible-" + name, proc.stdout + proc.stderr)
                 self.assertIn("attempt 1/4", proc.stderr)
 
+    def test_hidden_reasoning_failure_still_retries(self):
+        case = self.root / "hidden-reasoning"
+        case.mkdir()
+        hidden = (b"data: " + compact({"choices": [{"delta": {
+            "reasoning_content": "hidden-reasoning-sentinel"}}]}) + b"\n\n")
+        self.provider.add("/hidden-reasoning", [
+            (200, hidden, "text/event-stream", True),
+            (200, sse_message("visible answer recovered"), "text/event-stream"),
+        ])
+        proc = run_agent(case, {
+            "transport": "libcurl", "stream": True, "show_thinking": False,
+            "base_url": self.provider.url("/hidden-reasoning"),
+            "max_retries": 1, "retry_base_seconds": 0,
+        })
+        self.assertEqual((proc.returncode, proc.stdout),
+                         (0, "visible answer recovered\n"), proc.stderr)
+        self.assertEqual(self.provider.hits["/hidden-reasoning"], 2, proc.stderr)
+        self.assertNotIn("hidden-reasoning-sentinel", proc.stdout)
+        self.assertIn(hidden.decode(), proc.stderr)
+
     def test_strict_nofs_zero_delay_and_positive_delay_behavior(self):
         source = self.root / "provider_retry_nofs.c"
         binary = self.root / "provider-retry-nofs"
@@ -561,9 +638,12 @@ class ProviderRetryTests(unittest.TestCase):
         proc = subprocess.run([str(binary)], cwd=ROOT, text=True,
                               capture_output=True, timeout=5)
         self.assertEqual(proc.returncode, 0, (proc.stdout, proc.stderr))
-        self.assertIn("NOFS base=0 rc=0 hits=3 messages=2", proc.stdout)
+        self.assertIn("NOFS base=0 host=0 rc=0 hits=3 messages=2 delays=",
+                      proc.stdout)
+        self.assertIn("NOFS base=1 host=1 rc=0 hits=3 messages=2 delays=1,2",
+                      proc.stdout)
         self.assertIn("nofs ok", proc.stdout)
-        self.assertIn("NOFS base=1 rc=1 hits=1 messages=1 "
+        self.assertIn("NOFS base=1 host=0 rc=1 hits=1 messages=1 delays= "
                       "error=retry backoff unavailable without host I/O",
                       proc.stdout)
 
@@ -628,6 +708,30 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout)
         self.assertEqual(self.provider.hits["/raw-repl"], 1)
         self.assertEqual(proc.stdout.count(text_body.decode()), 1, proc.stdout)
+
+        # Exercise the real async diagnostic callback, chunking and PTY renderer.
+        from repl_cards import Repl, plain
+        large_body = b"raw-pty-begin\n" + b"Q" * 9000 + b"\nraw-pty-end\n"
+        self.provider.add("/raw-pty", [(500, large_body)])
+        env = agent_environment(case, {
+            "transport": "libcurl", "stream": True,
+            "base_url": self.provider.url("/raw-pty"),
+        })
+        repl = Repl(env, command=[
+            str(BINARY), "-i", "--no-tools", "--no-plugin", "--max-steps", "1",
+        ])
+        try:
+            repl.read_until("motiris> ")
+            repl.clear()
+            repl.send("retry route\r")
+            output = plain(repl.read_until("raw-pty-end", timeout=10))
+            self.assertIn(large_body.decode().rstrip("\n"), output)
+            self.assertEqual(self.provider.hits["/raw-pty"], 1)
+            repl.read_until("motiris> ", timeout=10)
+            repl.send("/exit\r")
+            repl.read_until("bye")
+        finally:
+            repl.close()
 
         for name, body in (("api", json_body), ("malformed", text_body)):
             path = "/raw-200-" + name

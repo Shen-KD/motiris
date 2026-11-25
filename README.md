@@ -249,12 +249,14 @@ HTTP statuses, invalid JSON/API errors and missing/null choices or messages
 all retry while no answer or reasoning delta is visible. Only after those
 attempts are exhausted does the next configured provider run. Every failed
 attempt, including the final one and `max_retries=0`, emits its diagnostic and
-the exact original response body (JSON, text or other bytes up to the response
-cap), or the transport error when no body exists. Delays and waits are
-cancellation-aware. Once answer/reasoning text has streamed, the run remains
-fail-closed without retry or fallback so partial answers are never mixed.
-Strict no-filesystem builds support immediate retries only; a positive delay
-fails explicitly instead of busy-waiting.
+the exact original NUL-free JSON/text response body up to the response cap, or
+the transport error when no body exists. Delays and waits are cancellation-aware.
+Once answer or visibly enabled reasoning text has streamed, the run remains
+fail-closed without retry or fallback so partial answers are never mixed;
+hidden reasoning alone does not suppress recovery. Strict no-filesystem builds
+support immediate retries directly and positive delays through
+`motiris_set_retry_wait_cb`; without that host callback a positive delay fails
+explicitly instead of busy-waiting.
 
 SSE streaming is on by default (`--no-stream` opts out), and `max_steps=0`
 means unlimited steps. `reasoning_effort` selects `off`, `low`, `medium` or

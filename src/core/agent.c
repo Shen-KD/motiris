@@ -58,6 +58,8 @@ struct MotirisAgent {
   int thinking_visible;
   MotirisCancelCallback *cancel;
   void *cancel_ud;
+  MotirisRetryWaitCallback *retry_wait_cb;
+  void *retry_wait_ud;
   int tools_on, plugins_on;
   int goal_check;
   int approval_required;
@@ -292,6 +294,11 @@ void motiris_set_cancel_cb(MotirisAgent *a, MotirisCancelCallback *cb, void *ud)
   a->cancel = cb;
   a->cancel_ud = ud;
 }
+void motiris_set_retry_wait_cb(MotirisAgent *a, MotirisRetryWaitCallback *cb,
+                               void *ud) {
+  a->retry_wait_cb = cb;
+  a->retry_wait_ud = ud;
+}
 static int run_cancelled(const MotirisAgent *a) {
   return a->cancel && a->cancel(a->cancel_ud);
 }
@@ -304,6 +311,7 @@ int retry_wait(MotirisAgent *a, unsigned int seconds);
  * failure, and -2 when positive delays are unavailable in the no-I/O build. */
 static int retry_wait(MotirisAgent *a, unsigned int seconds) {
   if (!seconds) return run_cancelled(a) ? 1 : 0;
+  if (a->retry_wait_cb) return a->retry_wait_cb(seconds, a->retry_wait_ud);
 #ifdef MOTIRIS_NO_FILESYSTEM
   (void)a;
   return -2;  /* C11 has no non-busy sleep; never spin behind the host's back. */
@@ -350,11 +358,14 @@ typedef struct {
   void (*cb)(const char *, void *);
   void *ud;
   int seen;
+  int visible;
 } ReasoningForward;
 
 static void forward_reasoning(const char *text, void *ud) {
   ReasoningForward *forward = ud;
-  if (text && *text) forward->seen = 1;
+  /* Hidden reasoning is still delivered for host-side observers, but it cannot
+   * make a partial answer visible and therefore must not suppress retries. */
+  if (text && *text && forward->visible) forward->seen = 1;
   forward->cb(text, forward->ud);
 }
 void motiris_set_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud) {
@@ -1027,18 +1038,32 @@ static int cancel_run(MotirisAgent *a, cJSON *run_tail,
   return MOTIRIS_RUN_CANCELLED;
 }
 
+static char *attempt_error(const char *prefix, const char *detail) {
+  if (!detail) detail = "(unknown)";
+  size_t prefix_len = strlen(prefix), detail_len = strlen(detail);
+  if (detail_len > (size_t)-1 - prefix_len - 1) return NULL;
+  char *message = malloc(prefix_len + detail_len + 1);
+  if (message) {
+    memcpy(message, prefix, prefix_len);
+    memcpy(message + prefix_len, detail, detail_len + 1);
+  }
+  return message;
+}
+
 static void report_attempt_failure(MotirisAgent *a, const char *provider,
                                    int attempt, const char *failure,
                                    const char *raw_body) {
+  if (!failure) failure = "out of memory";
   agent_diagnostic(a, "[motiris] provider %s attempt %d/%d failed: %s\n",
                    provider, attempt + 1, a->max_retries + 1, failure);
   /* Raw provider bytes must not pass through the terminal sanitizer or a
    * printf conversion. Hosts receive the same callback stream as other
    * diagnostics, so asynchronous renderers retain their serialization. */
-  const char *output = raw_body && *raw_body ? raw_body : failure;
-  agent_raw_diagnostic(a, output);
-  size_t length = strlen(output);
-  if (!length || output[length - 1] != '\n') agent_raw_diagnostic(a, "\n");
+  if (raw_body && *raw_body) {
+    agent_raw_diagnostic(a, raw_body);
+    size_t length = strlen(raw_body);
+    if (raw_body[length - 1] != '\n') agent_raw_diagnostic(a, "\n");
+  }
 }
 
 int motiris_run(MotirisAgent *a) {
@@ -1130,7 +1155,7 @@ int motiris_run(MotirisAgent *a) {
         char *error_body = NULL;
         DeltaForward forward = { a->on_delta, a->delta_ud, 0 };
         ReasoningForward reasoning = {
-          a->on_reasoning, a->reasoning_ud, 0
+          a->on_reasoning, a->reasoning_ud, 0, a->thinking_visible
         };
         char *resp = a->stream
             ? motiris_transport_send_stream(
@@ -1155,8 +1180,7 @@ int motiris_run(MotirisAgent *a) {
         }
         if (!resp) {
           free(last_err);
-          last_err = malloc((err ? strlen(err) : 0) + 32);
-          sprintf(last_err, "transport error: %s", err ? err : "(unknown)");
+          last_err = attempt_error("transport error: ", err);
           report_attempt_failure(a, provider, attempt, last_err, error_body);
           free(err);
           free(error_body);
@@ -1166,7 +1190,7 @@ int motiris_run(MotirisAgent *a) {
         }
 
         free(error_body);
-        j = cJSON_Parse(resp);
+        j = cJSON_ParseWithOpts(resp, NULL, 1);
         if (!j) {
           free(last_err);
           last_err = sdup("cannot parse model response");
@@ -1183,8 +1207,7 @@ int motiris_run(MotirisAgent *a) {
                     cJSON_GetObjectItemCaseSensitive(errj, "message"))
               : cJSON_GetStringValue(errj);
           free(last_err);
-          last_err = malloc((em ? strlen(em) : 0) + 16);
-          sprintf(last_err, "api error: %s", em ? em : "(unknown)");
+          last_err = attempt_error("api error: ", em);
           report_attempt_failure(a, provider, attempt, last_err, resp);
           cJSON_Delete(j);
           j = NULL;

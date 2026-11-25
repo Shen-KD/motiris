@@ -169,6 +169,13 @@ void motiris_append_system(MotirisAgent *a, const char *text);
  * it reads a flag set by a host signal handler. */
 typedef int (MotirisCancelCallback)(void *ud);
 void motiris_set_cancel_cb(MotirisAgent *a, MotirisCancelCallback *cb, void *ud);
+/* Optional host backoff for platforms without a core clock/sleep facility.
+ * Return 0 after waiting, 1 for cancellation, or a negative value on failure.
+ * POSIX hosts default to monotonic sleep; no-filesystem hosts need this callback
+ * for positive retry delays. Zero-delay retries never invoke it. */
+typedef int (MotirisRetryWaitCallback)(unsigned int seconds, void *ud);
+void motiris_set_retry_wait_cb(MotirisAgent *a, MotirisRetryWaitCallback *cb,
+                               void *ud);
 enum MotirisRunResult {
   MOTIRIS_RUN_OK = 0,
   MOTIRIS_RUN_ERROR = 1,

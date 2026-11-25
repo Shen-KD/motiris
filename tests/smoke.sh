@@ -115,7 +115,7 @@ OUT=$(MOTIRIS_HOME="$TH8" ./motiris -p hi --transport libcurl --max-steps 1 -v 2
 kill $MOCKPID 2>/dev/null
 rm -rf "$TH8"
 echo "$OUT" | grep -q 'fallback ok' || { echo "FAIL: $OUT"; exit 1; }
-echo "$OUT" | grep -q 'provider dead failed' || { echo "FAIL: dead not attempted"; exit 1; }
+echo "$OUT" | grep -q 'provider dead attempt 1/1 failed' || { echo "FAIL: dead not attempted"; exit 1; }
 python3 tests/provider.py
 python3 tests/provider_retry.py
 

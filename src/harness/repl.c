@@ -1431,7 +1431,8 @@ typedef enum {
   REPL_UI_REASONING,
   REPL_UI_FINAL,
   REPL_UI_TOOL,
-  REPL_UI_DIAGNOSTIC
+  REPL_UI_DIAGNOSTIC,
+  REPL_UI_DIAGNOSTIC_CONT
 } ReplUiEventType;
 
 typedef struct {
@@ -1630,7 +1631,16 @@ static void repl_async_final(const char *text, void *ud) {
 }
 
 static void repl_async_diagnostic(const char *text, void *ud) {
-  repl_async_text(ud, REPL_UI_DIAGNOSTIC, text);
+  if (!text) return;
+  size_t remaining = strlen(text);
+  ReplUiEventType type = REPL_UI_DIAGNOSTIC;
+  while (remaining) {
+    size_t len = remaining > REPL_UI_CHUNK ? REPL_UI_CHUNK : remaining;
+    if (repl_async_push(ud, type, text, len) != 0) return;
+    text += len;
+    remaining -= len;
+    type = REPL_UI_DIAGNOSTIC_CONT;
+  }
 }
 
 static void repl_async_reasoning(const char *text, void *ud) {
@@ -1830,13 +1840,15 @@ static void repl_tty_render_event(ReplTTY *tty, const ReplUiEvent *event) {
     fwrite(event->text, 1, event->len, stdout);
     printf(C_RESET);
   } else if (event->type == REPL_UI_TOOL ||
-             event->type == REPL_UI_DIAGNOSTIC) {
-    if (tty->output_needs_newline) {
+             event->type == REPL_UI_DIAGNOSTIC ||
+             event->type == REPL_UI_DIAGNOSTIC_CONT) {
+    if (tty->output_needs_newline &&
+        event->type != REPL_UI_DIAGNOSTIC_CONT) {
       printf("\n");
       tty->output_needs_newline = 0;
     }
     fwrite(event->text, 1, event->len,
-           event->type == REPL_UI_DIAGNOSTIC ? stderr : stdout);
+           event->type == REPL_UI_TOOL ? stdout : stderr);
     if (event->type == REPL_UI_TOOL) printf("\n");
   } else {
     if (state->reasoning_active) {

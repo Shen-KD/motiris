@@ -272,12 +272,15 @@ default-provider authentication, real fallback order, exactly zero/one
 Authorization headers per request, and default/entry 489/490-byte boundaries.
 `tests/provider_retry.py` covers configurable additional attempts per provider,
 base/2*base/4*base monotonic backoff, cancellation, exhaustion and fallback
-ordering for transport, HTTP, JSON/API and missing/null response failures. It
-requires exact original JSON/text bodies on every failed attempt across
-buffered, streamed and spawned-curl paths, including a diagnostic callback,
-REPL serialization and spawned-curl status-trailer budget boundaries. Visible
-answer/reasoning deltas forbid both retry and fallback. A strict C11 nofs probe
-allows zero-delay retries but rejects positive waits without host time/I/O;
+ordering for transport, HTTP, strict JSON/API and missing/null response
+failures, plus malformed/error-only/incomplete SSE. It requires exact original
+NUL-free JSON/text bodies on every failed attempt across buffered, streamed and
+spawned-curl paths. A real-PTY response larger than `REPL_UI_CHUNK` proves the
+async diagnostic queue/render path inserts no bytes between continuation
+events; spawned-curl status-trailer budget boundaries are also covered. Visible
+answer/reasoning deltas forbid retry and fallback, while hidden reasoning does
+not. A strict C11 nofs probe covers immediate retries, host-callback positive
+waits and explicit failure when no wait facility exists.
 `make test-provider-retry` runs the complete offline suite.
 A later overlong entry rejects the whole chain before an earlier healthy
 provider can perform I/O, without leaking the key. `tests/transport.py`
