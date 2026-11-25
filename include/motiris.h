@@ -28,7 +28,11 @@ const char *motiris_model(MotirisAgent *a);         /* current model id */
 int  motiris_tool_count(MotirisAgent *a);           /* registered tools */
 const char *motiris_tool_name(MotirisAgent *a, int i); /* or NULL */
 void motiris_set_base_url(MotirisAgent *a, const char *u);
+const char *motiris_base_url(MotirisAgent *a);
+const char *motiris_transport_name(MotirisAgent *a);
 void motiris_set_api_key(MotirisAgent *a, const char *k);
+/* Boolean only: whether the default provider has an effective credential. */
+int  motiris_api_key_configured(const MotirisAgent *a);
 void motiris_set_system(MotirisAgent *a, const char *sys);
 void motiris_add_user(MotirisAgent *a, const char *msg);
 /* Per-agent bounded live history and independent provider replay selection.
@@ -142,6 +146,13 @@ void motiris_set_reasoning_cb(MotirisAgent *a,
  * low/medium/high are accepted. Returns -1 without changing invalid input. */
 int  motiris_set_reasoning_effort(MotirisAgent *a, const char *effort);
 const char *motiris_reasoning_effort(MotirisAgent *a);
+/* think_mode NULL/""/"provider" uses the provider default and omits the
+ * request field; on/off emit a JSON boolean. Invalid input returns -1. */
+int  motiris_set_think_mode(MotirisAgent *a, const char *mode);
+const char *motiris_think_mode(MotirisAgent *a);
+/* Zero omits max_tokens; positive values through INT_MAX are sent as numbers. */
+int  motiris_set_max_tokens(MotirisAgent *a, int tokens);
+int  motiris_max_tokens(MotirisAgent *a);
 void motiris_set_thinking_visible(MotirisAgent *a, int on);
 int  motiris_thinking_visible(MotirisAgent *a);
 /* Append host-loaded instruction/persona text to the system prompt. */
@@ -158,6 +169,9 @@ enum MotirisRunResult {
 };
 int  motiris_run(MotirisAgent *a);   /* MotirisRunResult */
 const char *motiris_last_error(MotirisAgent *a);
+/* Explicit synchronous OpenAI-compatible discovery. Returns a new caller-owned
+ * array of exact model ID strings, or NULL with motiris_last_error() set. */
+cJSON *motiris_fetch_models(MotirisAgent *a);
 
 void motiris_set_tool_hook(MotirisAgent *a, MotirisToolHook cb, void *ud);
 /* append another observer without replacing existing ones */
@@ -191,9 +205,7 @@ int  motiris_tools_enabled(MotirisAgent *a);
 /* Optional host-backed vision tool (Makefile VISION_TOOLS=1). */
 #ifdef MOTIRIS_VISION_TOOLS
 void motiris_register_vision_tools(MotirisAgent *a);
-const char *motiris_base_url(MotirisAgent *a);
 const char *motiris_api_key(MotirisAgent *a);
-const char *motiris_transport_name(MotirisAgent *a);
 #endif
 
 /* ---- centralized config: $HOME/.motiris/{env,config.json,AGENTS.md,SOUL.md}
@@ -204,6 +216,9 @@ int  motiris_init_config(void);               /* write templates */
 /* Atomically update one whitelisted scalar config.json key. Prints only the
  * key/path on success, never the value. Returns 0 on success, nonzero on error. */
 int  motiris_set_config(const char *key, const char *value);
+/* Atomically upsert one safe MOTIRIS_* entry in the mode-0600 env file.
+ * Unrelated lines are preserved and values are never printed. */
+int  motiris_set_env(const char *key, const char *value);
 
 /* ---- shell safety policy (issue #10) ---- */
 void motiris_set_shell_policy(const char *allow_csv, const char *deny_csv);

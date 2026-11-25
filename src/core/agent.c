@@ -47,6 +47,8 @@ struct MotirisAgent {
   void (*on_reasoning)(const char *, void *);
   void *reasoning_ud;
   char reasoning_effort[8];
+  char think_mode[9];
+  int max_tokens;
   int thinking_visible;
   MotirisCancelCallback *cancel;
   void *cancel_ud;
@@ -104,6 +106,9 @@ char *motiris_transport_send(const char *backend, const char *url,
                              const char *auth, const char *body,
                              MotirisCancelCallback *cancel, void *cancel_ud,
                              char **err);
+char *motiris_transport_get(const char *backend, const char *url,
+                            const char *auth, MotirisCancelCallback *cancel,
+                            void *cancel_ud, char **err);
 char *motiris_transport_send_stream(const char *backend, const char *url,
                                     const char *auth, const char *body,
                                     void (*on_delta)(const char *, void *),
@@ -184,6 +189,7 @@ MotirisAgent *motiris_new(void) {
   a->compact_max_chars = 8192;
   a->print_answer = 1;
   a->stream = 1;
+  strcpy(a->think_mode, "provider");
   a->history_max_messages = env_limit("MOTIRIS_HISTORY_MAX_MESSAGES",
                                       HISTORY_MAX_MESSAGES, HISTORY_MAX_MESSAGES);
   a->history_max_bytes = env_limit("MOTIRIS_HISTORY_MAX_BYTES",
@@ -239,10 +245,14 @@ void motiris_set_api_key(MotirisAgent *a, const char *k) {
 void motiris_set_transport(MotirisAgent *a, const char *n) {
   snprintf(a->transport, sizeof a->transport, "%s", n ? n : "auto");
 }
-#ifdef MOTIRIS_VISION_TOOLS
 const char *motiris_base_url(MotirisAgent *a) { return a->base_url; }
-const char *motiris_api_key(MotirisAgent *a) { return a->api_key; }
 const char *motiris_transport_name(MotirisAgent *a) { return a->transport; }
+int motiris_api_key_configured(const MotirisAgent *a) {
+  const char *env_key = getenv("MOTIRIS_API_KEY");
+  return (a && a->api_key && *a->api_key) || (env_key && *env_key);
+}
+#ifdef MOTIRIS_VISION_TOOLS
+const char *motiris_api_key(MotirisAgent *a) { return a->api_key; }
 #endif
 void motiris_set_stream(MotirisAgent *a, int on) { a->stream = !!on; }
 int motiris_stream_enabled(MotirisAgent *a) { return a->stream; }
@@ -403,6 +413,122 @@ int motiris_set_reasoning_effort(MotirisAgent *a, const char *effort) {
 }
 const char *motiris_reasoning_effort(MotirisAgent *a) {
   return a->reasoning_effort;
+}
+
+int motiris_set_think_mode(MotirisAgent *a, const char *mode) {
+  const char *selected = (!mode || !*mode) ? "provider" : mode;
+  if (strcmp(selected, "provider") && strcmp(selected, "on") &&
+      strcmp(selected, "off")) {
+    set_error(a, "%s", "think mode must be provider, on or off");
+    return -1;
+  }
+  snprintf(a->think_mode, sizeof a->think_mode, "%s", selected);
+  return 0;
+}
+const char *motiris_think_mode(MotirisAgent *a) { return a->think_mode; }
+
+int motiris_set_max_tokens(MotirisAgent *a, int tokens) {
+  if (tokens < 0) {
+    set_error(a, "%s", "max tokens must be nonnegative");
+    return -1;
+  }
+  a->max_tokens = tokens;
+  return 0;
+}
+int motiris_max_tokens(MotirisAgent *a) { return a->max_tokens; }
+
+static char *models_url(const char *base) {
+  if (!base || (strncmp(base, "http://", 7) &&
+                strncmp(base, "https://", 8))) return NULL;
+  const char *suffix = strpbrk(base, "?#");
+  size_t length = suffix ? (size_t)(suffix - base) : strlen(base);
+  while (length && base[length - 1] == '/') length--;
+  static const char chat[] = "/chat/completions";
+  if (length >= sizeof chat - 1 &&
+      !memcmp(base + length - (sizeof chat - 1), chat, sizeof chat - 1))
+    length -= sizeof chat - 1;
+  static const char models[] = "/models";
+  int append = length < sizeof models - 1 ||
+      memcmp(base + length - (sizeof models - 1), models, sizeof models - 1);
+  size_t total = length + (append ? sizeof models - 1 : 0);
+  char *url = malloc(total + 1);
+  if (!url) return NULL;
+  memcpy(url, base, length);
+  if (append) memcpy(url + length, models, sizeof models - 1);
+  url[total] = '\0';
+  return url;
+}
+
+cJSON *motiris_fetch_models(MotirisAgent *a) {
+  free(a->last_error);
+  a->last_error = NULL;
+  char *url = models_url(a->base_url);
+  if (!url) {
+    set_error(a, "%s", "invalid HTTP(S) model discovery endpoint");
+    return NULL;
+  }
+  const char *env_key = getenv("MOTIRIS_API_KEY");
+  const char *key = a->api_key ? a->api_key : env_key;
+  char auth[AUTH_HEADER_SIZE];
+  char *authp = NULL;
+  if (key) {
+    if (strlen(key) > AUTH_MAX_KEY_BYTES) {
+      free(url);
+      set_error(a, "%s", "authorization header too long");
+      return NULL;
+    }
+    int n = snprintf(auth, sizeof auth, AUTH_HEADER_PREFIX "%s", key);
+    if (n < 0 || (size_t)n >= sizeof auth) {
+      free(url);
+      set_error(a, "%s", "cannot construct authorization header");
+      return NULL;
+    }
+    authp = auth;
+  }
+  char *error = NULL;
+  char *response = motiris_transport_get(a->transport, url, authp,
+                                         a->cancel, a->cancel_ud, &error);
+  free(url);
+  if (!response) {
+    set_error(a, "%s", error ? error : "model discovery transport failed");
+    free(error);
+    return NULL;
+  }
+  cJSON *root = cJSON_Parse(response);
+  free(response);
+  cJSON *data = root ? cJSON_GetObjectItemCaseSensitive(root, "data") : NULL;
+  if (!cJSON_IsArray(data)) {
+    cJSON_Delete(root);
+    set_error(a, "%s", "invalid models response");
+    return NULL;
+  }
+  cJSON *result = cJSON_CreateArray();
+  if (!result) {
+    cJSON_Delete(root);
+    set_error(a, "%s", "model list allocation failed");
+    return NULL;
+  }
+  for (cJSON *entry = data->child; entry; entry = entry->next) {
+    if (cJSON_GetArraySize(result) >= 128) break;
+    const char *id = cJSON_IsObject(entry) ? cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(entry, "id")) : NULL;
+    if (!id || !*id || strlen(id) > 512) continue;
+    cJSON *copy = cJSON_CreateString(id);
+    if (!copy || !cJSON_AddItemToArray(result, copy)) {
+      cJSON_Delete(copy);
+      cJSON_Delete(root);
+      cJSON_Delete(result);
+      set_error(a, "%s", "model list allocation failed");
+      return NULL;
+    }
+  }
+  cJSON_Delete(root);
+  if (!result->child) {
+    cJSON_Delete(result);
+    set_error(a, "%s", "models response contains no valid model IDs");
+    return NULL;
+  }
+  return result;
 }
 
 static int history_fail(MotirisAgent *a, const char *message) {
@@ -745,6 +871,9 @@ static char *build_request(MotirisAgent *a, const char *model) {
   cJSON_AddNumberToObject(req, "temperature", 0.2);
   if (*a->reasoning_effort)
     cJSON_AddStringToObject(req, "reasoning_effort", a->reasoning_effort);
+  if (strcmp(a->think_mode, "provider"))
+    cJSON_AddBoolToObject(req, "think_mode", !strcmp(a->think_mode, "on"));
+  if (a->max_tokens > 0) cJSON_AddNumberToObject(req, "max_tokens", a->max_tokens);
   if (a->stream) cJSON_AddTrueToObject(req, "stream");
   char *body = cJSON_PrintUnformatted(req);
   cJSON_Delete(req);
