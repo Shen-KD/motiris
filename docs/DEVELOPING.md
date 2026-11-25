@@ -224,7 +224,9 @@ buffered fallback paths retain their one final print. Goal-check confirmation
 uses no delta sink, so only a non-`DONE` aggregate is rendered. Once visible
 deltas exist, a transport/parse/API failure ends that run rather than mixing a
 partial answer with fallback output. The flag is run/attempt local, not global
-agent or session state.
+agent or session state. Reasoning uses the host's actual visibility contract:
+CLI/REPL hidden reasoning does not block recovery, while Gateway temporarily
+marks reasoning visible for SSE runs because it always emits reasoning events.
 
 Provider assistant objects are canonicalized before entering per-Agent history:
 only `role`, `content` and `tool_calls` participate in replay and snapshots.
@@ -244,9 +246,13 @@ adds no retained global or per-session metadata.
 hard maximum 16 MiB). Invalid values warn at Agent construction and use the
 default, avoiding direct worker-thread diagnostics. Buffered
 libcurl and spawned-curl bodies, each SSE line, aggregate content and each
-tool-argument string retain at most `C` bytes plus a private NUL; total SSE
-wire input is at most `4*C` to include JSON/framing, and at most 256 tool calls
-are aggregated. Geometric allocation is below `2*(C+1)` per receive buffer.
+tool-argument string retain at most `C` bytes plus a private NUL. Streaming
+also retains the original HTTP-200 body (up to `C`) for protocol-failure
+diagnostics; non-200 responses use a separate error body with the same cap.
+These attempt-local buffers are freed before retry/fallback and do not
+accumulate across attempts. Total SSE wire input is at most `4*C` to include
+JSON/framing, and at most 256 tool calls are aggregated. Geometric allocation
+is below `2*(C+1)` per receive buffer.
 Checked subtraction precedes every addition/allocation, a temporary pointer
 preserves the original allocation on `realloc` failure, and limit/OOM paths
 free partial state and return bounded `response limit exceeded` /

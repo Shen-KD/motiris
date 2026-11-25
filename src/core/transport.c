@@ -329,7 +329,7 @@ static char *libcurl_send(const char *url, const char *auth,
       } else {
         size_t n = strlen(curl_easy_strerror(rc)) + 32;
         char *m = malloc(n);
-        snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
+        if (m) snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
         *err = m;
       }
     }

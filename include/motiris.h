@@ -160,6 +160,9 @@ const char *motiris_think_mode(MotirisAgent *a);
 /* Zero omits max_tokens; positive values through INT_MAX are sent as numbers. */
 int  motiris_set_max_tokens(MotirisAgent *a, int tokens);
 int  motiris_max_tokens(MotirisAgent *a);
+/* Set true whenever reasoning callback output is visible to the user/client.
+ * Visible reasoning suppresses retry/fallback after a partial stream; hidden
+ * reasoning does not. CLI display filtering and this visibility flag are separate. */
 void motiris_set_thinking_visible(MotirisAgent *a, int on);
 int  motiris_thinking_visible(MotirisAgent *a);
 /* Append host-loaded instruction/persona text to the system prompt. */

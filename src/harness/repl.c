@@ -1844,7 +1844,8 @@ static void repl_tty_render_event(ReplTTY *tty, const ReplUiEvent *event) {
              event->type == REPL_UI_DIAGNOSTIC_CONT) {
     if (tty->output_needs_newline &&
         event->type != REPL_UI_DIAGNOSTIC_CONT) {
-      printf("\n");
+      /* A separate core callback may supply the line terminator itself. */
+      if (!event->len || event->text[0] != '\n') printf("\n");
       tty->output_needs_newline = 0;
     }
     fwrite(event->text, 1, event->len,

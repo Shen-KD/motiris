@@ -447,6 +447,61 @@ def run_sse_test(root):
         thread.join(timeout=5)
 
 
+class ReasoningFailureProvider(http.server.BaseHTTPRequestHandler):
+    hits = 0
+
+    def do_POST(self):
+        type(self).hits += 1
+        self.rfile.read(int(self.headers["Content-Length"]))
+        body = (b'data: {"choices":[{"delta":{"reasoning_content":'
+                b'"gateway-visible-reasoning"}}]}\n\n')
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body) + 64))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def log_message(self, *_args):
+        pass
+
+
+def run_reasoning_retry_guard_test(root):
+    ReasoningFailureProvider.hits = 0
+    provider = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), ReasoningFailureProvider)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    gateway = None
+    try:
+        gateway = Gateway(root / "reasoning-retry", {
+            "transport": "libcurl", "stream": True,
+            "base_url": "http://127.0.0.1:%d/v1/chat" % provider.server_address[1],
+            "max_retries": 3, "retry_base_seconds": 0,
+        })
+        payload = json.dumps({"chat_id": "reasoning-retry",
+                              "message": "hello"}).encode()
+        request = (b"POST /v1/chat HTTP/1.1\r\nHost: localhost\r\n"
+                   b"Content-Type: application/json\r\nContent-Length: " +
+                   str(len(payload)).encode() + b"\r\n\r\n" + payload)
+        with socket.create_connection(("127.0.0.1", gateway.port), timeout=3) as sock:
+            sock.sendall(request)
+            raw = receive_all(sock)
+        _headers, separator, body = raw.partition(b"\r\n\r\n")
+        assert separator
+        events = parse_sse(body)
+        assert [name for name, _ in events] == ["reasoning", "error"], events
+        assert events[0][1]["delta"] == "gateway-visible-reasoning", events
+        assert ReasoningFailureProvider.hits == 1, ReasoningFailureProvider.hits
+        print("gateway SSE: visible reasoning forbids retry after truncation")
+    finally:
+        if gateway is not None:
+            gateway.stop()
+        provider.shutdown()
+        provider.server_close()
+        thread.join(timeout=5)
+
+
 def run_invalid_setting_test(root):
     config_home = root / "invalid"
     home = config_home / "home"
@@ -474,6 +529,7 @@ def main():
         run_write_test(root)
         run_terminal_reply_test(root)
         run_sse_test(root)
+        run_reasoning_retry_guard_test(root)
         run_invalid_setting_test(root)
     print("gateway I/O: receive/send monotonic deadlines and cleanup passed")
 

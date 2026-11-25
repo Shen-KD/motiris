@@ -260,12 +260,13 @@ NOFS_PROBE_SOURCE = r'''
 static int fake_hits;
 static unsigned int host_delays[8];
 static int host_delay_count;
+static int host_wait_result;
 
 static int host_wait(unsigned int seconds, void *ud) {
   (void)ud;
   if (host_delay_count < 8) host_delays[host_delay_count] = seconds;
   host_delay_count++;
-  return 0;
+  return host_wait_result;
 }
 
 static char *copy_text(const char *text) {
@@ -320,9 +321,10 @@ char *motiris_transport_get(const char *backend, const char *url,
   return NULL;
 }
 
-static int run_one(int base, int use_host_wait) {
+static int run_one(int base, int use_host_wait, int wait_result) {
   fake_hits = 0;
   host_delay_count = 0;
+  host_wait_result = wait_result;
   MotirisAgent *a = motiris_new();
   if (!a) return 90;
   motiris_set_transport(a, "fake");
@@ -343,7 +345,8 @@ static int run_one(int base, int use_host_wait) {
 }
 
 int main(void) {
-  if (run_one(0, 0) || run_one(1, 1) || run_one(1, 0)) return 1;
+  if (run_one(0, 0, 0) || run_one(1, 1, 0) || run_one(1, 0, 0) ||
+      run_one(2, 1, 1)) return 1;
   return 0;
 }
 '''
@@ -538,6 +541,36 @@ class ProviderRetryTests(unittest.TestCase):
                 self.assertEqual(self.provider.hits[path], 2, proc.stderr)
                 self.assertIn(failure.decode(), proc.stderr)
 
+    def test_valid_stream_completion_variants(self):
+        case = self.root / "stream-variants"
+        case.mkdir()
+
+        def event(value, newline=b"\n"):
+            return b"data: " + compact(value) + newline + newline
+
+        for name in ("crlf-finish", "done-only", "usage-final"):
+            content = event({"choices": [{"delta": {"content": name + " ok"}}]},
+                            b"\r\n" if name == "crlf-finish" else b"\n")
+            if name == "crlf-finish":
+                body = content + event({"choices": [{"delta": {},
+                    "finish_reason": "stop"}]}, b"\r\n")
+            elif name == "done-only":
+                body = content + b"data: [DONE]\n\n"
+            else:
+                body = (content + event({"choices": [], "usage": {
+                    "prompt_tokens": 1, "completion_tokens": 1}}) +
+                    b"data: [DONE]\n\n")
+            with self.subTest(name=name):
+                path = "/valid-" + name
+                self.provider.add(path, [(200, body, "text/event-stream")])
+                proc = run_agent(case, {
+                    "transport": "libcurl", "stream": True,
+                    "base_url": self.provider.url(path),
+                })
+                self.assertEqual((proc.returncode, proc.stdout),
+                                 (0, name + " ok\n"), proc.stderr)
+                self.assertEqual(self.provider.hits[path], 1, proc.stderr)
+
     def test_backoff_sequence_full_shift_and_cancellation(self):
         case = self.root / "backoff"
         case.mkdir()
@@ -646,6 +679,8 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertIn("NOFS base=1 host=0 rc=1 hits=1 messages=1 delays= "
                       "error=retry backoff unavailable without host I/O",
                       proc.stdout)
+        self.assertIn("NOFS base=2 host=1 rc=2 hits=1 messages=1 delays=2 "
+                      "error=cancelled", proc.stdout)
 
     def test_spawned_status_trailer_preserves_exact_body_budget(self):
         case = self.root / "spawned-boundary"
@@ -711,7 +746,7 @@ class ProviderRetryTests(unittest.TestCase):
 
         # Exercise the real async diagnostic callback, chunking and PTY renderer.
         from repl_cards import Repl, plain
-        large_body = b"raw-pty-begin\n" + b"Q" * 9000 + b"\nraw-pty-end\n"
+        large_body = b"raw-pty-begin\n" + b"Q" * 9000 + b"\nraw-pty-end"
         self.provider.add("/raw-pty", [(500, large_body)])
         env = agent_environment(case, {
             "transport": "libcurl", "stream": True,
@@ -725,9 +760,13 @@ class ProviderRetryTests(unittest.TestCase):
             repl.clear()
             repl.send("retry route\r")
             output = plain(repl.read_until("raw-pty-end", timeout=10))
-            self.assertIn(large_body.decode().rstrip("\n"), output)
+            self.assertIn(large_body.decode(), output)
             self.assertEqual(self.provider.hits["/raw-pty"], 1)
-            repl.read_until("motiris> ", timeout=10)
+            tail = plain(repl.read_until("motiris> ", timeout=10))
+            after_body = tail.split("raw-pty-end", 1)[1]
+            # One terminator from core plus the existing TTY colour/turn break.
+            self.assertTrue(after_body.startswith("\n\nmotiris:"),
+                            repr(after_body[:100]))
             repl.send("/exit\r")
             repl.read_until("bye")
         finally:

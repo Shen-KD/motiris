@@ -665,6 +665,7 @@ static void handle_connection(int fd, int tools_on) {
   cJSON *jstream = cJSON_GetObjectItemCaseSensitive(body, "stream");
   int use_sse = !cJSON_IsFalse(jstream); /* SSE is the default wire format. */
   int saved_stream = motiris_stream_enabled(s->agent);
+  int saved_thinking = motiris_thinking_visible(s->agent);
   SseWriter writer = { .fd = fd, .failed = 0 };
   if (use_sse) {
     motiris_set_stream(s->agent, 1);
@@ -677,6 +678,10 @@ static void handle_connection(int fd, int tools_on) {
     }
     motiris_set_stream_cb(s->agent, gateway_delta, &writer);
     motiris_set_reasoning_cb(s->agent, gateway_reasoning, &writer);
+    /* Gateway always exposes reasoning as SSE, independently of the CLI's
+     * show_thinking preference. Mark it visible so partial reasoning forbids
+     * retry/fallback output from being mixed into the same client stream. */
+    motiris_set_thinking_visible(s->agent, 1);
   } else {
     motiris_set_stream(s->agent, 0);
   }
@@ -685,6 +690,7 @@ static void handle_connection(int fd, int tools_on) {
   int rc = motiris_run(s->agent);
   motiris_set_stream_cb(s->agent, NULL, NULL);
   motiris_set_reasoning_cb(s->agent, NULL, NULL);
+  motiris_set_thinking_visible(s->agent, saved_thinking);
   motiris_set_stream(s->agent, saved_stream);
   const char *auto_checkpoint_error = NULL;
   int auto_saved = 0;

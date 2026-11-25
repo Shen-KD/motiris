@@ -1266,11 +1266,11 @@ attempt_failed:
         }
         unsigned int delay = (unsigned int)a->retry_base_seconds << attempt;
         int wait_status = retry_wait(a, delay);
-        if (run_cancelled(a)) {
+        if (wait_status > 0 || run_cancelled(a)) {
           free(last_err);
           return cancel_run(a, run_tail, start_tok_in, start_tok_out);
         }
-        if (wait_status) {
+        if (wait_status < 0) {
           free(last_err);
           last_err = sdup(wait_status == -2
               ? "retry backoff unavailable without host I/O"
