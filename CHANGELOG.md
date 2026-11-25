@@ -8,6 +8,15 @@ published by `.github/workflows/release.yml`.
 
 ### Added
 
+- Interactive `/model` default-provider card: edit model ID, endpoint,
+  `think_mode=provider|on|off`, `max_tokens` and reasoning effort with immediate
+  session effect and explicit persistence. A manual Refresh derives and fetches
+  the OpenAI-compatible `/models` list with bounded authenticated libcurl GET,
+  exact model selection, cancellation and sanitized errors; opening/editing the
+  card performs no network I/O. Newly entered keys are never echoed or written
+  to JSON and are atomically saved in the mode-0600 env file through
+  `api_key_env`. Core/config, real-PTY, failure-path and restart-reload tests
+  cover the complete flow.
 - Generation-time TTY input: linenoise remains editable while a joinable agent
   worker runs, Enter accepts a bounded 32-line/64-KiB FIFO without implicit
   interruption, and natural completion/cancellation dispatches queued input in

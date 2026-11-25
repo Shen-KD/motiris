@@ -71,7 +71,10 @@ def main():
         proc = set_config(env, "max_steps", "25")
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
         for key, value in [("approval", "ask"), ("reasoning_effort", "high"),
-                           ("max_steps", "0")]:
+                           ("max_steps", "0"), ("think_mode", "provider"),
+                           ("think_mode", "off"), ("think_mode", "on"),
+                           ("max_tokens", "2147483647"), ("max_tokens", "0"),
+                           ("max_tokens", "4096")]:
             proc = set_config(env, key, value)
             assert proc.returncode == 0, (key, proc.stdout, proc.stderr)
         data = json.loads(path.read_text())
@@ -81,6 +84,8 @@ def main():
         assert data["workspace_guard"] is True
         assert data["approval"] == "ask" and data["reasoning_effort"] == "high"
         assert data["max_steps"] == 0 and type(data["max_steps"]) is int
+        assert data["think_mode"] == "on"
+        assert data["max_tokens"] == 4096 and type(data["max_tokens"]) is int
         assert data["providers"][0]["name"] == "keep"
         assert data["mcp_servers"][0]["cmd"] == "mock"
         assert data["extension"] == {"preserve": [1, True, None]}
@@ -106,6 +111,9 @@ def main():
         for key, value in [("max_steps", "-1"), ("max_steps", "12x"),
                            ("max_steps", "2147483648"), ("approval", "auto"),
                            ("reasoning_effort", "deep"), ("show_thinking", "yes"),
+                           ("think_mode", "auto"), ("think_mode", "ON"),
+                           ("think_mode", ""), ("max_tokens", "-1"),
+                           ("max_tokens", "12x"), ("max_tokens", "2147483648"),
                            ("workspace_guard", "yes"),
                            ("stream", "yes"), ("transport", "bogus"),
                            ("model", ""), ("unknown", "value")]:

@@ -163,7 +163,7 @@ motiris --cron jobs.json --once                          # scheduled jobs
 motiris --sessions [TERM]                                # list/search logs
 # repl (-i): / lists commands; ↑/↓ select, Enter runs, /exit leaves
 # commands: /help /new /tools /sessions [TERM] /resume FILE /skills [TERM]
-#           /save /load /config /approval /reasoning /thinking /hotkey /exit
+#           /save /load /config /model /approval /reasoning /thinking /hotkey /exit
 # During a reply, keep typing: Enter queues lines in FIFO order (32 / 64 KiB).
 # Queued turns and slash commands run automatically; Enter never interrupts.
 # Esc/Ctrl+C cancels generation without clearing the draft or queued input.
@@ -247,6 +247,29 @@ channel. Reasoning is never synthesized, added to canonical history, or saved
 in checkpoints/session traces. Approval defaults to `off`; `/approval ask`
 requires an interactive decision, while non-interactive or callback-less runs
 fail closed without executing the tool.
+
+`/model` opens a default-provider card for `model_id` (the `model` config key),
+`endpoint`, `think_mode`, `max_tokens` and `reasoning_effort`. `think_mode` is
+`provider` (omit the request field), `on` or `off` (JSON boolean); `max_tokens=0`
+omits the field, while a positive value sends an integer. Changes apply to the
+current session immediately. Saving writes non-secret settings to `config.json`;
+a newly entered API key is hidden while typing and atomically saved only as
+`MOTIRIS_API_KEY` in the mode-0600 env file, with `api_key_env` referencing it.
+Each field/file replacement is independently atomic, not a multi-file
+transaction; partial failures are reported, and a pending new key remains
+available for Save after closing/reopening the card or correcting a failed
+write. Empty key input leaves the current credential unchanged. Existing `providers[]`
+fallback entries remain independent of this default-provider card.
+
+Opening or editing `/model` performs no network I/O. Only **Refresh models**
+derives the OpenAI-compatible URL by replacing a terminal `/chat/completions`
+with `/models` (or appending `/models` to a base such as `/v1`) and performs an
+authenticated GET with the effective default credential. Discovery requires the
+`auto`/`libcurl` transport, does not follow redirects, uses a 15-second total
+timeout and a 1 MiB response cap, and retains at most 128 exact model IDs of up
+to 512 bytes. HTTP, cancellation and malformed-response errors are bounded and
+do not include response bodies or credentials. Left/right on `model_id` selects
+from the fetched list; non-TTY `/model` prints a masked summary only.
 
 REPL streaming prints a final answer once: the agent suppresses the aggregated
 copy only when the selected backend actually delivered text deltas, while buffered,
@@ -450,6 +473,8 @@ Edit scalar JSON config without a text editor:
 motiris set config model glm-5.3
 motiris set config stream false       # JSON boolean, not a string
 motiris set config max_steps 0        # 0 = unlimited; positive = bounded
+motiris set config think_mode on      # provider/on/off; omitted for provider
+motiris set config max_tokens 4096    # 0 omits max_tokens
 motiris --config approval ask         # equivalent typed JSON editor
 motiris --init                        # all-or-nothing safe defaults/templates
 motiris set config api_key_env MOTIRIS_API_KEY
@@ -458,9 +483,10 @@ motiris set config api_key_env MOTIRIS_API_KEY
 The command updates `$MOTIRIS_HOME/config.json` (default
 `~/.motiris/config.json`) without starting an agent or contacting a provider.
 String keys are `model`, `base_url`, `api_key_env`, `transport`, `system`,
-`plugin_dir`, `shell_allow`, `shell_deny`, `approval` and `reasoning_effort`;
-boolean keys are `stream`, `show_thinking`, `workspace_guard`,
-`context_compaction`, `tools`, `plugins` and `goal_check`. Integer keys are `max_steps` (0 unlimited),
+`plugin_dir`, `shell_allow`, `shell_deny`, `approval`, `reasoning_effort` and
+`think_mode`; boolean keys are `stream`, `show_thinking`, `workspace_guard`,
+`context_compaction`, `tools`, `plugins` and `goal_check`. Integer keys are
+`max_steps` (0 unlimited), `max_tokens` (0 provider default),
 `compaction_threshold`, `compaction_keep` and `compaction_max_chars`.
 Other fields, including `providers`, `mcp_servers` and
 extension fields, are preserved. Writes use a complete mode-0600 temporary

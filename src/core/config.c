@@ -5,7 +5,8 @@
  *                environment wins. Parsed (never sourced) - plain text.
  *   config.json  optional JSON: model, base_url, api_key_env,
  *                max_steps, transport, stream, approval, reasoning_effort,
- *                show_thinking, system, plugin_dir, tools, plugins.
+ *                think_mode, max_tokens, show_thinking, system, plugin_dir,
+ *                tools, plugins.
  *
  * Precedence: CLI flags > config.json > env file > built-in defaults.
  * Missing files are fine; run `motiris --init` to generate templates.
@@ -269,6 +270,11 @@ void motiris_apply_config(MotirisAgent *a) {
   if ((s = jstr(j, "reasoning_effort")) &&
       motiris_set_reasoning_effort(a, s))
     fprintf(stderr, "motiris: reasoning_effort must be off, low, medium or high\n");
+  if ((s = jstr(j, "think_mode")) && motiris_set_think_mode(a, s))
+    fprintf(stderr, "motiris: think_mode must be provider, on or off\n");
+  if (cJSON_GetObjectItemCaseSensitive(j, "max_tokens"))
+    motiris_set_max_tokens(a, jint(j, "max_tokens", motiris_max_tokens(a),
+                                  0, INT_MAX));
   if (cJSON_GetObjectItemCaseSensitive(j, "show_thinking"))
     motiris_set_thinking_visible(a, jbool(j, "show_thinking", 0));
   int compact = jbool(j, "context_compaction", 0);
@@ -412,10 +418,14 @@ int motiris_init_config(void) {
     "# Motiris configuration\n\n"
     "Use `motiris set config KEY VALUE` or `motiris --config KEY VALUE` for JSON.\n"
     "Keys: stream (boolean), max_steps (0 unlimited or positive), approval (off|ask),\n"
-    "reasoning_effort (off|low|medium|high), show_thinking (boolean),\n"
+    "reasoning_effort (off|low|medium|high), think_mode (provider|on|off),\n"
+    "max_tokens (0 provider default or positive), show_thinking (boolean),\n"
     "workspace_guard (boolean; off permits any OS-accessible path).\n"
-    "In the REPL use /config, /approval, /reasoning and /thinking. Session card\n"
-    "changes are immediate; only the explicit save action persists them.\n"
+    "In the REPL use /config, /model, /approval, /reasoning and /thinking.\n"
+    "Session card changes are immediate; only the explicit save action persists\n"
+    "them. /model edits model_id/endpoint/parameters and performs model discovery\n"
+    "only when Refresh models is selected. API keys stay hidden and are saved\n"
+    "only in the mode-0600 env file, referenced by api_key_env.\n"
     "Compaction keys: context_compaction, compaction_threshold, compaction_keep,\n"
     "compaction_max_chars. Enable compaction only when its optional plugin exists.\n"
     "Skill discovery scans user < workspace < explicit directories. Only title,\n"
@@ -551,6 +561,8 @@ static const ConfigKey CONFIG_KEYS[] = {
   { "compaction_max_chars", CONFIG_INT, 0 },
   { "approval", CONFIG_STRING, 1 },
   { "reasoning_effort", CONFIG_STRING, 1 },
+  { "think_mode", CONFIG_STRING, 1 },
+  { "max_tokens", CONFIG_INT, 0 },
   { "tools", CONFIG_BOOL, 0 },
   { "plugins", CONFIG_BOOL, 0 },
   { "goal_check", CONFIG_BOOL, 0 },
@@ -579,6 +591,185 @@ static int config_write_all(int fd, const char *buf, size_t len) {
   return 0;
 }
 
+/* ---------------- atomic env-file editor ---------------- */
+#define ENV_FILE_MAX_BYTES (1 << 20)
+#define ENV_LINE_MAX_BYTES 4096
+#define ENV_API_KEY_MAX_BYTES 489
+
+static int env_edit_error(const char *reason) {
+  fprintf(stderr, "motiris: cannot update env: %s\n", reason);
+  return -1;
+}
+
+static int env_key_safe(const char *key) {
+  if (!key || strncmp(key, "MOTIRIS_", 8) || !key[8]) return 0;
+  for (const unsigned char *p = (const unsigned char *)key + 8; *p; p++)
+    if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+          (*p >= '0' && *p <= '9') || *p == '_')) return 0;
+  return 1;
+}
+
+static int env_value_safe(const char *key, const char *value) {
+  if (!value || !*value || strstr(value, "${")) return 0;
+  size_t length = strlen(value);
+  if (strchr(" \t\r\n\v\f", value[0]) ||
+      strchr(" \t\r\n\v\f", value[length - 1])) return 0;
+  for (const unsigned char *p = (const unsigned char *)value; *p; p++)
+    if (*p < 0x20 || *p == 0x7f) return 0;
+  if (!strcmp(key, "MOTIRIS_API_KEY") && length > ENV_API_KEY_MAX_BYTES)
+    return 0;
+  /* load_env_file uses a 4096-byte fgets buffer including NUL. */
+  return strlen(key) + length + 2 < ENV_LINE_MAX_BYTES;
+}
+
+static int env_line_matches(const char *line, size_t length, const char *key) {
+  size_t start = 0;
+  while (start < length && (line[start] == ' ' || line[start] == '\t')) start++;
+  size_t end = start;
+  while (end < length && line[end] != '=' && line[end] != '\n' &&
+         line[end] != '\r') end++;
+  if (end >= length || line[end] != '=') return 0;
+  size_t trimmed = end;
+  while (trimmed > start &&
+         (line[trimmed - 1] == ' ' || line[trimmed - 1] == '\t')) trimmed--;
+  size_t key_length = strlen(key);
+  return trimmed - start == key_length &&
+         !memcmp(line + start, key, key_length);
+}
+
+int motiris_set_env(const char *key, const char *value) {
+  if (!env_key_safe(key)) return env_edit_error("unsafe key");
+  if (!env_value_safe(key, value)) return env_edit_error("unsafe value");
+  char *dir = config_dir();
+  if (!dir) return env_edit_error("out of memory");
+  size_t path_cap = strlen(dir) + 16;
+  char *path = malloc(path_cap);
+  if (!path) { free(dir); return env_edit_error("out of memory"); }
+  snprintf(path, path_cap, "%s/env", dir);
+  char *source = NULL, *updated = NULL, *temp = NULL;
+  size_t size = 0, updated_length = 0;
+  int fd = -1, temp_fd = -1, temp_created = 0, replaced = 0;
+
+  fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+  if (fd >= 0) {
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        st.st_size > ENV_FILE_MAX_BYTES) {
+      env_edit_error("invalid or oversized existing file");
+      goto fail;
+    }
+    size = (size_t)st.st_size;
+    source = malloc(size + 1);
+    if (!source) { env_edit_error("out of memory"); goto fail; }
+    size_t off = 0;
+    while (off < size) {
+      ssize_t n = read(fd, source + off, size - off);
+      if (n > 0) { off += (size_t)n; continue; }
+      if (n < 0 && errno == EINTR) continue;
+      env_edit_error(n < 0 ? "cannot read existing file" :
+                           "existing file changed while reading");
+      goto fail;
+    }
+    char extra;
+    ssize_t n;
+    do n = read(fd, &extra, 1); while (n < 0 && errno == EINTR);
+    if (n != 0) {
+      env_edit_error(n < 0 ? "cannot read existing file" :
+                           "existing file changed while reading");
+      goto fail;
+    }
+    source[size] = '\0';
+    close(fd);
+    fd = -1;
+  } else if (errno != ENOENT) {
+    env_edit_error("cannot open existing file");
+    goto fail;
+  } else {
+    source = malloc(1);
+    if (!source) { env_edit_error("out of memory"); goto fail; }
+    source[0] = '\0';
+  }
+
+  size_t key_length = strlen(key), value_length = strlen(value);
+  size_t updated_cap = size + key_length + value_length + 3;
+  updated = malloc(updated_cap);
+  if (!updated) { env_edit_error("out of memory"); goto fail; }
+  size_t off = 0;
+  while (off < size) {
+    size_t end = off;
+    while (end < size && source[end] != '\n') end++;
+    size_t next = end < size ? end + 1 : end;
+    if (env_line_matches(source + off, end - off, key)) {
+      if (!replaced) {
+        memcpy(updated + updated_length, key, key_length);
+        updated_length += key_length;
+        updated[updated_length++] = '=';
+        memcpy(updated + updated_length, value, value_length);
+        updated_length += value_length;
+        if (next > end) updated[updated_length++] = '\n';
+        replaced = 1;
+      }
+    } else {
+      memcpy(updated + updated_length, source + off, next - off);
+      updated_length += next - off;
+    }
+    off = next;
+  }
+  if (!replaced) {
+    if (updated_length && updated[updated_length - 1] != '\n')
+      updated[updated_length++] = '\n';
+    memcpy(updated + updated_length, key, key_length);
+    updated_length += key_length;
+    updated[updated_length++] = '=';
+    memcpy(updated + updated_length, value, value_length);
+    updated_length += value_length;
+    updated[updated_length++] = '\n';
+  }
+
+  if (mkdir(dir, 0755) && errno != EEXIST) {
+    env_edit_error("cannot create config directory");
+    goto fail;
+  }
+  temp = malloc(strlen(path) + 16);
+  if (!temp) { env_edit_error("out of memory"); goto fail; }
+  sprintf(temp, "%s.tmp.XXXXXX", path);
+  temp_fd = mkstemp(temp);
+  if (temp_fd < 0) { env_edit_error("cannot create temporary file"); goto fail; }
+  temp_created = 1;
+  if (config_write_all(temp_fd, updated, updated_length) || fsync(temp_fd)) {
+    env_edit_error("cannot write temporary file");
+    goto fail;
+  }
+  if (close(temp_fd)) {
+    temp_fd = -1;
+    env_edit_error("cannot close temporary file");
+    goto fail;
+  }
+  temp_fd = -1;
+  if (rename(temp, path)) {
+    env_edit_error("cannot replace existing file");
+    goto fail;
+  }
+  temp_created = 0;
+  free(temp);
+  free(updated);
+  free(source);
+  free(path);
+  free(dir);
+  return 0;
+
+fail:
+  if (fd >= 0) close(fd);
+  if (temp_fd >= 0) close(temp_fd);
+  if (temp_created) unlink(temp);
+  free(temp);
+  free(updated);
+  free(source);
+  free(path);
+  free(dir);
+  return -1;
+}
+
 int motiris_set_config(const char *key, const char *value) {
   const ConfigKey *spec = NULL;
   if (key && value) {
@@ -590,7 +781,8 @@ int motiris_set_config(const char *key, const char *value) {
             "api_key_env, transport, system, plugin_dir, shell_allow, "
             "shell_deny, stream, show_thinking, workspace_guard, approval, reasoning_effort, "
             "context_compaction, compaction_threshold, compaction_keep, "
-            "compaction_max_chars, tools, plugins, goal_check or max_steps)\n");
+            "compaction_max_chars, think_mode, max_tokens, tools, plugins, "
+            "goal_check or max_steps)\n");
     return 1;
   }
   if (spec->nonempty && !*value) {
@@ -637,6 +829,10 @@ int motiris_set_config(const char *key, const char *value) {
              strcmp(value, "low") && strcmp(value, "medium") &&
              strcmp(value, "high")) {
     fprintf(stderr, "motiris: reasoning_effort must be off, low, medium or high\n");
+    return 1;
+  } else if (!strcmp(key, "think_mode") && strcmp(value, "provider") &&
+             strcmp(value, "on") && strcmp(value, "off")) {
+    fprintf(stderr, "motiris: think_mode must be provider, on or off\n");
     return 1;
   }
 
@@ -763,6 +959,10 @@ int motiris_init_config(void) { return 1; }
 int motiris_set_config(const char *key, const char *value) {
   (void)key; (void)value;
   return 1;
+}
+int motiris_set_env(const char *key, const char *value) {
+  (void)key; (void)value;
+  return -1;
 }
 #endif
 

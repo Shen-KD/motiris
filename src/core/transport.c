@@ -45,6 +45,7 @@ static int cancel_requested(const CancelCtx *cancel) {
 #ifndef MOTIRIS_NO_FILESYSTEM
 
 #define RESPONSE_MAX_BYTES (16u * 1024u * 1024u)
+#define MODELS_RESPONSE_MAX_BYTES (1024u * 1024u)
 #define STREAM_MAX_TOOL_CALLS 256
 #define STREAM_WIRE_OVERHEAD 4u
 
@@ -330,6 +331,68 @@ static char *libcurl_send(const char *url, const char *auth,
     free(out.data);
     return NULL;
   }
+  return out.data;
+}
+
+static char *libcurl_get(const char *url, const char *auth,
+                         MotirisCancelCallback *cancel_cb, void *cancel_ud,
+                         char **err) {
+  CancelCtx cancel = { cancel_cb, cancel_ud };
+  if (cancel_requested(&cancel)) {
+    if (err) *err = strdup("cancelled");
+    return NULL;
+  }
+  CURL *c = curl_easy_init();
+  if (!c) { if (err) *err = strdup("libcurl init failed"); return NULL; }
+  struct curl_slist *hdrs = NULL;
+  hdrs = curl_slist_append(hdrs, "Accept: application/json");
+  if (auth) hdrs = curl_slist_append(hdrs, auth);
+  Buf out = { .cancel = &cancel, .limit = MODELS_RESPONSE_MAX_BYTES };
+  curl_easy_setopt(c, CURLOPT_URL, url);
+  curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+  curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+  curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, curl_progress_cb);
+  curl_easy_setopt(c, CURLOPT_XFERINFODATA, &cancel);
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
+  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
+  curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
+  curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
+  curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
+  curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(c, CURLOPT_USERAGENT, "motiris/0.1");
+  CURLcode rc = curl_easy_perform(c);
+  long http = 0;
+  curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http);
+  curl_slist_free_all(hdrs);
+  curl_easy_cleanup(c);
+  if (rc != CURLE_OK || out.failed) {
+    if (err) {
+      if (cancel_requested(&cancel)) *err = strdup("cancelled");
+      else if (out.failed) *err = strdup(buffer_error(out.failed));
+      else {
+        size_t n = strlen(curl_easy_strerror(rc)) + 32;
+        char *message = malloc(n);
+        if (message) snprintf(message, n, "curl: %s", curl_easy_strerror(rc));
+        *err = message;
+      }
+    }
+    free(out.data);
+    return NULL;
+  }
+  if (http != 200) {
+    if (err) {
+      char *message = malloc(64);
+      if (message) snprintf(message, 64, "http status %ld", http);
+      *err = message;
+    }
+    free(out.data);
+    return NULL;
+  }
+  if (!out.data) out.data = strdup("");
   return out.data;
 }
 
@@ -697,6 +760,22 @@ static char *transport_error(const char *msg) {
   char *copy = malloc(n);
   if (copy) memcpy(copy, msg, n);
   return copy;
+}
+
+char *motiris_transport_get(const char *backend, const char *url,
+                            const char *auth,
+                            MotirisCancelCallback *cancel_cb, void *cancel_ud,
+                            char **err) {
+  if (err) *err = NULL;
+#ifndef MOTIRIS_NO_FILESYSTEM
+  if (!backend || !strcmp(backend, "auto") || !strcmp(backend, "libcurl"))
+    return libcurl_get(url, auth, cancel_cb, cancel_ud, err);
+  if (err) *err = transport_error("model discovery requires auto/libcurl transport");
+#else
+  (void)backend; (void)url; (void)auth; (void)cancel_cb; (void)cancel_ud;
+  if (err) *err = transport_error("model discovery unavailable without host I/O");
+#endif
+  return NULL;
 }
 
 char *motiris_transport_send(const char *backend, const char *url,
