@@ -116,6 +116,13 @@ int motiris_load_plugins(MotirisAgent *a, const char *dir);  /* 0 on success */
 void motiris_set_transport(MotirisAgent *a, const char *name);  /* "curl"|"echo" */
 void motiris_set_max_steps(MotirisAgent *a, int n);   /* 0 = unlimited */
 int  motiris_max_steps(MotirisAgent *a);
+/* Provider attempts are initial + max_retries, independently per provider.
+ * Retry N waits retry_base_seconds << (N-1). Invalid values return -1 and
+ * leave the previous setting unchanged. */
+int  motiris_set_max_retries(MotirisAgent *a, int retries);
+int  motiris_max_retries(MotirisAgent *a);
+int  motiris_set_retry_base_seconds(MotirisAgent *a, int seconds);
+int  motiris_retry_base_seconds(MotirisAgent *a);
 void motiris_set_goal_check(MotirisAgent *a, int on);   /* confirm goal met */
 void motiris_set_plugins_enabled(MotirisAgent *a, int on);
 void motiris_set_tools_enabled(MotirisAgent *a, int on);

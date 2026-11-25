@@ -14,6 +14,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef MOTIRIS_NO_FILESYSTEM
+#include <errno.h>
+#endif
 
 #define MAX_TOOLS 128
 #define HISTORY_MAX_MESSAGES 256
@@ -35,6 +39,8 @@ struct MotirisAgent {
   int ntools;
   char transport[16];
   int max_steps;
+  int max_retries;
+  int retry_base_seconds;
   int verbose;
   int print_answer;
   int stream;
@@ -78,6 +84,11 @@ struct MotirisAgent {
   int history_error;
 };
 
+static void agent_raw_diagnostic(MotirisAgent *a, const char *text) {
+  if (a->on_diagnostic) a->on_diagnostic(text, a->diagnostic_ud);
+  else fputs(text, stderr);
+}
+
 static void agent_diagnostic(MotirisAgent *a, const char *format, ...) {
   va_list ap, measure;
   va_start(ap, format);
@@ -105,7 +116,7 @@ static void agent_diagnostic(MotirisAgent *a, const char *format, ...) {
 char *motiris_transport_send(const char *backend, const char *url,
                              const char *auth, const char *body,
                              MotirisCancelCallback *cancel, void *cancel_ud,
-                             char **err);
+                             char **err, char **error_body);
 char *motiris_transport_get(const char *backend, const char *url,
                             const char *auth, MotirisCancelCallback *cancel,
                             void *cancel_ud, char **err);
@@ -116,7 +127,8 @@ char *motiris_transport_send_stream(const char *backend, const char *url,
                                     void (*on_reasoning)(const char *, void *),
                                     void *reasoning_ud,
                                     MotirisCancelCallback *cancel,
-                                    void *cancel_ud, char **err);
+                                    void *cancel_ud, char **err,
+                                    char **error_body);
 
 /* tools.c */
 int motiris_register_core_tools_count(void);
@@ -184,6 +196,8 @@ MotirisAgent *motiris_new(void) {
   a->messages = cJSON_CreateArray();
   strcpy(a->transport, "auto");
   a->max_steps = 0;
+  a->max_retries = 0;
+  a->retry_base_seconds = 1;
   a->compact_threshold = 32;
   a->compact_keep = 8;
   a->compact_max_chars = 8192;
@@ -281,6 +295,42 @@ void motiris_set_cancel_cb(MotirisAgent *a, MotirisCancelCallback *cb, void *ud)
 static int run_cancelled(const MotirisAgent *a) {
   return a->cancel && a->cancel(a->cancel_ud);
 }
+
+#ifdef MOTIRIS_RETRY_WAIT_HOOK
+#define retry_wait MOTIRIS_RETRY_WAIT_HOOK
+int retry_wait(MotirisAgent *a, unsigned int seconds);
+#else
+/* Return 1 for cancellation, 0 after the delay, -1 for host clock/wait
+ * failure, and -2 when positive delays are unavailable in the no-I/O build. */
+static int retry_wait(MotirisAgent *a, unsigned int seconds) {
+  if (!seconds) return run_cancelled(a) ? 1 : 0;
+#ifdef MOTIRIS_NO_FILESYSTEM
+  (void)a;
+  return -2;  /* C11 has no non-busy sleep; never spin behind the host's back. */
+#else
+  struct timespec deadline;
+  if (clock_gettime(CLOCK_MONOTONIC, &deadline)) return -1;
+  deadline.tv_sec += (time_t)seconds;
+  for (;;) {
+    if (run_cancelled(a)) return 1;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+    time_t seconds_left = deadline.tv_sec - now.tv_sec;
+    long nanoseconds_left = deadline.tv_nsec - now.tv_nsec;
+    if (nanoseconds_left < 0) {
+      seconds_left--;
+      nanoseconds_left += 1000000000L;
+    }
+    if (seconds_left < 0 ||
+        (!seconds_left && nanoseconds_left <= 0)) return 0;
+    struct timespec chunk = { 0, 50000000L };
+    if (!seconds_left && nanoseconds_left < chunk.tv_nsec)
+      chunk.tv_nsec = nanoseconds_left;
+    if (nanosleep(&chunk, NULL) && errno != EINTR) return -1;
+  }
+#endif
+}
+#endif
 
 typedef struct {
   void (*cb)(const char *, void *);
@@ -436,6 +486,28 @@ int motiris_set_max_tokens(MotirisAgent *a, int tokens) {
   return 0;
 }
 int motiris_max_tokens(MotirisAgent *a) { return a->max_tokens; }
+
+int motiris_set_max_retries(MotirisAgent *a, int retries) {
+  if (!a || retries < 0 || retries > 8) {
+    if (a) set_error(a, "%s", "max retries must be an integer in 0..8");
+    return -1;
+  }
+  a->max_retries = retries;
+  return 0;
+}
+int motiris_max_retries(MotirisAgent *a) { return a->max_retries; }
+
+int motiris_set_retry_base_seconds(MotirisAgent *a, int seconds) {
+  if (!a || seconds < 0 || seconds > 60) {
+    if (a) set_error(a, "%s", "retry base seconds must be an integer in 0..60");
+    return -1;
+  }
+  a->retry_base_seconds = seconds;
+  return 0;
+}
+int motiris_retry_base_seconds(MotirisAgent *a) {
+  return a->retry_base_seconds;
+}
 
 static char *models_url(const char *base) {
   if (!base || (strncmp(base, "http://", 7) &&
@@ -955,6 +1027,20 @@ static int cancel_run(MotirisAgent *a, cJSON *run_tail,
   return MOTIRIS_RUN_CANCELLED;
 }
 
+static void report_attempt_failure(MotirisAgent *a, const char *provider,
+                                   int attempt, const char *failure,
+                                   const char *raw_body) {
+  agent_diagnostic(a, "[motiris] provider %s attempt %d/%d failed: %s\n",
+                   provider, attempt + 1, a->max_retries + 1, failure);
+  /* Raw provider bytes must not pass through the terminal sanitizer or a
+   * printf conversion. Hosts receive the same callback stream as other
+   * diagnostics, so asynchronous renderers retain their serialization. */
+  const char *output = raw_body && *raw_body ? raw_body : failure;
+  agent_raw_diagnostic(a, output);
+  size_t length = strlen(output);
+  if (!length || output[length - 1] != '\n') agent_raw_diagnostic(a, "\n");
+}
+
 int motiris_run(MotirisAgent *a) {
   if (a->history_error) return 1;
   free(a->last_error);
@@ -1002,8 +1088,9 @@ int motiris_run(MotirisAgent *a) {
     cJSON *j = NULL;
     int delta_seen = 0, reasoning_seen = 0;
 
-    /* try providers in order; on transport/parse/api error, fail over */
-    for (int pi = 0; pi < np; pi++) {
+    /* Retry each provider independently; only exhaustion permits fallback. */
+    int stop_providers = 0;
+    for (int pi = 0; pi < np && !stop_providers; pi++) {
       const char *model, *url, *key;
       if (a->nproviders > 0) {
         model = a->providers[pi].model;
@@ -1015,102 +1102,161 @@ int motiris_run(MotirisAgent *a) {
         url = a->base_url;
         key = default_key;
       }
+      const char *provider = a->nproviders > 0 ? pname(a, pi)
+                                               : "default provider";
       if (a->verbose)
         agent_diagnostic(a, "[motiris] step %lu: %s via %s\n", step + 1, model,
-                         a->nproviders > 0 ? pname(a, pi) : "default provider");
+                         provider);
 
-      char *body = build_request(a, model);
-      if (!body) return 1;
+      for (int attempt = 0; attempt <= a->max_retries; attempt++) {
+        char *body = build_request(a, model);
+        if (!body) { free(last_err); return 1; }
 
-      char auth[AUTH_HEADER_SIZE];
-      char *authp = NULL;
-      if (key) {
-        int n = snprintf(auth, sizeof auth, AUTH_HEADER_PREFIX "%s", key);
-        if (n < 0 || (size_t)n >= sizeof auth) {
-          free(body);
-          free(last_err);
-          set_error(a, n < 0 ? "cannot construct authorization header"
-                             : "authorization header too long", NULL);
-          return 1;
+        char auth[AUTH_HEADER_SIZE];
+        char *authp = NULL;
+        if (key) {
+          int n = snprintf(auth, sizeof auth, AUTH_HEADER_PREFIX "%s", key);
+          if (n < 0 || (size_t)n >= sizeof auth) {
+            free(body);
+            free(last_err);
+            set_error(a, n < 0 ? "cannot construct authorization header"
+                               : "authorization header too long", NULL);
+            return 1;
+          }
+          authp = auth;
         }
-        authp = auth;
-      }
 
-      char *err = NULL;
-      DeltaForward forward = { a->on_delta, a->delta_ud, 0 };
-      ReasoningForward reasoning = {
-        a->on_reasoning, a->reasoning_ud, 0
-      };
-      char *resp = a->stream
-          ? motiris_transport_send_stream(
-                a->transport, url, authp, body,
-                a->on_delta && !confirm_asked ? forward_delta : NULL,
-                a->on_delta && !confirm_asked ? &forward : NULL,
-                a->on_reasoning && !confirm_asked ? forward_reasoning : NULL,
-                a->on_reasoning && !confirm_asked ? &reasoning : NULL,
-                a->cancel, a->cancel_ud, &err)
-          : motiris_transport_send(a->transport, url, authp, body,
-                                   a->cancel, a->cancel_ud, &err);
-      delta_seen = forward.seen;
-      reasoning_seen = reasoning.seen;
-      free(body);
-      if (run_cancelled(a)) {
+        char *err = NULL;
+        char *error_body = NULL;
+        DeltaForward forward = { a->on_delta, a->delta_ud, 0 };
+        ReasoningForward reasoning = {
+          a->on_reasoning, a->reasoning_ud, 0
+        };
+        char *resp = a->stream
+            ? motiris_transport_send_stream(
+                  a->transport, url, authp, body,
+                  a->on_delta && !confirm_asked ? forward_delta : NULL,
+                  a->on_delta && !confirm_asked ? &forward : NULL,
+                  a->on_reasoning && !confirm_asked ? forward_reasoning : NULL,
+                  a->on_reasoning && !confirm_asked ? &reasoning : NULL,
+                  a->cancel, a->cancel_ud, &err, &error_body)
+            : motiris_transport_send(a->transport, url, authp, body,
+                                     a->cancel, a->cancel_ud, &err,
+                                     &error_body);
+        delta_seen = forward.seen;
+        reasoning_seen = reasoning.seen;
+        free(body);
+        if (run_cancelled(a)) {
+          free(resp);
+          free(err);
+          free(error_body);
+          free(last_err);
+          return cancel_run(a, run_tail, start_tok_in, start_tok_out);
+        }
+        if (!resp) {
+          free(last_err);
+          last_err = malloc((err ? strlen(err) : 0) + 32);
+          sprintf(last_err, "transport error: %s", err ? err : "(unknown)");
+          report_attempt_failure(a, provider, attempt, last_err, error_body);
+          free(err);
+          free(error_body);
+          /* Any visible provider output cannot be mixed with another attempt. */
+          if (delta_seen || reasoning_seen) stop_providers = 1;
+          goto attempt_failed;
+        }
+
+        free(error_body);
+        j = cJSON_Parse(resp);
+        if (!j) {
+          free(last_err);
+          last_err = sdup("cannot parse model response");
+          report_attempt_failure(a, provider, attempt, last_err, resp);
+          free(resp);
+          free(err);
+          if (delta_seen || reasoning_seen) stop_providers = 1;
+          goto attempt_failed;
+        }
+        cJSON *errj = cJSON_GetObjectItemCaseSensitive(j, "error");
+        if (errj) {
+          const char *em = cJSON_IsObject(errj)
+              ? cJSON_GetStringValue(
+                    cJSON_GetObjectItemCaseSensitive(errj, "message"))
+              : cJSON_GetStringValue(errj);
+          free(last_err);
+          last_err = malloc((em ? strlen(em) : 0) + 16);
+          sprintf(last_err, "api error: %s", em ? em : "(unknown)");
+          report_attempt_failure(a, provider, attempt, last_err, resp);
+          cJSON_Delete(j);
+          j = NULL;
+          free(resp);
+          free(err);
+          if (delta_seen || reasoning_seen) stop_providers = 1;
+          goto attempt_failed;
+        }
+        cJSON *candidate_choice = cJSON_GetArrayItem(
+            cJSON_GetObjectItemCaseSensitive(j, "choices"), 0);
+        if (!cJSON_IsObject(candidate_choice)) {
+          free(last_err);
+          last_err = sdup("response has no choices");
+          report_attempt_failure(a, provider, attempt, last_err, resp);
+          cJSON_Delete(j);
+          j = NULL;
+          free(resp);
+          free(err);
+          if (delta_seen || reasoning_seen) stop_providers = 1;
+          goto attempt_failed;
+        }
+        cJSON *candidate_message = cJSON_GetObjectItemCaseSensitive(
+            candidate_choice, "message");
+        if (!cJSON_IsObject(candidate_message)) {
+          free(last_err);
+          last_err = sdup("response message missing");
+          report_attempt_failure(a, provider, attempt, last_err, resp);
+          cJSON_Delete(j);
+          j = NULL;
+          free(resp);
+          free(err);
+          if (delta_seen || reasoning_seen) stop_providers = 1;
+          goto attempt_failed;
+        }
+        if (a->verbose) {
+          agent_diagnostic(a, "[motiris] response: %.200s%s\n", resp,
+                           strlen(resp) > 200 ? "..." : "");
+        }
         free(resp);
         free(err);
-        free(last_err);
-        return cancel_run(a, run_tail, start_tok_in, start_tok_out);
-      }
-      if (!resp) {
-        free(last_err);
-        last_err = malloc((err ? strlen(err) : 0) + 32);
-        sprintf(last_err, "transport error: %s", err ? err : "(unknown)");
-        free(err);
-        if (a->verbose && a->nproviders > 0)
-          agent_diagnostic(a, "[motiris] provider %s failed: %s\n",
-                           pname(a, pi), last_err);
-        /* Any visible provider output cannot be mixed with a fallback. */
-        if (delta_seen || reasoning_seen) break;
-        continue;
-      }
-      if (a->verbose) {
-        agent_diagnostic(a, "[motiris] response: %.200s%s\n", resp,
-                         strlen(resp) > 200 ? "..." : "");
-      }
+        /* accumulate usage/token stats from this response */
+        cJSON *usage = cJSON_GetObjectItemCaseSensitive(j, "usage");
+        if (cJSON_IsObject(usage)) {
+          cJSON *pt = cJSON_GetObjectItemCaseSensitive(usage, "prompt_tokens");
+          cJSON *ct = cJSON_GetObjectItemCaseSensitive(usage, "completion_tokens");
+          if (cJSON_IsNumber(pt)) a->tok_in += (long)pt->valuedouble;
+          if (cJSON_IsNumber(ct)) a->tok_out += (long)ct->valuedouble;
+        }
+        break; /* got a usable response */
 
-      j = cJSON_Parse(resp);
-      free(resp);
-      if (!j) {
-        free(last_err);
-        last_err = sdup("cannot parse model response");
-        if (delta_seen || reasoning_seen) break;
-        continue;
+attempt_failed:
+        if (stop_providers || attempt >= a->max_retries) break;
+        if (run_cancelled(a)) {
+          free(last_err);
+          return cancel_run(a, run_tail, start_tok_in, start_tok_out);
+        }
+        unsigned int delay = (unsigned int)a->retry_base_seconds << attempt;
+        int wait_status = retry_wait(a, delay);
+        if (run_cancelled(a)) {
+          free(last_err);
+          return cancel_run(a, run_tail, start_tok_in, start_tok_out);
+        }
+        if (wait_status) {
+          free(last_err);
+          last_err = sdup(wait_status == -2
+              ? "retry backoff unavailable without host I/O"
+              : "retry backoff failed");
+          stop_providers = 1;
+          break;
+        }
       }
-      cJSON *errj = cJSON_GetObjectItemCaseSensitive(j, "error");
-      if (errj) {
-        const char *em = cJSON_IsObject(errj)
-            ? cJSON_GetStringValue(
-                  cJSON_GetObjectItemCaseSensitive(errj, "message"))
-            : cJSON_GetStringValue(errj);
-        free(last_err);
-        last_err = malloc((em ? strlen(em) : 0) + 16);
-        sprintf(last_err, "api error: %s", em ? em : "(unknown)");
-        cJSON_Delete(j);
-        j = NULL;
-        if (a->verbose && a->nproviders > 0)
-          agent_diagnostic(a, "[motiris] provider %s failed: %s\n",
-                           pname(a, pi), last_err);
-        if (delta_seen || reasoning_seen) break;
-        continue;
-      }
-      /* accumulate usage/token stats from this response */
-      cJSON *usage = cJSON_GetObjectItemCaseSensitive(j, "usage");
-      if (cJSON_IsObject(usage)) {
-        cJSON *pt = cJSON_GetObjectItemCaseSensitive(usage, "prompt_tokens");
-        cJSON *ct = cJSON_GetObjectItemCaseSensitive(usage, "completion_tokens");
-        if (cJSON_IsNumber(pt)) a->tok_in += (long)pt->valuedouble;
-        if (cJSON_IsNumber(ct)) a->tok_out += (long)ct->valuedouble;
-      }
-      break; /* got a usable response */
+      if (j) break;
     }
 
     if (!j) {

@@ -4,8 +4,9 @@
  *                defaults: a variable already exported in the calling
  *                environment wins. Parsed (never sourced) - plain text.
  *   config.json  optional JSON: model, base_url, api_key_env,
- *                max_steps, transport, stream, approval, reasoning_effort,
- *                think_mode, max_tokens, show_thinking, system, plugin_dir,
+ *                max_steps, max_retries, retry_base_seconds, transport, stream,
+ *                approval, reasoning_effort, think_mode, max_tokens,
+ *                show_thinking, system, plugin_dir,
  *                tools, plugins.
  *
  * Precedence: CLI flags > config.json > env file > built-in defaults.
@@ -259,6 +260,17 @@ void motiris_apply_config(MotirisAgent *a) {
     else
       fprintf(stderr, "motiris: invalid max_steps; using existing value\n");
   }
+  if (cJSON_GetObjectItemCaseSensitive(j, "max_retries")) {
+    int value = jint(j, "max_retries", motiris_max_retries(a), 0, 8);
+    if (motiris_set_max_retries(a, value))
+      fprintf(stderr, "motiris: invalid max_retries; using existing value\n");
+  }
+  if (cJSON_GetObjectItemCaseSensitive(j, "retry_base_seconds")) {
+    int value = jint(j, "retry_base_seconds",
+                     motiris_retry_base_seconds(a), 0, 60);
+    if (motiris_set_retry_base_seconds(a, value))
+      fprintf(stderr, "motiris: invalid retry_base_seconds; using existing value\n");
+  }
   if (cJSON_GetObjectItemCaseSensitive(j, "stream"))
     motiris_set_stream(a, jbool(j, "stream", 1));
   if ((s = jstr(j, "approval"))) {
@@ -385,6 +397,8 @@ int motiris_init_config(void) {
     "  \"base_url\": \"https://token.moi.matrixorigin.cn/v1/chat/completions\",\n"
     "  \"api_key_env\": \"MOI_TAAS_API_KEY\",\n"
     "  \"max_steps\": 0,\n"
+    "  \"max_retries\": 0,\n"
+    "  \"retry_base_seconds\": 1,\n"
     "  \"transport\": \"auto\",\n"
     "  \"stream\": true,\n"
     "  \"approval\": \"off\",\n"
@@ -417,7 +431,8 @@ int motiris_init_config(void) {
     "---\n"
     "# Motiris configuration\n\n"
     "Use `motiris set config KEY VALUE` or `motiris --config KEY VALUE` for JSON.\n"
-    "Keys: stream (boolean), max_steps (0 unlimited or positive), approval (off|ask),\n"
+    "Keys: stream (boolean), max_steps (0 unlimited or positive), max_retries (0..8),\n"
+    "retry_base_seconds (0..60), approval (off|ask),\n"
     "reasoning_effort (off|low|medium|high), think_mode (provider|on|off),\n"
     "max_tokens (0 provider default or positive), show_thinking (boolean),\n"
     "workspace_guard (boolean; off permits any OS-accessible path).\n"
@@ -570,6 +585,8 @@ static const ConfigKey CONFIG_KEYS[] = {
   { "plugins", CONFIG_BOOL, 0 },
   { "goal_check", CONFIG_BOOL, 0 },
   { "max_steps", CONFIG_INT, 0 },
+  { "max_retries", CONFIG_INT, 0 },
+  { "retry_base_seconds", CONFIG_INT, 0 },
 };
 
 static int config_error(const char *path, const char *reason) {
@@ -785,7 +802,7 @@ int motiris_set_config(const char *key, const char *value) {
             "shell_deny, stream, show_thinking, workspace_guard, approval, reasoning_effort, "
             "context_compaction, compaction_threshold, compaction_keep, "
             "compaction_max_chars, think_mode, max_tokens, tools, plugins, "
-            "goal_check or max_steps)\n");
+            "goal_check, max_steps, max_retries or retry_base_seconds)\n");
     return 1;
   }
   if (spec->nonempty && !*value) {
@@ -811,6 +828,12 @@ int motiris_set_config(const char *key, const char *value) {
     int_value = strtol(value, &end, 10);
     if (errno == ERANGE || !end || *end || int_value < 0 || int_value > INT_MAX) {
       fprintf(stderr, "motiris: %s must be an integer in 0..%d\n", key, INT_MAX);
+      return 1;
+    }
+    if ((!strcmp(key, "max_retries") && int_value > 8) ||
+        (!strcmp(key, "retry_base_seconds") && int_value > 60)) {
+      fprintf(stderr, "motiris: %s must be an integer in 0..%d\n",
+              key, !strcmp(key, "max_retries") ? 8 : 60);
       return 1;
     }
   } else if ((!strcmp(key, "compaction_threshold") && (int_value < 4 || int_value > 256)) ||
