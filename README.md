@@ -252,13 +252,16 @@ fail closed without executing the tool.
 `endpoint`, `think_mode`, `max_tokens` and `reasoning_effort`. `think_mode` is
 `provider` (omit the request field), `on` or `off` (JSON boolean); `max_tokens=0`
 omits the field, while a positive value sends an integer. Changes apply to the
-current session immediately. Saving writes non-secret settings to `config.json`;
+current session immediately. Closing after unsaved changes prompts for `y`
+(save), `n` (keep session-only values) or Escape (return to the card); there is
+no separate save row. A failed save leaves the card and pending values open for
+retry. Confirmed saving writes non-secret settings to `config.json`;
 a newly entered API key is hidden while typing and atomically saved only as
 `MOTIRIS_API_KEY` in the mode-0600 env file, with `api_key_env` referencing it.
 Each field/file replacement is independently atomic, not a multi-file
 transaction; partial failures are reported, and a pending new key remains
-available for Save after closing/reopening the card or correcting a failed
-write. Empty key input leaves the current credential unchanged. Existing `providers[]`
+available for a later confirmed save after closing/reopening the card or
+correcting a failed write. Empty key input leaves the current credential unchanged. Existing `providers[]`
 fallback entries remain independent of this default-provider card.
 
 Opening or editing `/model` performs no network I/O. Only **Refresh models**
@@ -268,8 +271,12 @@ authenticated GET with the effective default credential. Discovery requires the
 `auto`/`libcurl` transport, does not follow redirects, uses a 15-second total
 timeout and a 1 MiB response cap, and retains at most 128 exact model IDs of up
 to 512 bytes. HTTP, cancellation and malformed-response errors are bounded and
-do not include response bodies or credentials. Left/right on `model_id` selects
-from the fetched list; non-TTY `/model` prints a masked summary only.
+do not include response bodies or credentials. Enter on `model_id` expands the
+fetched IDs inline (with a scrolling window for long lists); up/down navigate,
+Enter applies the exact ID, and q/Escape cancels without changing it. `e` keeps
+manual editing available, while left/right remains a quick-cycle shortcut.
+Non-TTY `/model` prints a masked summary only. Both the card and its text editor
+redraw only after actual input or state changes, never on raw-read timeouts.
 
 REPL streaming prints a final answer once: the agent suppresses the aggregated
 copy only when the selected backend actually delivered text deltas, while buffered,

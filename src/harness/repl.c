@@ -118,6 +118,7 @@ typedef struct {
   /* A newly entered credential stays pending across model-card close/reopen
    * and failed saves. It is cleansed only after complete save or REPL exit. */
   char *pending_api_key;
+  int model_config_dirty;
 } ReplState;
 
 static void clear_pending_api_key(ReplState *state) {
@@ -230,21 +231,28 @@ static void card_terminal_stop(CardTerminal *terminal) {
   terminal->active = 0;
 }
 
-/* u/d/l/r navigate, Enter selects, q/Escape/Ctrl+C closes. */
+#define CARD_KEY_EOF (-1)
+#define CARD_KEY_INTERRUPT (-2)
+
+/* u/d/l/r navigate, Enter selects, q/Escape/Ctrl+C closes. EOF is distinct
+ * so a dirty-card confirmation cannot turn a terminal hangup into a loop. */
 static int card_read_key(void) {
   unsigned char c;
   ssize_t n = read(STDIN_FILENO, &c, 1);
   if (n < 0 && errno == EINTR)
-    return atomic_load_explicit(&card_interrupted, memory_order_relaxed) ? 'q' : 0;
-  if (n < 0) return 'q';
+    return atomic_load_explicit(&card_interrupted, memory_order_relaxed)
+        ? CARD_KEY_INTERRUPT : 0;
+  if (n < 0) return CARD_KEY_EOF;
   if (n == 0) {
     struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
     if (poll(&pfd, 1, 0) > 0 &&
-        (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) return 'q';
+        (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) return CARD_KEY_EOF;
   }
   if (n <= 0)
-    return atomic_load_explicit(&card_interrupted, memory_order_relaxed) ? 'q' : 0;
-  if (c == 3 || c == 'q' || c == 'Q') return 'q';
+    return atomic_load_explicit(&card_interrupted, memory_order_relaxed)
+        ? CARD_KEY_INTERRUPT : 0;
+  if (c == 3) return CARD_KEY_INTERRUPT;
+  if (c == 'q' || c == 'Q') return 'q';
   if (c == '\r' || c == '\n') return '\n';
   if (c == 's' || c == 'S') return 's';
   if (c != 27) return (int)c;
@@ -313,16 +321,22 @@ static void config_card(ReplState *state) {
   static const char *const efforts[] = { "", "low", "medium", "high" };
   CardTerminal terminal;
   if (!card_terminal_start(&terminal)) return;
-  int selected = 0, save = 0, session_action = 0, done = 0;
+  int selected = 0, save = 0, session_action = 0, done = 0, redraw = 1;
   while (!done) {
-    draw_config_card(a, selected);
+    if (redraw) {
+      draw_config_card(a, selected);
+      redraw = 0;
+    }
     int key = card_read_key();
-    if (key == 'q') break;
+    if (!key) continue;
+    if (key == 'q' || key == CARD_KEY_EOF || key == CARD_KEY_INTERRUPT) break;
     if (key == 'u' || key == 'l') {
       selected = (selected + 9) % 10;
+      redraw = 1;
       continue;
     } else if (key == 'd' || key == 'r') {
       selected = (selected + 1) % 10;
+      redraw = 1;
       continue;
     } else if (key == 's') { save = 1; break; }
     else if (key != '\n') continue;
@@ -350,6 +364,7 @@ static void config_card(ReplState *state) {
     else if (selected == 7) { session_action = 2; done = 1; }
     else if (selected == 8) { save = 1; done = 1; }
     else if (selected == 9) done = 1;
+    redraw = 1;
   }
   card_terminal_stop(&terminal);
   if (save) save_config_card(a);
@@ -380,12 +395,16 @@ static void config_card(ReplState *state) {
 }
 
 /* ---------------- default-provider model card ---------------- */
-#define MODEL_CARD_ROWS 9
+#define MODEL_CARD_ROWS 8
+#define MODEL_CARD_VISIBLE_MODELS 8
 #define MODEL_CARD_KEY_MAX 489
 
 typedef struct {
   cJSON *models;
   int model_index;
+  int expanding;
+  int choice_index;
+  int *dirty;
   char status[160];
 } ModelCard;
 
@@ -397,6 +416,8 @@ static void model_card_clear_models(ModelCard *card) {
   cJSON_Delete(card->models);
   card->models = NULL;
   card->model_index = -1;
+  card->expanding = 0;
+  card->choice_index = -1;
 }
 
 static void draw_model_card(MotirisAgent *a, const ModelCard *card,
@@ -414,19 +435,39 @@ static void draw_model_card(MotirisAgent *a, const ModelCard *card,
   else snprintf(refresh, sizeof refresh, "manual GET /models");
 
   printf("\033[2J\033[H" C_BOLD "Model configuration" C_RESET "\r\n"
-         "Enter: edit/change  arrows: navigate  s: save  q: close\r\n\r\n");
-  card_row(selected == 0, "model_id:", model);
-  card_row(selected == 1, "think_mode:", motiris_think_mode(a));
-  card_row(selected == 2, "max_tokens:", tokens);
-  card_row(selected == 3, "reasoning:", effort && *effort ? effort : "provider");
-  card_row(selected == 4, "endpoint:", endpoint);
-  card_row(selected == 5, "api_key:",
+         "Enter: edit/select  arrows: navigate  q: close\r\n\r\n");
+  card_row(!card->expanding && selected == 0, "model_id:", model);
+  if (card->expanding && count > 0) {
+    printf("  fetched models (Enter: choose, q/Esc: cancel)\r\n");
+    int start = card->choice_index - MODEL_CARD_VISIBLE_MODELS / 2;
+    if (start < 0) start = 0;
+    if (start > count - MODEL_CARD_VISIBLE_MODELS)
+      start = count - MODEL_CARD_VISIBLE_MODELS;
+    if (start < 0) start = 0;
+    int end = start + MODEL_CARD_VISIBLE_MODELS;
+    if (end > count) end = count;
+    for (int i = start; i < end; i++) {
+      const char *id = cJSON_GetStringValue(cJSON_GetArrayItem(card->models, i));
+      char safe_id[96], label[32];
+      clip(safe_id, sizeof safe_id, id ? id : "", 72);
+      snprintf(label, sizeof label, "  [%d/%d]", i + 1, count);
+      card_row(i == card->choice_index, label, safe_id);
+    }
+    if (count > MODEL_CARD_VISIBLE_MODELS)
+      printf("  showing %d-%d of %d\r\n", start + 1, end, count);
+  }
+  card_row(!card->expanding && selected == 1, "think_mode:",
+           motiris_think_mode(a));
+  card_row(!card->expanding && selected == 2, "max_tokens:", tokens);
+  card_row(!card->expanding && selected == 3, "reasoning:",
+           effort && *effort ? effort : "provider");
+  card_row(!card->expanding && selected == 4, "endpoint:", endpoint);
+  card_row(!card->expanding && selected == 5, "api_key:",
            motiris_api_key_configured(a) ? "(set)" : "(not set)");
-  card_row(selected == 6, "refresh models", refresh);
-  card_row(selected == 7, "save changes", "config.json + mode-0600 env");
-  card_row(selected == 8, "close", "keep session values");
-  if (count > 0)
-    printf("\r\nleft/right on model_id: select a fetched model (%s%d/%d)\r\n",
+  card_row(!card->expanding && selected == 6, "refresh models", refresh);
+  card_row(!card->expanding && selected == 7, "close", "keep session values");
+  if (count > 0 && !card->expanding)
+    printf("\r\nmodel_id Enter: expand choices; e: edit; left/right: cycle (%s%d/%d)\r\n",
            card->model_index >= 0 ? "" : "none, ",
            card->model_index >= 0 ? card->model_index + 1 : 0, count);
   if (motiris_provider_count(a) > 0)
@@ -442,17 +483,21 @@ static void draw_model_card(MotirisAgent *a, const ModelCard *card,
 static int card_edit_text(const char *label, char *value, size_t cap,
                           int secret) {
   size_t length = strlen(value);
+  int redraw = 1;
   for (;;) {
-    printf("\033[2J\033[H" C_BOLD "Edit %s" C_RESET "\r\n\r\n", label);
-    if (secret) printf("(hidden input, %zu bytes)\r\n", length);
-    else {
-      char display[256];
-      clip(display, sizeof display, value, 200);
-      printf("%s\r\n", display);
+    if (redraw) {
+      printf("\033[2J\033[H" C_BOLD "Edit %s" C_RESET "\r\n\r\n", label);
+      if (secret) printf("(hidden input, %zu bytes)\r\n", length);
+      else {
+        char display[256];
+        clip(display, sizeof display, value, 200);
+        printf("%s\r\n", display);
+      }
+      printf("\r\nEnter: apply  Ctrl+U: clear  Backspace: delete  Esc: cancel\r\n");
+      if (secret) printf("empty input keeps the current API key\r\n");
+      fflush(stdout);
+      redraw = 0;
     }
-    printf("\r\nEnter: apply  Ctrl+U: clear  Backspace: delete  Esc: cancel\r\n");
-    if (secret) printf("empty input keeps the current API key\r\n");
-    fflush(stdout);
 
     unsigned char c;
     ssize_t n = read(STDIN_FILENO, &c, 1);
@@ -470,18 +515,20 @@ static int card_edit_text(const char *label, char *value, size_t cap,
     }
     if (c == 3 || c == 27) return 0;
     if (c == '\r' || c == '\n') return 1;
-    if (c == 21) { value[0] = '\0'; length = 0; continue; }
+    if (c == 21) { value[0] = '\0'; length = 0; redraw = 1; continue; }
     if (c == 8 || c == 127) {
       if (length) {
         length--;
         while (length && ((unsigned char)value[length] & 0xc0) == 0x80) length--;
         value[length] = '\0';
+        redraw = 1;
       }
       continue;
     }
     if (c >= 32 && c != 127 && length + 1 < cap) {
       value[length++] = (char)c;
       value[length] = '\0';
+      redraw = 1;
     }
   }
 }
@@ -510,13 +557,25 @@ static int model_card_edit_text(MotirisAgent *a, ReplState *state,
     if (secret) memset(value, 0, sizeof value);
     return 0;
   }
+  int changed = 0;
   if (field == 0) {
-    motiris_set_model(a, value);
-    model_card_status(card, "model updated for this session");
+    const char *current = motiris_model(a);
+    if (!current || strcmp(current, value)) {
+      motiris_set_model(a, value);
+      changed = 1;
+      model_card_status(card, "model updated for this session");
+    } else model_card_status(card, "model unchanged");
   } else if (field == 4) {
-    motiris_set_base_url(a, value);
-    model_card_clear_models(card);
-    model_card_status(card, "endpoint updated; refresh to discover models");
+    const char *current = motiris_base_url(a);
+    if (!current || strcmp(current, value)) {
+      motiris_set_base_url(a, value);
+      model_card_clear_models(card);
+      changed = 1;
+      model_card_status(card, "endpoint updated; refresh to discover models");
+    } else model_card_status(card, "endpoint unchanged");
+  } else if (state->pending_api_key && !strcmp(state->pending_api_key, value)) {
+    memset(value, 0, sizeof value);
+    model_card_status(card, "API key unchanged");
   } else {
     char *pending = strdup(value);
     memset(value, 0, sizeof value);
@@ -528,8 +587,10 @@ static int model_card_edit_text(MotirisAgent *a, ReplState *state,
     state->pending_api_key = pending;
     motiris_set_api_key(a, state->pending_api_key);
     model_card_clear_models(card);
+    changed = 1;
     model_card_status(card, "API key updated without terminal echo");
   }
+  if (changed) *card->dirty = 1;
   return 1;
 }
 
@@ -541,10 +602,19 @@ static void model_card_edit_tokens(MotirisAgent *a, ModelCard *card) {
   errno = 0;
   long parsed = strtol(value, &end, 10);
   if (errno == ERANGE || !end || *end || end == value || parsed < 0 ||
-      parsed > INT_MAX || motiris_set_max_tokens(a, (int)parsed)) {
+      parsed > INT_MAX) {
     model_card_status(card, "invalid max_tokens; expected 0..2147483647");
     return;
   }
+  if (parsed == motiris_max_tokens(a)) {
+    model_card_status(card, "max_tokens unchanged");
+    return;
+  }
+  if (motiris_set_max_tokens(a, (int)parsed)) {
+    model_card_status(card, "invalid max_tokens; expected 0..2147483647");
+    return;
+  }
+  *card->dirty = 1;
   model_card_status(card, "max_tokens updated for this session");
 }
 
@@ -578,7 +648,11 @@ static void model_card_select_model(MotirisAgent *a, ModelCard *card,
   const char *id = cJSON_GetStringValue(cJSON_GetArrayItem(
       card->models, card->model_index));
   if (id) {
-    motiris_set_model(a, id);
+    const char *current = motiris_model(a);
+    if (!current || strcmp(current, id)) {
+      motiris_set_model(a, id);
+      *card->dirty = 1;
+    }
     model_card_status(card, "fetched model selected for this session");
   }
 }
@@ -609,7 +683,53 @@ static void model_card_refresh(MotirisAgent *a, ModelCard *card) {
     const char *id = cJSON_GetStringValue(cJSON_GetArrayItem(models, i));
     if (id && current && !strcmp(id, current)) { card->model_index = i; break; }
   }
-  model_card_status(card, "refresh complete; left/right on model_id to select");
+  model_card_status(card, "refresh complete; Enter on model_id to expand choices");
+}
+
+static void model_card_expand(ModelCard *card) {
+  int count = cJSON_GetArraySize(card->models);
+  if (!count) {
+    model_card_status(card, "refresh models first, or use e to edit manually");
+    return;
+  }
+  card->expanding = 1;
+  card->choice_index = card->model_index >= 0 ? card->model_index : 0;
+  model_card_status(card, "up/down: navigate  Enter: apply  q/Esc: cancel");
+}
+
+static void model_card_apply_choice(MotirisAgent *a, ModelCard *card) {
+  const char *id = cJSON_GetStringValue(cJSON_GetArrayItem(
+      card->models, card->choice_index));
+  if (id) {
+    const char *current = motiris_model(a);
+    if (!current || strcmp(current, id)) {
+      motiris_set_model(a, id);
+      *card->dirty = 1;
+    }
+    card->model_index = card->choice_index;
+    model_card_status(card, "fetched model selected for this session");
+  }
+  card->expanding = 0;
+  card->choice_index = -1;
+}
+
+static void model_card_cancel_choice(ModelCard *card) {
+  card->expanding = 0;
+  card->choice_index = -1;
+  model_card_status(card, "selection cancelled");
+}
+
+static int model_card_confirm_close(void) {
+  printf("\033[2J\033[H" C_BOLD "Save configuration before closing?" C_RESET
+         "\r\n\r\n[y] save  [n] keep session only  [Esc] return\r\n");
+  fflush(stdout);
+  for (;;) {
+    int key = card_read_key();
+    if (key == 'y' || key == 'Y') return 'y';
+    if (key == 'n' || key == 'N' || key == CARD_KEY_EOF ||
+        key == CARD_KEY_INTERRUPT) return 'n';
+    if (key == 'q') return 'q';
+  }
 }
 
 static int save_model_card(MotirisAgent *a, ReplState *state) {
@@ -643,35 +763,91 @@ static void model_card(ReplState *state) {
   ModelCard card;
   memset(&card, 0, sizeof card);
   card.model_index = -1;
-  model_card_status(&card, "session changes are immediate; s saves settings");
+  card.choice_index = -1;
+  card.dirty = &state->model_config_dirty;
+  model_card_status(&card, "session changes are immediate; close asks to save");
   CardTerminal terminal;
   if (!card_terminal_start(&terminal)) return;
-  int selected = 0, save = 0, done = 0;
+  int selected = 0, done = 0, redraw = 1;
   while (!done) {
-    draw_model_card(a, &card, selected);
+    if (redraw) {
+      draw_model_card(a, &card, selected);
+      redraw = 0;
+    }
     int key = card_read_key();
-    if (key == 'q') break;
-    if (key == 'u') { selected = (selected + MODEL_CARD_ROWS - 1) % MODEL_CARD_ROWS; continue; }
-    if (key == 'd') { selected = (selected + 1) % MODEL_CARD_ROWS; continue; }
-    if (key == 's') { save = 1; break; }
+    if (!key) continue;  /* raw-read timeout: leave the screen untouched */
+    if (key == CARD_KEY_EOF || key == CARD_KEY_INTERRUPT) {
+      done = 1;  /* EOF/Ctrl+C is a force-close, never a confirmation loop. */
+      break;
+    }
+
+    if (card.expanding) {
+      int count = cJSON_GetArraySize(card.models);
+      if (key == 'u' || key == 'd') {
+        int direction = key == 'd' ? 1 : -1;
+        card.choice_index = (card.choice_index + direction + count) % count;
+        redraw = 1;
+      } else if (key == '\n') {
+        model_card_apply_choice(a, &card);
+        redraw = 1;
+      } else if (key == 'q') {
+        model_card_cancel_choice(&card);
+        redraw = 1;
+      }
+      continue;
+    }
+
+    if (key == 'q' || (key == '\n' && selected == 7)) {
+      if (!*card.dirty) { done = 1; break; }
+      int confirm = model_card_confirm_close();
+      if (confirm == 'q') { redraw = 1; continue; }
+      if (confirm == 'n') { done = 1; break; }
+      card_terminal_stop(&terminal);
+      if (!save_model_card(a, state)) {
+        *card.dirty = 0;
+        done = 1;
+        break;
+      }
+      /* Keep the card and all pending values available for an immediate retry. */
+      if (!card_terminal_start(&terminal)) { done = 1; break; }
+      model_card_status(&card, "values could not be saved; q to retry");
+      redraw = 1;
+      continue;
+    }
+    if (key == 'u' || key == 'd') {
+      selected = (selected + (key == 'd' ? 1 : MODEL_CARD_ROWS - 1)) %
+                 MODEL_CARD_ROWS;
+      redraw = 1;
+      continue;
+    }
     if ((key == 'l' || key == 'r') && selected == 0) {
       model_card_select_model(a, &card, key == 'r' ? 1 : -1);
+      redraw = 1;
       continue;
     }
     if (key == 'l' || key == 'r') continue;
+    if (key == 'e' && selected == 0) {
+      (void)model_card_edit_text(a, state, &card, 0);
+      redraw = 1;
+      continue;
+    }
     if (key != '\n') continue;
 
-    if (selected == 0 || selected == 4 || selected == 5)
+    if (selected == 0 && cJSON_GetArraySize(card.models) > 0)
+      model_card_expand(&card);
+    else if (selected == 0 || selected == 4 || selected == 5)
       (void)model_card_edit_text(a, state, &card, selected);
-    else if (selected == 1) model_card_cycle_think(a);
-    else if (selected == 2) model_card_edit_tokens(a, &card);
-    else if (selected == 3) model_card_cycle_reasoning(a);
-    else if (selected == 6) model_card_refresh(a, &card);
-    else if (selected == 7) { save = 1; done = 1; }
-    else if (selected == 8) done = 1;
+    else if (selected == 1) {
+      model_card_cycle_think(a);
+      *card.dirty = 1;
+    } else if (selected == 2) model_card_edit_tokens(a, &card);
+    else if (selected == 3) {
+      model_card_cycle_reasoning(a);
+      *card.dirty = 1;
+    } else if (selected == 6) model_card_refresh(a, &card);
+    redraw = 1;
   }
   card_terminal_stop(&terminal);
-  if (save) (void)save_model_card(a, state);
   model_card_clear_models(&card);
 }
 
@@ -695,14 +871,18 @@ static MotirisApprovalDecision approval_card(const char *name,
   (void)ud;
   CardTerminal terminal;
   if (!card_terminal_start(&terminal)) return MOTIRIS_APPROVAL_DENY;
-  int selected = 0;
+  int selected = 0, redraw = 1;
   MotirisApprovalDecision decision = MOTIRIS_APPROVAL_DENY;
   for (;;) {
-    draw_approval_card(name, args, selected);
+    if (redraw) {
+      draw_approval_card(name, args, selected);
+      redraw = 0;
+    }
     int key = card_read_key();
-    if (key == 'q') break;
-    if (key == 'u' || key == 'l') selected = (selected + 2) % 3;
-    else if (key == 'd' || key == 'r') selected = (selected + 1) % 3;
+    if (!key) continue;
+    if (key == 'q' || key == CARD_KEY_EOF || key == CARD_KEY_INTERRUPT) break;
+    if (key == 'u' || key == 'l') { selected = (selected + 2) % 3; redraw = 1; }
+    else if (key == 'd' || key == 'r') { selected = (selected + 1) % 3; redraw = 1; }
     else if (key == '\n') {
       decision = selected == 0 ? MOTIRIS_APPROVAL_ALLOW_ONCE :
                  selected == 1 ? MOTIRIS_APPROVAL_ALLOW_SESSION :

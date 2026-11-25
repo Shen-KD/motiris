@@ -183,11 +183,17 @@ def test_config_card(env, home):
         repl.read_until("motiris> ")
         repl.clear()
         repl.send("/config\r")
-        initial = plain(repl.read_until("save changes"))
+        initial = plain(repl.read_until("keep session values"))
         for text in ("Session configuration", "stream: on", "approval: off",
                      "max_steps: 0", "thinking: off", "reasoning: provider",
                      "workspace_guard:", "save changes", "close"):
             assert text in initial, (text, initial)
+        repl.clear()
+        time.sleep(0.35)
+        ready, _, _ = select.select([repl.master], [], [], 0)
+        if ready:
+            repl.output.extend(os.read(repl.master, 65536))
+        assert not ready, "idle config card redrawn: " + plain(repl.output)
 
         # Cycle unlimited -> 5, then toggle stream off. Changes are immediate.
         repl.send("\x1b[B\x1b[B\r")
@@ -241,6 +247,7 @@ class ModelProvider(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), ModelHandler)
         self.requests = []
         self.status = 200
+        self.models = [{"id": "model-alpha"}, {"id": "org/exact:model"}]
 
 
 class ModelHandler(BaseHTTPRequestHandler):
@@ -250,9 +257,7 @@ class ModelHandler(BaseHTTPRequestHandler):
             "path": self.path, "body": body_in,
             "authorization": self.headers.get_all("Authorization") or [],
         })
-        body = json.dumps({"data": [
-            {"id": "model-alpha"}, {"id": "org/exact:model"},
-        ]}).encode()
+        body = json.dumps({"data": self.server.models}).encode()
         self.send_response(self.server.status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -261,6 +266,108 @@ class ModelHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args):
         pass
+
+
+def test_model_card_idle_does_not_redraw(env):
+    repl = Repl(env)
+    try:
+        repl.read_until("motiris> ")
+        repl.send("/model\r")
+        repl.read_until("session changes are immediate; close asks to save")
+        repl.clear()
+        time.sleep(0.35)  # several raw-read timeouts; no key was pressed
+        ready, _, _ = select.select([repl.master], [], [], 0)
+        if ready:
+            repl.output.extend(os.read(repl.master, 65536))
+        assert not ready, "idle card redrawn: " + plain(repl.output)
+        repl.send("\r")
+        repl.read_until("Esc: cancel")
+        repl.clear()
+        time.sleep(0.35)
+        ready, _, _ = select.select([repl.master], [], [], 0)
+        if ready:
+            repl.output.extend(os.read(repl.master, 65536))
+        assert not ready, "idle editor redrawn: " + plain(repl.output)
+        repl.send("\r")  # accept unchanged text: still no semantic edit
+        repl.read_until("model unchanged")
+        repl.send("q")  # no edits, so no save prompt
+        repl.read_until("motiris> ")
+        repl.send("/exit\r")
+        repl.read_until("bye")
+    finally:
+        repl.close()
+
+
+def test_model_card_expanded_choices(env, home):
+    home = home / "expanded-choices"
+    env = environment(home)
+    provider = ModelProvider()
+    provider.models = [{"id": "model-%02d" % i} for i in range(11)]
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    endpoint = "http://127.0.0.1:%d/v1/chat/completions" % provider.server_port
+    repl = Repl(env, command=[
+        str(BIN), "-i", "--transport", "libcurl", "--no-plugin",
+        "-b", endpoint,
+    ])
+    try:
+        repl.read_until("motiris> ")
+        repl.send("/model\r")
+        repl.read_until("keep session values")
+        repl.send("\x1b[B" * 6 + "\r")
+        repl.read_until("11 models loaded")
+        repl.send("\x1b[A" * 6 + "\r")
+        expanded = plain(repl.read_until("up/down: navigate"))
+        assert "model-00" in expanded and "model-07" in expanded, expanded
+        assert "model-10" not in expanded, expanded
+        # Up from the first item wraps to the last and scrolls the window.
+        repl.send("\x1b[A")
+        scrolled = plain(repl.read_until("showing 4-11 of 11"))
+        assert "model-10" in scrolled, scrolled
+        repl.send("\r")
+        repl.read_until(re.compile(r"model_id:\s+model-10"))
+
+        # Escape collapses the picker without applying the highlighted change.
+        repl.send("\r")
+        repl.read_until("up/down: navigate")
+        repl.send("\x1b[A")
+        repl.clear()
+        repl.send("\x1b")
+        cancelled = plain(repl.read_until("selection cancelled"))
+        final_frame = cancelled[cancelled.rfind("Model configuration"):]
+        assert re.search(r"model_id:\s+model-10", final_frame), final_frame
+        assert "model-09" not in final_frame, final_frame
+
+        # Manual editing remains available even after a list was fetched.
+        repl.send("e\x15manual-after-list\r")
+        repl.read_until(re.compile(r"model_id:\s+manual-after-list"))
+        repl.send("q")
+        repl.read_until("Save configuration before closing?")
+        repl.clear()
+        repl.send("\x1b")  # return to the card without closing
+        repl.read_until("model updated for this session")
+        repl.send("q")
+        repl.read_until("Save configuration before closing?")
+        repl.send("n")
+        repl.clear()
+        repl.read_until("motiris> ")
+        assert not (home / "config" / "config.json").exists()
+        # Declining save does not clear the REPL-scoped dirty state: reopening
+        # and closing again must still offer a save without another edit.
+        repl.send("/model\r")
+        repl.read_until("session changes are immediate; close asks to save")
+        repl.send("q")
+        repl.read_until("Save configuration before closing?")
+        repl.send("n")
+        repl.clear()
+        repl.read_until("motiris> ")
+        repl.send("/exit\r")
+        repl.read_until("bye")
+    finally:
+        repl.close()
+        provider.shutdown()
+        provider.server_close()
+        thread.join(timeout=5)
 
 
 def test_model_card(env, home):
@@ -277,12 +384,13 @@ def test_model_card(env, home):
         repl.read_until("motiris> ")
         repl.clear()
         repl.send("/model\r")
-        initial = plain(repl.read_until("save changes"))
+        initial = plain(repl.read_until("keep session values"))
         for text in ("Model configuration", "model_id:", "gpt-4o-mini",
                      "think_mode:", "provider", "max_tokens:", "0",
                      "reasoning:", "endpoint:", "api_key:", "(not set)",
-                     "refresh models", "save changes", "close"):
+                     "refresh models", "close"):
             assert text in initial, (text, initial)
+        assert "save changes" not in initial, initial
         assert provider.requests == [], "opening /model performed network I/O"
 
         # Every text field is edited inside the raw card, not through linenoise.
@@ -301,13 +409,15 @@ def test_model_card(env, home):
         assert secret not in masked, masked
         assert provider.requests == [], "editing fields performed network I/O"
 
-        # Closing does not discard a pending session credential: reopening and
-        # saving later must still persist it without retyping.
+        # Declining save keeps the session credential pending: a later explicit
+        # save must still persist it without retyping.
         repl.send("q")
+        repl.read_until("Save configuration before closing?")
+        repl.send("n")
         repl.read_until("motiris> ")
         repl.clear()
         repl.send("/model\r")
-        repl.read_until("save changes")
+        repl.read_until("keep session values")
         assert provider.requests == [], "reopening /model performed network I/O"
 
         # Only the explicit refresh action performs one authenticated GET.
@@ -319,12 +429,15 @@ def test_model_card(env, home):
         assert provider.requests[0]["body"] == b""
         assert provider.requests[0]["authorization"] == ["Bearer " + secret]
 
-        # Left/right on model_id selects exact IDs returned by the provider.
-        repl.send("\x1b[A" * 6 + "\x1b[C")
-        repl.read_until(re.compile(r"model_id:\s+model-alpha"))
-        repl.send("\x1b[C")
+        # Enter expands the fetched choices; down+Enter selects the exact ID.
+        repl.send("\x1b[A" * 6 + "\r")
+        expanded = plain(repl.read_until("up/down: navigate"))
+        assert "model-alpha" in expanded and "org/exact:model" in expanded, expanded
+        repl.send("\x1b[B\r")
         repl.read_until(re.compile(r"model_id:\s+org/exact:model"))
-        repl.send("\x1b[B" * 7 + "\r")  # save changes
+        repl.send("q")
+        repl.read_until("Save configuration before closing?")
+        repl.send("y")
         repl.read_until("model configuration saved")
         repl.read_until("motiris> ")
         saved = json.loads((home / "config" / "config.json").read_text())
@@ -342,7 +455,7 @@ def test_model_card(env, home):
         before = len(provider.requests)
         repl.clear()
         repl.send("/model\r")
-        repl.read_until("save changes")
+        repl.read_until("keep session values")
         assert len(provider.requests) == before
         provider.status = 401
         repl.send("\x1b[B" * 6 + "\r")
@@ -368,6 +481,29 @@ def test_model_card(env, home):
     assert secret not in output
 
 
+def test_model_card_interrupt_close_does_not_loop(env, home):
+    home = home / "interrupt-close"
+    env = environment(home)
+    repl = Repl(env)
+    try:
+        repl.read_until("motiris> ")
+        repl.send("/model\r")
+        repl.read_until("session changes are immediate; close asks to save")
+        repl.send("\x1b[B\r")  # dirty: provider -> on
+        repl.read_until(re.compile(r"think_mode:\s+on\b"))
+        repl.send("q")
+        repl.read_until("Save configuration before closing?")
+        repl.clear()
+        repl.send("\x03")
+        repl.read_until("motiris> ", timeout=2)
+        assert repl.proc.poll() is None
+        assert not (home / "config" / "config.json").exists()
+        repl.send("/exit\r")
+        repl.read_until("bye")
+    finally:
+        repl.close()
+
+
 def test_model_card_failed_save_retains_key(env, home):
     secret = "retry-secret-sentinel"
     repl = Repl(env)
@@ -375,7 +511,7 @@ def test_model_card_failed_save_retains_key(env, home):
     try:
         repl.read_until("motiris> ")
         repl.send("/model\r")
-        repl.read_until("save changes")
+        repl.read_until("keep session values")
         repl.send("\x1b[B" * 5 + "\r" + secret + "\r")
         repl.read_until(re.compile(r"api_key:\s+\(set\)"))
         config_json = config / "config.json"
@@ -383,16 +519,18 @@ def test_model_card_failed_save_retains_key(env, home):
             config_json.unlink()
         config_json.mkdir()  # deterministic regular-file rejection, even for UID 0
         repl.clear()
-        repl.send("s")
+        repl.send("q")
+        repl.read_until("Save configuration before closing?")
+        repl.send("y")
         failed = plain(repl.read_until("values could not be saved"))
         assert secret not in failed
-        repl.read_until("motiris> ")
         assert ("MOTIRIS_API_KEY=" + secret) in (config / "env").read_text()
+        # The card stays open after failure; fix the path and retry without
+        # reopening or retyping the credential.
         config_json.rmdir()
-        repl.send("/model\r")
-        repl.read_until("save changes")
-        repl.clear()
-        repl.send("s")
+        repl.send("q")
+        repl.read_until("Save configuration before closing?")
+        repl.send("y")
         repl.read_until("model configuration saved")
         assert ("MOTIRIS_API_KEY=" + secret) in (config / "env").read_text()
         saved = json.loads((config / "config.json").read_text())
@@ -418,8 +556,14 @@ def test_approval_card(env):
             repl.read_until(re.compile(r"approval:\s+ask"))
             repl.clear()
             repl.send("run a tool\r")
-            initial = plain(repl.read_until("allow for session"))
+            initial = plain(repl.read_until("q/Esc: deny"))
             assert "Tool approval" in initial and "shell" in initial, initial
+            repl.clear()
+            time.sleep(0.35)
+            ready, _, _ = select.select([repl.master], [], [], 0)
+            if ready:
+                repl.output.extend(os.read(repl.master, 65536))
+            assert not ready, "idle approval card redrawn: " + plain(repl.output)
             repl.send(keys)
             output = plain(repl.read_until("echo round complete: [ok]"))
             assert ("⚙ shell" in output) == should_execute, output
@@ -435,7 +579,10 @@ def main():
         test_model_editor_escapes_terminal_controls(env)
         test_non_tty_approval_fails_closed(env)
         test_config_card(env, Path(tmp))
+        test_model_card_idle_does_not_redraw(env)
+        test_model_card_expanded_choices(env, Path(tmp))
         test_model_card(env, Path(tmp))
+        test_model_card_interrupt_close_does_not_loop(env, Path(tmp))
         test_model_card_failed_save_retains_key(env, Path(tmp))
         test_approval_card(env)
     print("repl-cards: non-TTY commands, config/model cards and fail-closed approval passed")

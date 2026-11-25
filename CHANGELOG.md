@@ -137,6 +137,12 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- `/model` no longer redraws on raw-input timeouts, and its refreshed IDs now
+  expand into an inline scrolling option list with keyboard apply/cancel and
+  manual-edit fallback. Closing with unsaved changes prompts for save,
+  session-only or return instead of relying on a dedicated save row; failed
+  saves stay open for retry. `/config`, tool approval and text editing also
+  suppress idle redraws, with real-PTY coverage for every interaction mode.
 - `--no-tools` now fails closed across CLI, cron, Gateway, direct C API and
   real subagents: configured Plugin/MCP initialization, Skill tools, provider
   tool schemas and dispatch are all suppressed even when config says
