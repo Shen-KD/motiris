@@ -1051,6 +1051,16 @@ terminal rendering and invalidates it on endpoint/key changes or refresh failure
 Saving uses the existing atomic config editor plus `motiris_set_env`, which
 preserves unrelated env lines and replaces the mode-0600 file atomically without
 printing secrets. Plaintext `api_key` remains an invalid config.json key.
+Enter expands fetched model IDs into a bounded scrolling option window; Enter
+applies and q/Escape cancels without mutating the selection, while `e` retains
+manual editing. Dirty state belongs to `ReplState`, so declining save and
+reopening still offers a later save; unchanged values do not prompt. Closing
+with dirty values prompts for save/session-only/return, failed saves keep the
+card open, and distinct EOF/interrupt keycodes force a session-only close
+without a confirmation loop. `/model`, `/config`, approval and text
+editor loops redraw only on actual input/state changes, never on the 100ms
+raw-read timeout. `src/harness/` is the host runtime adapter layer (REPL,
+gateway, cron, sessions, plugins and MCP), not the test directory.
 
 Agent callbacks and run boundaries:
 
@@ -1176,9 +1186,13 @@ may still use its own atomic replacement.
   think/token/reasoning, endpoint and hidden-key edits, proves zero I/O before
   Refresh, checks one authenticated GET and exact discovered-ID selection, then
   verifies config/env persistence, restart reload and sanitized 401 output.
-  Close/reopen and deterministic env-success/config-failure retries retain the
-  pending credential; malicious OSC payloads cover summary, banner, raw editor,
-  verbose diagnostics and terminal-safe rendering without changing stored IDs.
+  Inline fetched-model expansion covers navigation, exact selection, cancel
+  without mutation and manual editing; close prompts cover save, session-only,
+  return and in-card failure retry. Idle assertions prove `/model`, `/config`,
+  approval and text editing emit no timeout redraws. Close/reopen and
+  deterministic env-success/config-failure retries retain the pending credential;
+  malicious OSC payloads cover summary, banner, raw editor, verbose diagnostics
+  and terminal-safe rendering without changing stored IDs.
   `/hotkey` prints interactive key bindings, Ctrl-U clears old rows, `/quit`
   fails locally without a model turn, and `/exit` remains the single exit command. A slow-SSE PTY case also sends
   Ctrl+C during generation, verifies the REPL survives and returns its prompt,
