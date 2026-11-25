@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import threading
@@ -759,11 +760,14 @@ class ProviderRetryTests(unittest.TestCase):
             repl.read_until("motiris> ")
             repl.clear()
             repl.send("retry route\r")
-            output = plain(repl.read_until("raw-pty-end", timeout=10))
+            # Match the prompt after the body in one ordered read. A separate
+            # read_until("motiris> ") can return immediately on the prompt
+            # echoed before the request because Repl keeps a cumulative buffer.
+            output = plain(repl.read_until(
+                re.compile(r"raw-pty-end[\s\S]*motiris> "), timeout=10))
             self.assertIn(large_body.decode(), output)
             self.assertEqual(self.provider.hits["/raw-pty"], 1)
-            tail = plain(repl.read_until("motiris> ", timeout=10))
-            after_body = tail.split("raw-pty-end", 1)[1]
+            after_body = output.split("raw-pty-end", 1)[1]
             # One terminator from core plus the existing TTY colour/turn break.
             self.assertTrue(after_body.startswith("\n\nmotiris:"),
                             repr(after_body[:100]))
