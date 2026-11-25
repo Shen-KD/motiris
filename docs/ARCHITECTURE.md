@@ -71,7 +71,11 @@ skill_write 工具。会话恢复已升级为有界 full-turn JSON checkpoint，
 **Agent 循环**(`agent.c`):装配请求(系统提示 + 历史 + tools 数组)→
 按 provider 顺序尝试 → libcurl 发送 → 解析响应 → 有 tool_calls 就执行
 工具、把结果作为 tool 消息追加 → 回到循环;finish_reason=stop 输出最终
-答案。token 计数从每次响应的 usage 累加。
+答案。token 计数从每次响应的 usage 累加。每个 provider 在 fallback 前可执行
+`max_retries` 次额外尝试；第 N 次重试前等待 `retry_base_seconds << (N-1)`
+秒，退避可取消。传输、HTTP、JSON/API 和 choices/message 结构失败均输出原始
+响应体或传输错误；一旦已经流出 answer/reasoning 增量则 fail closed，不重试、
+不混用其他 provider 的部分回答。
 
 **有界历史与会话快照**:core 在每 Agent 上分别维护 live/replay item/byte
 预算；live 淘汰只删除最老的完整 user turn，active turn 超限则失败，不留下

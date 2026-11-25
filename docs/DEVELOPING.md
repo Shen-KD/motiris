@@ -270,6 +270,15 @@ need real platform validation.
 entries, omitted/missing key environments, mixed-chain credential isolation,
 default-provider authentication, real fallback order, exactly zero/one
 Authorization headers per request, and default/entry 489/490-byte boundaries.
+`tests/provider_retry.py` covers configurable additional attempts per provider,
+base/2*base/4*base monotonic backoff, cancellation, exhaustion and fallback
+ordering for transport, HTTP, JSON/API and missing/null response failures. It
+requires exact original JSON/text bodies on every failed attempt across
+buffered, streamed and spawned-curl paths, including a diagnostic callback,
+REPL serialization and spawned-curl status-trailer budget boundaries. Visible
+answer/reasoning deltas forbid both retry and fallback. A strict C11 nofs probe
+allows zero-delay retries but rejects positive waits without host time/I/O;
+`make test-provider-retry` runs the complete offline suite.
 A later overlong entry rejects the whole chain before an earlier healthy
 provider can perform I/O, without leaking the key. `tests/transport.py`
 covers buffered, SSE wire/line/content/tool arguments, spawned curl, an
@@ -1042,7 +1051,9 @@ are read per call; no global session state is added.
 
 The REPL `/model` card edits the default provider through public Agent APIs.
 `think_mode=provider` omits the field, `on`/`off` send a JSON boolean, and
-`max_tokens=0` omits the numeric field. `motiris_fetch_models` is explicit and
+`max_tokens=0` omits the numeric field. `max_retries` is the additional attempt
+count (0..8); `retry_base_s` saves as `retry_base_seconds` (0..60) and drives
+the full left-shift backoff sequence. `motiris_fetch_models` is explicit and
 synchronous: it derives `/models`, shares default credential/auth bounds with
 generation, and returns a caller-owned cJSON array. Its bounded libcurl-only GET
 uses no redirect following, a 15-second timeout, a 1 MiB response cap, at most
@@ -1183,7 +1194,8 @@ may still use its own atomic replacement.
   to the expected subsets, up/down move a wrapping reverse-video selection and
   Enter accepts it. No-match rows leave arrows on history navigation.
   `tests/repl_cards.py` drives the `/model` raw-terminal editor through model,
-  think/token/reasoning, endpoint and hidden-key edits, proves zero I/O before
+  think/token/retry/backoff/reasoning, endpoint and hidden-key edits, proves
+  retry config persistence and restart reload, proves zero I/O before
   Refresh, checks one authenticated GET and exact discovered-ID selection, then
   verifies config/env persistence, restart reload and sanitized 401 output.
   Inline fetched-model expansion covers navigation, exact selection, cancel

@@ -117,6 +117,7 @@ rm -rf "$TH8"
 echo "$OUT" | grep -q 'fallback ok' || { echo "FAIL: $OUT"; exit 1; }
 echo "$OUT" | grep -q 'provider dead failed' || { echo "FAIL: dead not attempted"; exit 1; }
 python3 tests/provider.py
+python3 tests/provider_retry.py
 
 fi
 if test_in 9; then

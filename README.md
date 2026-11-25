@@ -114,6 +114,7 @@ make test-nofs        # strict-C11 core + file/memory/shell backend cut test
 make test-persistence # full-CLI volatile-only checkpoint backend cut test
 make test-core-nofs   # core-only retention + memory snapshot round-trip
 make test-shell       # bounded shell execution integration tests
+make test-provider-retry # provider retry/backoff/raw-error offline mocks
 make test-browser-subagent # bounded browser/subagent process tests
 make test-webtools-parser # malformed/truncated web_search parser regression
 make test-filetools   # malformed args, file bounds and atomic fault injection
@@ -239,6 +240,22 @@ used only when no provider list is configured. The fixed 512-byte
 prefix and NUL. Longer keys fail with a bounded error before any network I/O
 instead of silently sending an unauthenticated request.
 
+Provider retries are configured independently from the fallback list.
+`max_retries` (default 0, range 0..8) is the number of additional attempts on
+the current provider in each agent step. Before retry N, the delay in seconds
+is `retry_base_seconds << (N-1)` (default base 1, range 0..60), producing
+base, 2*base, 4*base and so on; base 0 retries immediately. Transport errors,
+HTTP statuses, invalid JSON/API errors and missing/null choices or messages
+all retry while no answer or reasoning delta is visible. Only after those
+attempts are exhausted does the next configured provider run. Every failed
+attempt, including the final one and `max_retries=0`, emits its diagnostic and
+the exact original response body (JSON, text or other bytes up to the response
+cap), or the transport error when no body exists. Delays and waits are
+cancellation-aware. Once answer/reasoning text has streamed, the run remains
+fail-closed without retry or fallback so partial answers are never mixed.
+Strict no-filesystem builds support immediate retries only; a positive delay
+fails explicitly instead of busy-waiting.
+
 SSE streaming is on by default (`--no-stream` opts out), and `max_steps=0`
 means unlimited steps. `reasoning_effort` selects `off`, `low`, `medium` or
 `high`; `/reasoning` changes it interactively. `/thinking on` displays only
@@ -249,7 +266,8 @@ requires an interactive decision, while non-interactive or callback-less runs
 fail closed without executing the tool.
 
 `/model` opens a default-provider card for `model_id` (the `model` config key),
-`endpoint`, `think_mode`, `max_tokens` and `reasoning_effort`. `think_mode` is
+`endpoint`, `think_mode`, `max_tokens`, `max_retries`, `retry_base_s` (saved as
+`retry_base_seconds`) and `reasoning_effort`. `think_mode` is
 `provider` (omit the request field), `on` or `off` (JSON boolean); `max_tokens=0`
 omits the field, while a positive value sends an integer. Changes apply to the
 current session immediately. Closing after unsaved changes prompts for `y`
@@ -482,6 +500,8 @@ motiris set config stream false       # JSON boolean, not a string
 motiris set config max_steps 0        # 0 = unlimited; positive = bounded
 motiris set config think_mode on      # provider/on/off; omitted for provider
 motiris set config max_tokens 4096    # 0 omits max_tokens
+motiris set config max_retries 3      # additional attempts per provider
+motiris set config retry_base_seconds 1 # delays: 1, 2, 4, ... seconds
 motiris --config approval ask         # equivalent typed JSON editor
 motiris --init                        # all-or-nothing safe defaults/templates
 motiris set config api_key_env MOTIRIS_API_KEY
@@ -493,8 +513,9 @@ String keys are `model`, `base_url`, `api_key_env`, `transport`, `system`,
 `plugin_dir`, `shell_allow`, `shell_deny`, `approval`, `reasoning_effort` and
 `think_mode`; boolean keys are `stream`, `show_thinking`, `workspace_guard`,
 `context_compaction`, `tools`, `plugins` and `goal_check`. Integer keys are
-`max_steps` (0 unlimited), `max_tokens` (0 provider default),
-`compaction_threshold`, `compaction_keep` and `compaction_max_chars`.
+`max_steps` (0 unlimited), `max_tokens` (0 provider default), `max_retries`
+(0..8), `retry_base_seconds` (0..60), `compaction_threshold`, `compaction_keep`
+and `compaction_max_chars`.
 Other fields, including `providers`, `mcp_servers` and
 extension fields, are preserved. Writes use a complete mode-0600 temporary
 file plus `fsync` and atomic rename. Empty, malformed, non-object, oversized
