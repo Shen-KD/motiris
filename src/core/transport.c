@@ -113,8 +113,10 @@ typedef struct {
   CancelCtx *cancel;
   Buf line;                       /* one SSE line, including bounded NUL */
   Buf content;                    /* concatenated delta.content */
-  Buf raw;                        /* buffered JSON fallback, before first SSE */
-  int saw_sse;
+  Buf raw;                        /* original 200 body / buffered JSON fallback */
+  Buf error;                      /* original non-200 response bytes */
+  CURL *curl;
+  int saw_sse, saw_choice, saw_complete;
   size_t received, wire_limit;    /* bounded JSON/SSE framing as well */
   int failed;
   cJSON *tool_calls;              /* array of {id,type,function} */
@@ -123,8 +125,13 @@ typedef struct {
 
 /* parse one "data: {json}" payload: extract delta and aggregate */
 static int stream_handle_data(StreamCtx *s, const char *payload) {
-  cJSON *j = cJSON_Parse(payload);
-  if (!j) return 0;
+  cJSON *j = cJSON_ParseWithOpts(payload, NULL, 1);
+  if (!j || !cJSON_IsObject(j) ||
+      cJSON_GetObjectItemCaseSensitive(j, "error")) {
+    s->failed = 4;
+    cJSON_Delete(j);
+    return -1;
+  }
   cJSON *use = cJSON_GetObjectItemCaseSensitive(j, "usage");
   if (cJSON_IsObject(use)) {
     cJSON_Delete(s->usage);
@@ -132,8 +139,14 @@ static int stream_handle_data(StreamCtx *s, const char *payload) {
   }
   cJSON *choice = cJSON_GetArrayItem(
       cJSON_GetObjectItemCaseSensitive(j, "choices"), 0);
+  if (cJSON_IsObject(choice)) {
+    s->saw_choice = 1;
+    if (cJSON_IsString(cJSON_GetObjectItemCaseSensitive(choice,
+                                                       "finish_reason")))
+      s->saw_complete = 1;
+  }
   cJSON *delta = choice ? cJSON_GetObjectItemCaseSensitive(choice, "delta") : NULL;
-  if (!delta) { cJSON_Delete(j); return 0; }
+  if (!cJSON_IsObject(delta)) { cJSON_Delete(j); return 0; }
 
   const char *reasoning = cJSON_GetStringValue(
       cJSON_GetObjectItemCaseSensitive(delta, "reasoning_content"));
@@ -245,14 +258,16 @@ static int stream_feed(StreamCtx *s, const char *p, size_t n) {
   for (size_t i = 0; i < n; i++) {
     char c = p[i];
     if (c == '\n') {
+      if (s->line.len && s->line.data[s->line.len - 1] == '\r') {
+        s->line.data[--s->line.len] = '\0';
+      }
       const char *line = s->line.data ? s->line.data : "";
       if (!strncmp(line, "data:", 5)) {
         s->saw_sse = 1;
         const char *payload = line + 5;
         while (*payload == ' ') payload++;
-        if (strcmp(payload, "[DONE]") && *payload &&
-            stream_handle_data(s, payload))
-          return -1;
+        if (!strcmp(payload, "[DONE]")) s->saw_complete = 1;
+        else if (*payload && stream_handle_data(s, payload)) return -1;
       }
       s->line.len = 0;
       if (s->line.data) s->line.data[0] = '\0';
@@ -274,7 +289,8 @@ static size_t curl_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
 
 static char *libcurl_send(const char *url, const char *auth,
                           const char *body, MotirisCancelCallback *cancel_cb,
-                          void *cancel_ud, char **err) {
+                          void *cancel_ud, char **err, char **error_body) {
+  if (error_body) *error_body = NULL;
   CURL *c = curl_easy_init();
   if (!c) { if (err) *err = strdup("libcurl init failed"); return NULL; }
 
@@ -313,7 +329,7 @@ static char *libcurl_send(const char *url, const char *auth,
       } else {
         size_t n = strlen(curl_easy_strerror(rc)) + 32;
         char *m = malloc(n);
-        snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
+        if (m) snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
         *err = m;
       }
     }
@@ -322,15 +338,18 @@ static char *libcurl_send(const char *url, const char *auth,
   }
   if (http != 200) {
     if (err) {
-      size_t n = 128 + (out.data ? strlen(out.data) : 0);
-      char *m = malloc(n);
-      snprintf(m, n, "http status %ld: %.200s", http,
-               out.data ? out.data : "");
+      char *m = malloc(64);
+      if (m) snprintf(m, 64, "http status %ld", http);
       *err = m;
+    }
+    if (error_body) {
+      *error_body = out.data;
+      out.data = NULL;
     }
     free(out.data);
     return NULL;
   }
+  if (!out.data) out.data = strdup("");
   return out.data;
 }
 
@@ -406,15 +425,19 @@ static size_t stream_write_cb(char *ptr, size_t sz, size_t nm, void *ud) {
     return 0;
   }
   s->received += n;
-  /* Some OpenAI-compatible endpoints ignore stream:true and return JSON.
-   * Keep a bounded copy only until the first SSE record establishes framing. */
-  if (!s->saw_sse && !s->raw.failed) (void)buf_append(&s->raw, ptr, n);
-  if (stream_feed(s, ptr, n)) return 0;
-  if (s->saw_sse && s->raw.data) {
-    free(s->raw.data);
-    s->raw.data = NULL;
-    s->raw.len = 0;
+  long http = 0;
+  if (s->curl) curl_easy_getinfo(s->curl, CURLINFO_RESPONSE_CODE, &http);
+  if (http && http != 200) {
+    if (buf_append(&s->error, ptr, n)) {
+      s->failed = s->error.failed;
+      return 0;
+    }
+    return n;
   }
+  /* Some endpoints ignore stream:true and return JSON. Retain the bounded 200
+   * body after SSE framing too, so protocol failures can report original bytes. */
+  if (!s->raw.failed) (void)buf_append(&s->raw, ptr, n);
+  if (stream_feed(s, ptr, n)) return 0;
   return n;
 }
 
@@ -426,7 +449,9 @@ static char *libcurl_send_stream(const char *url, const char *auth,
                                  void (*on_reasoning)(const char *, void *),
                                  void *reasoning_ud,
                                  MotirisCancelCallback *cancel_cb,
-                                 void *cancel_ud, char **err) {
+                                 void *cancel_ud, char **err,
+                                 char **error_body) {
+  if (error_body) *error_body = NULL;
   CURL *c = curl_easy_init();
   if (!c) { if (err) *err = strdup("libcurl init failed"); return NULL; }
 
@@ -442,7 +467,7 @@ static char *libcurl_send_stream(const char *url, const char *auth,
     .on_reasoning = on_reasoning, .reasoning_ud = reasoning_ud,
     .cancel = &cancel,
     .line = { .limit = limit }, .content = { .limit = limit },
-    .raw = { .limit = limit },
+    .raw = { .limit = limit }, .error = { .limit = limit }, .curl = c,
     .wire_limit = limit * STREAM_WIRE_OVERHEAD,
   };
   curl_easy_setopt(c, CURLOPT_URL, url);
@@ -473,27 +498,36 @@ static char *libcurl_send_stream(const char *url, const char *auth,
       } else {
         size_t n = strlen(curl_easy_strerror(rc)) + 32;
         char *m = malloc(n);
-        snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
+        if (m) snprintf(m, n, "curl: %s", curl_easy_strerror(rc));
         *err = m;
       }
     }
+    Buf *original = http != 200 ? &s.error : &s.raw;
+    if (error_body && !original->failed && original->data) {
+      *error_body = original->data;
+      original->data = NULL;
+    }
     free(s.content.data); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
-    free(s.line.data); free(s.raw.data);
+    free(s.line.data); free(s.raw.data); free(s.error.data);
     return NULL;
   }
   if (http != 200) {
     if (err) {
       char *m = malloc(96);
-      snprintf(m, 96, "http status %ld (stream)", http);
+      if (m) snprintf(m, 96, "http status %ld (stream)", http);
       *err = m;
     }
+    if (error_body) {
+      *error_body = s.error.data;
+      s.error.data = NULL;
+    }
     free(s.content.data); cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
-    free(s.line.data); free(s.raw.data);
+    free(s.line.data); free(s.raw.data); free(s.error.data);
     return NULL;
   }
 
   if (!s.saw_sse) {
-    free(s.content.data); free(s.line.data);
+    free(s.content.data); free(s.line.data); free(s.error.data);
     cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
     if (s.raw.failed) {
       free(s.raw.data);
@@ -502,6 +536,17 @@ static char *libcurl_send_stream(const char *url, const char *auth,
     }
     if (!s.raw.data) s.raw.data = strdup("");
     return s.raw.data;
+  }
+
+  if (!s.saw_choice || !s.saw_complete) {
+    if (err) *err = strdup("invalid stream response");
+    if (error_body && !s.raw.failed && s.raw.data) {
+      *error_body = s.raw.data;
+      s.raw.data = NULL;
+    }
+    free(s.content.data); free(s.line.data); free(s.raw.data); free(s.error.data);
+    cJSON_Delete(s.tool_calls); cJSON_Delete(s.usage);
+    return NULL;
   }
 
   /* rebuild one complete chat message from the delta aggregates */
@@ -525,6 +570,7 @@ static char *libcurl_send_stream(const char *url, const char *auth,
   free(s.content.data);
   free(s.line.data);
   free(s.raw.data);
+  free(s.error.data);
   char *printed = cJSON_PrintUnformatted(resp);
   cJSON_Delete(resp);
   return printed;
@@ -570,15 +616,39 @@ static int write_all(int fd, const char *s) {
   size_t len = strlen(s), off = 0;
   while (off < len) {
     ssize_t n = write(fd, s + off, len - off);
+    if (n < 0 && errno == EINTR) continue;
     if (n <= 0) return -1;
     off += (size_t)n;
   }
   return 0;
 }
 
+static char *last_substring(char *text, const char *needle) {
+  char *found = NULL;
+  size_t length = strlen(needle);
+  for (char *p = text; (p = strstr(p, needle)) != NULL; p += length)
+    found = p;
+  return found;
+}
+
+static int strip_spawn_status(char *out, long *http) {
+  static const char marker[] = "\n__MOTIRIS_HTTP_STATUS__:";
+  char *suffix = last_substring(out, marker);
+  if (!suffix) return -1;
+  const char *number = suffix + sizeof marker - 1;
+  char *end = NULL;
+  errno = 0;
+  long status = strtol(number, &end, 10);
+  if (errno || !end || *end || end == number) return -1;
+  *suffix = '\0';
+  *http = status;
+  return 0;
+}
+
 static char *spawn_curl(const char *url, const char *auth,
                         const char *body, MotirisCancelCallback *cancel_cb,
-                        void *cancel_ud, char **err) {
+                        void *cancel_ud, char **err, char **error_body) {
+  if (error_body) *error_body = NULL;
   CancelCtx cancel = { cancel_cb, cancel_ud };
   if (cancel_requested(&cancel)) {
     if (err) *err = strdup("cancelled");
@@ -610,7 +680,7 @@ static char *spawn_curl(const char *url, const char *auth,
     close(outpipe[0]); close(outpipe[1]);
     /* build argv dynamically: no -H auth header when there is no key */
     const char *curl = find_curl();
-    char *argv[18];
+    char *argv[24];
     int ai = 0;
     argv[ai++] = (char *)curl;
     argv[ai++] = "-sS"; argv[ai++] = "-L";
@@ -620,6 +690,8 @@ static char *spawn_curl(const char *url, const char *auth,
     argv[ai++] = "-H"; argv[ai++] = "Accept: application/json";
     if (auth) { argv[ai++] = "-H"; argv[ai++] = (char *)auth; }
     argv[ai++] = "--data-binary"; argv[ai++] = "@-";
+    argv[ai++] = "--write-out";
+    argv[ai++] = "\n__MOTIRIS_HTTP_STATUS__:%{http_code}";
     argv[ai] = NULL;
     execvp(curl, argv);
     _exit(127);
@@ -632,8 +704,10 @@ static char *spawn_curl(const char *url, const char *auth,
 
   int cancelled = 0;
   int read_failed = 0;
+  size_t body_limit = response_limit();
+  /* The write-out trailer is transport metadata, not provider body bytes. */
   char *out = read_all(outpipe[0], pid, &cancel, &cancelled,
-                       response_limit(), &read_failed);
+                       body_limit + 64, &read_failed);
   close(outpipe[0]);
 
   int st = 0;
@@ -648,14 +722,46 @@ static char *spawn_curl(const char *url, const char *auth,
     free(out);
     return NULL;
   }
-  if (wr < 0) { free(out); return NULL; }
-  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || !*out) {
+  if (wr < 0) {
+    if (err) *err = strdup("curl request write failed");
+    free(out);
+    return NULL;
+  }
+  long http = 0;
+  int have_status = out && strip_spawn_status(out, &http) == 0;
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
     if (err) {
-      size_t need = 64 + strlen(out ? out : "");
-      char *m = malloc(need);
-      snprintf(m, need, "curl exited %d: %s",
-               WIFEXITED(st) ? WEXITSTATUS(st) : -1, out ? out : "");
+      char *m = malloc(64);
+      if (m) snprintf(m, 64, "curl exited %d",
+                      WIFEXITED(st) ? WEXITSTATUS(st) : -1);
       *err = m;
+    }
+    if (error_body && out && *out) {
+      *error_body = out;
+      out = NULL;
+    }
+    free(out);
+    return NULL;
+  }
+  if (!have_status) {
+    if (err) *err = strdup("curl response missing HTTP status");
+    free(out);
+    return NULL;
+  }
+  if (strlen(out) > body_limit) {
+    if (err) *err = strdup("response limit exceeded");
+    free(out);
+    return NULL;
+  }
+  if (http != 200) {
+    if (err) {
+      char *m = malloc(64);
+      if (m) snprintf(m, 64, "http status %ld", http);
+      *err = m;
+    }
+    if (error_body) {
+      *error_body = out;
+      out = NULL;
     }
     free(out);
     return NULL;
@@ -711,7 +817,7 @@ static char *echo_response(const char *body) {
 char *motiris_transport_send(const char *backend, const char *url,
                              const char *auth, const char *body,
                              MotirisCancelCallback *cancel, void *cancel_ud,
-                             char **err);
+                             char **err, char **error_body);
 char *motiris_transport_send_stream(const char *backend, const char *url,
                                     const char *auth, const char *body,
                                     void (*on_delta)(const char *, void *),
@@ -719,13 +825,15 @@ char *motiris_transport_send_stream(const char *backend, const char *url,
                                     void (*on_reasoning)(const char *, void *),
                                     void *reasoning_ud,
                                     MotirisCancelCallback *cancel,
-                                    void *cancel_ud, char **err) {
+                                    void *cancel_ud, char **err,
+                                    char **error_body) {
   if (err) *err = NULL;
+  if (error_body) *error_body = NULL;
 #ifndef MOTIRIS_NO_FILESYSTEM
   if (!backend || !strcmp(backend, "auto") || !strcmp(backend, "libcurl"))
     return libcurl_send_stream(url, auth, body, on_delta, ud,
                                on_reasoning, reasoning_ud,
-                               cancel, cancel_ud, err);
+                               cancel, cancel_ud, err, error_body);
 #else
   (void)on_delta;
   (void)ud;
@@ -750,7 +858,7 @@ char *motiris_transport_send_stream(const char *backend, const char *url,
     return NULL;
   }
   char *response = motiris_transport_send(backend, url, auth, buffered,
-                                          cancel, cancel_ud, err);
+                                          cancel, cancel_ud, err, error_body);
   free(buffered);
   return response;
 }
@@ -781,8 +889,9 @@ char *motiris_transport_get(const char *backend, const char *url,
 char *motiris_transport_send(const char *backend, const char *url,
                              const char *auth, const char *body,
                              MotirisCancelCallback *cancel_cb, void *cancel_ud,
-                             char **err) {
+                             char **err, char **error_body) {
   if (err) *err = NULL;
+  if (error_body) *error_body = NULL;
   CancelCtx initial_cancel = { cancel_cb, cancel_ud };
   if (cancel_requested(&initial_cancel)) {
     if (err) *err = transport_error("cancelled");
@@ -790,9 +899,10 @@ char *motiris_transport_send(const char *backend, const char *url,
   }
 #ifndef MOTIRIS_NO_FILESYSTEM
   if (!backend || !strcmp(backend, "auto") || !strcmp(backend, "libcurl"))
-    return libcurl_send(url, auth, body, cancel_cb, cancel_ud, err);
+    return libcurl_send(url, auth, body, cancel_cb, cancel_ud, err,
+                        error_body);
   if (!strcmp(backend, "curl"))
-    return spawn_curl(url, auth, body, cancel_cb, cancel_ud, err);
+    return spawn_curl(url, auth, body, cancel_cb, cancel_ud, err, error_body);
 #else
   (void)url;
   (void)auth;

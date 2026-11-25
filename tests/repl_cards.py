@@ -71,6 +71,7 @@ def test_non_tty_commands(env):
     assert "interactive terminal" in output, output
     assert "model_id: gpt-4o-mini" in output, output
     assert "think_mode: provider" in output and "max_tokens: 0" in output, output
+    assert "max_retries: 0" in output and "retry_base_seconds: 1" in output, output
     assert "endpoint: https://api.openai.com/v1/chat/completions" in output, output
     assert "api_key: (not set)" in output, output
 
@@ -314,9 +315,9 @@ def test_model_card_expanded_choices(env, home):
         repl.read_until("motiris> ")
         repl.send("/model\r")
         repl.read_until("keep session values")
-        repl.send("\x1b[B" * 6 + "\r")
+        repl.send("\x1b[B" * 8 + "\r")
         repl.read_until("11 models loaded")
-        repl.send("\x1b[A" * 6 + "\r")
+        repl.send("\x1b[A" * 8 + "\r")
         expanded = plain(repl.read_until("up/down: navigate"))
         assert "model-00" in expanded and "model-07" in expanded, expanded
         assert "model-10" not in expanded, expanded
@@ -387,6 +388,7 @@ def test_model_card(env, home):
         initial = plain(repl.read_until("keep session values"))
         for text in ("Model configuration", "model_id:", "gpt-4o-mini",
                      "think_mode:", "provider", "max_tokens:", "0",
+                     "max_retries:", "0", "retry_base_s:", "1",
                      "reasoning:", "endpoint:", "api_key:", "(not set)",
                      "refresh models", "close"):
             assert text in initial, (text, initial)
@@ -400,6 +402,10 @@ def test_model_card(env, home):
         repl.read_until(re.compile(r"think_mode:\s+on\b"))
         repl.send("\x1b[B\r\x154096\r")
         repl.read_until(re.compile(r"max_tokens:\s+4096\b"))
+        repl.send("\x1b[B\r\x152\r")
+        repl.read_until(re.compile(r"max_retries:\s+2\b"))
+        repl.send("\x1b[B\r\x150\r")
+        repl.read_until(re.compile(r"retry_base_s:\s+0\b"))
         repl.send("\x1b[B\r")  # reasoning provider -> low
         repl.read_until(re.compile(r"reasoning:\s+low\b"))
         repl.send("\x1b[B\r\x15" + endpoint + "\r")
@@ -421,7 +427,7 @@ def test_model_card(env, home):
         assert provider.requests == [], "reopening /model performed network I/O"
 
         # Only the explicit refresh action performs one authenticated GET.
-        repl.send("\x1b[B" * 6 + "\r")
+        repl.send("\x1b[B" * 8 + "\r")
         refreshed = plain(repl.read_until("2 models loaded"))
         assert secret not in refreshed
         assert len(provider.requests) == 1
@@ -430,7 +436,7 @@ def test_model_card(env, home):
         assert provider.requests[0]["authorization"] == ["Bearer " + secret]
 
         # Enter expands the fetched choices; down+Enter selects the exact ID.
-        repl.send("\x1b[A" * 6 + "\r")
+        repl.send("\x1b[A" * 8 + "\r")
         expanded = plain(repl.read_until("up/down: navigate"))
         assert "model-alpha" in expanded and "org/exact:model" in expanded, expanded
         repl.send("\x1b[B\r")
@@ -443,6 +449,7 @@ def test_model_card(env, home):
         saved = json.loads((home / "config" / "config.json").read_text())
         assert saved["model"] == "org/exact:model", saved
         assert saved["think_mode"] == "on" and saved["max_tokens"] == 4096, saved
+        assert saved["max_retries"] == 2 and saved["retry_base_seconds"] == 0, saved
         assert saved["reasoning_effort"] == "low", saved
         assert saved["base_url"] == endpoint and saved["api_key_env"] == "MOTIRIS_API_KEY", saved
         assert secret not in json.dumps(saved)
@@ -458,7 +465,7 @@ def test_model_card(env, home):
         repl.read_until("keep session values")
         assert len(provider.requests) == before
         provider.status = 401
-        repl.send("\x1b[B" * 6 + "\r")
+        repl.send("\x1b[B" * 8 + "\r")
         failed = plain(repl.read_until("refresh failed: http status 401"))
         assert secret not in failed and len(failed) < 10000
         repl.send("q")
@@ -477,6 +484,7 @@ def test_model_card(env, home):
     output = run_pipe(env, ["/model", "/exit"])
     assert "model_id: org/exact:model" in output, output
     assert "think_mode: on" in output and "max_tokens: 4096" in output, output
+    assert "max_retries: 2" in output and "retry_base_seconds: 0" in output, output
     assert "reasoning: low" in output and "api_key: (set)" in output, output
     assert secret not in output
 
@@ -512,7 +520,7 @@ def test_model_card_failed_save_retains_key(env, home):
         repl.read_until("motiris> ")
         repl.send("/model\r")
         repl.read_until("keep session values")
-        repl.send("\x1b[B" * 5 + "\r" + secret + "\r")
+        repl.send("\x1b[B" * 7 + "\r" + secret + "\r")
         repl.read_until(re.compile(r"api_key:\s+\(set\)"))
         config_json = config / "config.json"
         if config_json.exists():

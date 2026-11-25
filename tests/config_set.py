@@ -70,6 +70,11 @@ def main():
             assert proc.returncode == 0, (key, proc.stdout, proc.stderr)
         proc = set_config(env, "max_steps", "25")
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        for key, values in [("max_retries", ("2", "8", "0", "2")),
+                            ("retry_base_seconds", ("0", "60", "1", "0"))]:
+            for value in values:
+                proc = set_config(env, key, value)
+                assert proc.returncode == 0, (key, value, proc.stdout, proc.stderr)
         for key, value in [("approval", "ask"), ("reasoning_effort", "high"),
                            ("max_steps", "0"), ("think_mode", "provider"),
                            ("think_mode", "off"), ("think_mode", "on"),
@@ -84,6 +89,9 @@ def main():
         assert data["workspace_guard"] is True
         assert data["approval"] == "ask" and data["reasoning_effort"] == "high"
         assert data["max_steps"] == 0 and type(data["max_steps"]) is int
+        assert data["max_retries"] == 2 and type(data["max_retries"]) is int
+        assert data["retry_base_seconds"] == 0
+        assert type(data["retry_base_seconds"]) is int
         assert data["think_mode"] == "on"
         assert data["max_tokens"] == 4096 and type(data["max_tokens"]) is int
         assert data["providers"][0]["name"] == "keep"
@@ -113,6 +121,13 @@ def main():
                            ("reasoning_effort", "deep"), ("show_thinking", "yes"),
                            ("think_mode", "auto"), ("think_mode", "ON"),
                            ("think_mode", ""), ("max_tokens", "-1"),
+                           ("max_retries", "-1"), ("max_retries", "9"),
+                           ("max_retries", "1.5"), ("max_retries", "true"),
+                           ("max_retries", ""), ("retry_base_seconds", "-1"),
+                           ("retry_base_seconds", "61"),
+                           ("retry_base_seconds", "2x"),
+                           ("retry_base_seconds", "false"),
+                           ("retry_base_seconds", ""),
                            ("max_tokens", "12x"), ("max_tokens", "2147483648"),
                            ("workspace_guard", "yes"),
                            ("stream", "yes"), ("transport", "bogus"),

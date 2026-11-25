@@ -116,6 +116,13 @@ int motiris_load_plugins(MotirisAgent *a, const char *dir);  /* 0 on success */
 void motiris_set_transport(MotirisAgent *a, const char *name);  /* "curl"|"echo" */
 void motiris_set_max_steps(MotirisAgent *a, int n);   /* 0 = unlimited */
 int  motiris_max_steps(MotirisAgent *a);
+/* Provider attempts are initial + max_retries, independently per provider.
+ * Retry N waits retry_base_seconds << (N-1). Invalid values return -1 and
+ * leave the previous setting unchanged. */
+int  motiris_set_max_retries(MotirisAgent *a, int retries);
+int  motiris_max_retries(MotirisAgent *a);
+int  motiris_set_retry_base_seconds(MotirisAgent *a, int seconds);
+int  motiris_retry_base_seconds(MotirisAgent *a);
 void motiris_set_goal_check(MotirisAgent *a, int on);   /* confirm goal met */
 void motiris_set_plugins_enabled(MotirisAgent *a, int on);
 void motiris_set_tools_enabled(MotirisAgent *a, int on);
@@ -153,6 +160,9 @@ const char *motiris_think_mode(MotirisAgent *a);
 /* Zero omits max_tokens; positive values through INT_MAX are sent as numbers. */
 int  motiris_set_max_tokens(MotirisAgent *a, int tokens);
 int  motiris_max_tokens(MotirisAgent *a);
+/* Set true whenever reasoning callback output is visible to the user/client.
+ * Visible reasoning suppresses retry/fallback after a partial stream; hidden
+ * reasoning does not. CLI display filtering and this visibility flag are separate. */
 void motiris_set_thinking_visible(MotirisAgent *a, int on);
 int  motiris_thinking_visible(MotirisAgent *a);
 /* Append host-loaded instruction/persona text to the system prompt. */
@@ -162,6 +172,13 @@ void motiris_append_system(MotirisAgent *a, const char *text);
  * it reads a flag set by a host signal handler. */
 typedef int (MotirisCancelCallback)(void *ud);
 void motiris_set_cancel_cb(MotirisAgent *a, MotirisCancelCallback *cb, void *ud);
+/* Optional host backoff for platforms without a core clock/sleep facility.
+ * Return 0 after waiting, 1 for cancellation, or a negative value on failure.
+ * POSIX hosts default to monotonic sleep; no-filesystem hosts need this callback
+ * for positive retry delays. Zero-delay retries never invoke it. */
+typedef int (MotirisRetryWaitCallback)(unsigned int seconds, void *ud);
+void motiris_set_retry_wait_cb(MotirisAgent *a, MotirisRetryWaitCallback *cb,
+                               void *ud);
 enum MotirisRunResult {
   MOTIRIS_RUN_OK = 0,
   MOTIRIS_RUN_ERROR = 1,

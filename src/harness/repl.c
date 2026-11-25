@@ -395,7 +395,7 @@ static void config_card(ReplState *state) {
 }
 
 /* ---------------- default-provider model card ---------------- */
-#define MODEL_CARD_ROWS 8
+#define MODEL_CARD_ROWS 10
 #define MODEL_CARD_VISIBLE_MODELS 8
 #define MODEL_CARD_KEY_MAX 489
 
@@ -423,10 +423,12 @@ static void model_card_clear_models(ModelCard *card) {
 static void draw_model_card(MotirisAgent *a, const ModelCard *card,
                             int selected) {
   const char *effort = motiris_reasoning_effort(a);
-  char tokens[32], model[96], endpoint[96], status[128];
-  char refresh[64];
+  char tokens[32], retries[16], backoff[16];
+  char model[96], endpoint[96], status[128], refresh[64];
   snprintf(tokens, sizeof tokens, "%d%s", motiris_max_tokens(a),
            motiris_max_tokens(a) ? "" : " (provider)");
+  snprintf(retries, sizeof retries, "%d", motiris_max_retries(a));
+  snprintf(backoff, sizeof backoff, "%d", motiris_retry_base_seconds(a));
   clip(model, sizeof model, motiris_model(a) ? motiris_model(a) : "", 72);
   clip(endpoint, sizeof endpoint, motiris_base_url(a), 72);
   clip(status, sizeof status, card->status, 100);
@@ -459,13 +461,15 @@ static void draw_model_card(MotirisAgent *a, const ModelCard *card,
   card_row(!card->expanding && selected == 1, "think_mode:",
            motiris_think_mode(a));
   card_row(!card->expanding && selected == 2, "max_tokens:", tokens);
-  card_row(!card->expanding && selected == 3, "reasoning:",
+  card_row(!card->expanding && selected == 3, "max_retries:", retries);
+  card_row(!card->expanding && selected == 4, "retry_base_s:", backoff);
+  card_row(!card->expanding && selected == 5, "reasoning:",
            effort && *effort ? effort : "provider");
-  card_row(!card->expanding && selected == 4, "endpoint:", endpoint);
-  card_row(!card->expanding && selected == 5, "api_key:",
+  card_row(!card->expanding && selected == 6, "endpoint:", endpoint);
+  card_row(!card->expanding && selected == 7, "api_key:",
            motiris_api_key_configured(a) ? "(set)" : "(not set)");
-  card_row(!card->expanding && selected == 6, "refresh models", refresh);
-  card_row(!card->expanding && selected == 7, "close", "keep session values");
+  card_row(!card->expanding && selected == 8, "refresh models", refresh);
+  card_row(!card->expanding && selected == 9, "close", "keep session values");
   if (count > 0 && !card->expanding)
     printf("\r\nmodel_id Enter: expand choices; e: edit; left/right: cycle (%s%d/%d)\r\n",
            card->model_index >= 0 ? "" : "none, ",
@@ -543,7 +547,7 @@ static int model_card_edit_text(MotirisAgent *a, ReplState *state,
   if (field == 0) {
     label = "model_id";
     snprintf(value, sizeof value, "%s", motiris_model(a));
-  } else if (field == 4) {
+  } else if (field == 6) {
     label = "endpoint";
     cap = sizeof value;
     snprintf(value, sizeof value, "%s", motiris_base_url(a));
@@ -565,7 +569,7 @@ static int model_card_edit_text(MotirisAgent *a, ReplState *state,
       changed = 1;
       model_card_status(card, "model updated for this session");
     } else model_card_status(card, "model unchanged");
-  } else if (field == 4) {
+  } else if (field == 6) {
     const char *current = motiris_base_url(a);
     if (!current || strcmp(current, value)) {
       motiris_set_base_url(a, value);
@@ -594,28 +598,48 @@ static int model_card_edit_text(MotirisAgent *a, ReplState *state,
   return 1;
 }
 
-static void model_card_edit_tokens(MotirisAgent *a, ModelCard *card) {
+static void model_card_edit_number(MotirisAgent *a, ModelCard *card,
+                                   int field) {
+  const char *label = field == 2 ? "max_tokens (0 = provider)" :
+                      field == 3 ? "max_retries (0..8)" :
+                                   "retry_base_s (0..60)";
+  int current = field == 2 ? motiris_max_tokens(a) :
+                field == 3 ? motiris_max_retries(a) :
+                             motiris_retry_base_seconds(a);
+  long maximum = field == 2 ? INT_MAX : field == 3 ? 8 : 60;
   char value[32];
-  snprintf(value, sizeof value, "%d", motiris_max_tokens(a));
-  if (!card_edit_text("max_tokens (0 = provider)", value, sizeof value, 0)) return;
+  snprintf(value, sizeof value, "%d", current);
+  if (!card_edit_text(label, value, sizeof value, 0)) return;
   char *end = NULL;
   errno = 0;
   long parsed = strtol(value, &end, 10);
+  char message[112];
+  const char *name = field == 2 ? "max_tokens" :
+                     field == 3 ? "max_retries" : "retry_base_s";
   if (errno == ERANGE || !end || *end || end == value || parsed < 0 ||
-      parsed > INT_MAX) {
-    model_card_status(card, "invalid max_tokens; expected 0..2147483647");
+      parsed > maximum) {
+    snprintf(message, sizeof message, "invalid %s; expected 0..%ld", name,
+             maximum);
+    model_card_status(card, message);
     return;
   }
-  if (parsed == motiris_max_tokens(a)) {
-    model_card_status(card, "max_tokens unchanged");
+  if (parsed == current) {
+    snprintf(message, sizeof message, "%s unchanged", name);
+    model_card_status(card, message);
     return;
   }
-  if (motiris_set_max_tokens(a, (int)parsed)) {
-    model_card_status(card, "invalid max_tokens; expected 0..2147483647");
+  int rc = field == 2 ? motiris_set_max_tokens(a, (int)parsed) :
+           field == 3 ? motiris_set_max_retries(a, (int)parsed) :
+                        motiris_set_retry_base_seconds(a, (int)parsed);
+  if (rc) {
+    snprintf(message, sizeof message, "invalid %s; expected 0..%ld", name,
+             maximum);
+    model_card_status(card, message);
     return;
   }
   *card->dirty = 1;
-  model_card_status(card, "max_tokens updated for this session");
+  snprintf(message, sizeof message, "%s updated for this session", name);
+  model_card_status(card, message);
 }
 
 static void model_card_cycle_think(MotirisAgent *a) {
@@ -665,7 +689,7 @@ static int card_refresh_cancelled(void *ud) {
 static void model_card_refresh(MotirisAgent *a, ModelCard *card) {
   model_card_clear_models(card);
   model_card_status(card, "refreshing models...");
-  draw_model_card(a, card, 6);
+  draw_model_card(a, card, 8);
   motiris_set_cancel_cb(a, card_refresh_cancelled, NULL);
   cJSON *models = motiris_fetch_models(a);
   motiris_set_cancel_cb(a, NULL, NULL);
@@ -733,14 +757,18 @@ static int model_card_confirm_close(void) {
 }
 
 static int save_model_card(MotirisAgent *a, ReplState *state) {
-  char tokens[32], effort[16];
+  char tokens[32], retries[16], backoff[16], effort[16];
   snprintf(tokens, sizeof tokens, "%d", motiris_max_tokens(a));
+  snprintf(retries, sizeof retries, "%d", motiris_max_retries(a));
+  snprintf(backoff, sizeof backoff, "%d", motiris_retry_base_seconds(a));
   const char *current = motiris_reasoning_effort(a);
   snprintf(effort, sizeof effort, "%s", current && *current ? current : "off");
   int failed = 0;
   failed += motiris_set_config("model", motiris_model(a)) != 0;
   failed += motiris_set_config("think_mode", motiris_think_mode(a)) != 0;
   failed += motiris_set_config("max_tokens", tokens) != 0;
+  failed += motiris_set_config("max_retries", retries) != 0;
+  failed += motiris_set_config("retry_base_seconds", backoff) != 0;
   failed += motiris_set_config("reasoning_effort", effort) != 0;
   failed += motiris_set_config("base_url", motiris_base_url(a)) != 0;
   if (state->pending_api_key) {
@@ -797,7 +825,7 @@ static void model_card(ReplState *state) {
       continue;
     }
 
-    if (key == 'q' || (key == '\n' && selected == 7)) {
+    if (key == 'q' || (key == '\n' && selected == 9)) {
       if (!*card.dirty) { done = 1; break; }
       int confirm = model_card_confirm_close();
       if (confirm == 'q') { redraw = 1; continue; }
@@ -835,16 +863,17 @@ static void model_card(ReplState *state) {
 
     if (selected == 0 && cJSON_GetArraySize(card.models) > 0)
       model_card_expand(&card);
-    else if (selected == 0 || selected == 4 || selected == 5)
+    else if (selected == 0 || selected == 6 || selected == 7)
       (void)model_card_edit_text(a, state, &card, selected);
     else if (selected == 1) {
       model_card_cycle_think(a);
       *card.dirty = 1;
-    } else if (selected == 2) model_card_edit_tokens(a, &card);
-    else if (selected == 3) {
+    } else if (selected >= 2 && selected <= 4)
+      model_card_edit_number(a, &card, selected);
+    else if (selected == 5) {
       model_card_cycle_reasoning(a);
       *card.dirty = 1;
-    } else if (selected == 6) model_card_refresh(a, &card);
+    } else if (selected == 8) model_card_refresh(a, &card);
     redraw = 1;
   }
   card_terminal_stop(&terminal);
@@ -1083,8 +1112,11 @@ static int handle_command(MotirisAgent *a, ReplState *state,
     char model[256], endpoint[256];
     clip(model, sizeof model, motiris_model(a) ? motiris_model(a) : "", 200);
     clip(endpoint, sizeof endpoint, motiris_base_url(a), 200);
-    printf("model_id: %s\nthink_mode: %s\nmax_tokens: %d\nreasoning: %s\nendpoint: %s\napi_key: %s\n",
+    printf("model_id: %s\nthink_mode: %s\nmax_tokens: %d\n"
+           "max_retries: %d\nretry_base_seconds: %d\n"
+           "reasoning: %s\nendpoint: %s\napi_key: %s\n",
            model, motiris_think_mode(a), motiris_max_tokens(a),
+           motiris_max_retries(a), motiris_retry_base_seconds(a),
            effort && *effort ? effort : "provider", endpoint,
            motiris_api_key_configured(a) ? "(set)" : "(not set)");
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
@@ -1399,7 +1431,8 @@ typedef enum {
   REPL_UI_REASONING,
   REPL_UI_FINAL,
   REPL_UI_TOOL,
-  REPL_UI_DIAGNOSTIC
+  REPL_UI_DIAGNOSTIC,
+  REPL_UI_DIAGNOSTIC_CONT
 } ReplUiEventType;
 
 typedef struct {
@@ -1598,7 +1631,16 @@ static void repl_async_final(const char *text, void *ud) {
 }
 
 static void repl_async_diagnostic(const char *text, void *ud) {
-  repl_async_text(ud, REPL_UI_DIAGNOSTIC, text);
+  if (!text) return;
+  size_t remaining = strlen(text);
+  ReplUiEventType type = REPL_UI_DIAGNOSTIC;
+  while (remaining) {
+    size_t len = remaining > REPL_UI_CHUNK ? REPL_UI_CHUNK : remaining;
+    if (repl_async_push(ud, type, text, len) != 0) return;
+    text += len;
+    remaining -= len;
+    type = REPL_UI_DIAGNOSTIC_CONT;
+  }
 }
 
 static void repl_async_reasoning(const char *text, void *ud) {
@@ -1798,13 +1840,16 @@ static void repl_tty_render_event(ReplTTY *tty, const ReplUiEvent *event) {
     fwrite(event->text, 1, event->len, stdout);
     printf(C_RESET);
   } else if (event->type == REPL_UI_TOOL ||
-             event->type == REPL_UI_DIAGNOSTIC) {
-    if (tty->output_needs_newline) {
-      printf("\n");
+             event->type == REPL_UI_DIAGNOSTIC ||
+             event->type == REPL_UI_DIAGNOSTIC_CONT) {
+    if (tty->output_needs_newline &&
+        event->type != REPL_UI_DIAGNOSTIC_CONT) {
+      /* A separate core callback may supply the line terminator itself. */
+      if (!event->len || event->text[0] != '\n') printf("\n");
       tty->output_needs_newline = 0;
     }
     fwrite(event->text, 1, event->len,
-           event->type == REPL_UI_DIAGNOSTIC ? stderr : stdout);
+           event->type == REPL_UI_TOOL ? stdout : stderr);
     if (event->type == REPL_UI_TOOL) printf("\n");
   } else {
     if (state->reasoning_active) {

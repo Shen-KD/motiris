@@ -117,6 +117,9 @@ test: motiris plugins
 test-shell: motiris
 	python3 tests/shell.py
 
+test-provider-retry: motiris
+	python3 tests/provider_retry.py
+
 test-browser-subagent: motiris
 	python3 tests/browser_subagent.py
 

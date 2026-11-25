@@ -224,7 +224,9 @@ buffered fallback paths retain their one final print. Goal-check confirmation
 uses no delta sink, so only a non-`DONE` aggregate is rendered. Once visible
 deltas exist, a transport/parse/API failure ends that run rather than mixing a
 partial answer with fallback output. The flag is run/attempt local, not global
-agent or session state.
+agent or session state. Reasoning uses the host's actual visibility contract:
+CLI/REPL hidden reasoning does not block recovery, while Gateway temporarily
+marks reasoning visible for SSE runs because it always emits reasoning events.
 
 Provider assistant objects are canonicalized before entering per-Agent history:
 only `role`, `content` and `tool_calls` participate in replay and snapshots.
@@ -244,9 +246,13 @@ adds no retained global or per-session metadata.
 hard maximum 16 MiB). Invalid values warn at Agent construction and use the
 default, avoiding direct worker-thread diagnostics. Buffered
 libcurl and spawned-curl bodies, each SSE line, aggregate content and each
-tool-argument string retain at most `C` bytes plus a private NUL; total SSE
-wire input is at most `4*C` to include JSON/framing, and at most 256 tool calls
-are aggregated. Geometric allocation is below `2*(C+1)` per receive buffer.
+tool-argument string retain at most `C` bytes plus a private NUL. Streaming
+also retains the original HTTP-200 body (up to `C`) for protocol-failure
+diagnostics; non-200 responses use a separate error body with the same cap.
+These attempt-local buffers are freed before retry/fallback and do not
+accumulate across attempts. Total SSE wire input is at most `4*C` to include
+JSON/framing, and at most 256 tool calls are aggregated. Geometric allocation
+is below `2*(C+1)` per receive buffer.
 Checked subtraction precedes every addition/allocation, a temporary pointer
 preserves the original allocation on `realloc` failure, and limit/OOM paths
 free partial state and return bounded `response limit exceeded` /
@@ -270,6 +276,18 @@ need real platform validation.
 entries, omitted/missing key environments, mixed-chain credential isolation,
 default-provider authentication, real fallback order, exactly zero/one
 Authorization headers per request, and default/entry 489/490-byte boundaries.
+`tests/provider_retry.py` covers configurable additional attempts per provider,
+base/2*base/4*base monotonic backoff, cancellation, exhaustion and fallback
+ordering for transport, HTTP, strict JSON/API and missing/null response
+failures, plus malformed/error-only/incomplete SSE. It requires exact original
+NUL-free JSON/text bodies on every failed attempt across buffered, streamed and
+spawned-curl paths. A real-PTY response larger than `REPL_UI_CHUNK` proves the
+async diagnostic queue/render path inserts no bytes between continuation
+events; spawned-curl status-trailer budget boundaries are also covered. Visible
+answer/reasoning deltas forbid retry and fallback, while hidden reasoning does
+not. A strict C11 nofs probe covers immediate retries, host-callback positive
+waits and explicit failure when no wait facility exists.
+`make test-provider-retry` runs the complete offline suite.
 A later overlong entry rejects the whole chain before an earlier healthy
 provider can perform I/O, without leaking the key. `tests/transport.py`
 covers buffered, SSE wire/line/content/tool arguments, spawned curl, an
@@ -1042,7 +1060,9 @@ are read per call; no global session state is added.
 
 The REPL `/model` card edits the default provider through public Agent APIs.
 `think_mode=provider` omits the field, `on`/`off` send a JSON boolean, and
-`max_tokens=0` omits the numeric field. `motiris_fetch_models` is explicit and
+`max_tokens=0` omits the numeric field. `max_retries` is the additional attempt
+count (0..8); `retry_base_s` saves as `retry_base_seconds` (0..60) and drives
+the full left-shift backoff sequence. `motiris_fetch_models` is explicit and
 synchronous: it derives `/models`, shares default credential/auth bounds with
 generation, and returns a caller-owned cJSON array. Its bounded libcurl-only GET
 uses no redirect following, a 15-second timeout, a 1 MiB response cap, at most
@@ -1183,7 +1203,8 @@ may still use its own atomic replacement.
   to the expected subsets, up/down move a wrapping reverse-video selection and
   Enter accepts it. No-match rows leave arrows on history navigation.
   `tests/repl_cards.py` drives the `/model` raw-terminal editor through model,
-  think/token/reasoning, endpoint and hidden-key edits, proves zero I/O before
+  think/token/retry/backoff/reasoning, endpoint and hidden-key edits, proves
+  retry config persistence and restart reload, proves zero I/O before
   Refresh, checks one authenticated GET and exact discovered-ID selection, then
   verifies config/env persistence, restart reload and sanitized 401 output.
   Inline fetched-model expansion covers navigation, exact selection, cancel

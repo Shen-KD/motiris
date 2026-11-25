@@ -8,6 +8,15 @@ published by `.github/workflows/release.yml`.
 
 ### Added
 
+- Configurable per-provider retries: `max_retries=0..8` additional attempts and
+  `retry_base_seconds=0..60`, with cancellation-aware delays of base,
+  2*base, 4*base and so on before provider fallback. Transport, HTTP, malformed
+  JSON/API, missing/null and malformed/error-only/incomplete SSE failures retry
+  before visible deltas; partial streamed answers remain fail-closed, while
+  hidden reasoning does not suppress recovery. Every failed attempt emits the
+  original NUL-free JSON/text body or transport error. Both values are editable and
+  persistable in `/model`; offline mocks cover every failure class, all three
+  HTTP backends, exact backoff/cancellation, raw bodies and strict nofs builds.
 - Interactive `/model` default-provider card: edit model ID, endpoint,
   `think_mode=provider|on|off`, `max_tokens` and reasoning effort with immediate
   session effect and explicit persistence. A manual Refresh derives and fetches
