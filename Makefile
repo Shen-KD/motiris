@@ -211,6 +211,7 @@ test-docker:
 
 clean:
 	rm -f motiris *.a build/memory-unit build/filetools-unit build/webtools-parser \
+		build/repl_drop_async_wake.so \
 		examples/hello_plugin.so plugins/context_compaction/context_compaction.so
 	rm -rf build/nofs
 	find src deps -name '*.o' -delete
