@@ -1425,6 +1425,7 @@ static int repl_sync_loop(MotirisAgent *a, ReplState *state,
 #define REPL_UI_EVENT_BYTES (256u * 1024u)
 #define REPL_UI_CHUNK 4096u
 #define REPL_EDIT_INITIAL 4096u
+#define REPL_ACTIVE_POLL_MS 100
 
 typedef enum {
   REPL_UI_DELTA,
@@ -2151,7 +2152,14 @@ static int repl_tty_loop(MotirisAgent *a, ReplState *state,
       { .fd = STDIN_FILENO, .events = POLLIN },
       { .fd = tty.async.pipefd[0], .events = POLLIN }
     };
-    int ready = poll(fds, 2, -1);
+    /* The self-pipe is the fast path. While a worker is active, also poll
+     * with a bounded wait so queued events and a completed worker are still
+     * observed if a wakeup is lost. Never clear worker_active without join. */
+    int ready = poll(fds, 2, tty.worker_active ? REPL_ACTIVE_POLL_MS : -1);
+    if (ready == 0) {
+      repl_tty_drain_events(&tty);
+      continue;
+    }
     if (ready < 0) {
       if (errno == EINTR) continue;
       repl_tty_hide(&tty);

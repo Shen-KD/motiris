@@ -190,8 +190,11 @@ lone Escape request the existing cooperative cancel flag without clearing the
 draft/FIFO; after join, rollback and session finalization, the next line runs
 automatically. Arbitrary tool calls still cannot be forcibly interrupted.
 Lock-free C11 atomics give cancellation flags signal/cross-thread visibility,
-and self-pipe writes retry `EINTR`. Escape/UTF-8/bracketed-paste parsers retain
-partial state across bounded reads.
+and self-pipe writes retry `EINTR`. While a worker is active, the main thread
+also wakes every 100ms to drain events and recheck completion; idle waits stay
+unlimited. This bounded fallback recovers from lost event/completion wakeups
+without detaching or forcibly clearing a live worker. Escape/UTF-8/bracketed-
+paste parsers retain partial state across bounded reads.
 
 Approval is a condition-variable handoff: the worker waits while the main
 thread runs the existing card as sole input reader, then resumes with the
@@ -203,6 +206,9 @@ continuation, local-command ordering, lone-Esc cancellation, exact user
 history, draft preservation and final-screen answer visibility across buffered
 and consecutive streamed deltas; existing cancel/cards/menu/render tests cover
 Ctrl+C, approval arbitration and non-TTY compatibility.
+`tests/repl_stream_recovery.py` uses a test-only `LD_PRELOAD` interposer to
+drop self-pipe wakeups across a truncated SSE response, then proves queued
+and newly submitted turns both recover with no partial assistant replay.
 
 ### Provider routing, single rendering and bounded responses
 

@@ -146,6 +146,13 @@ published by `.github/workflows/release.yml`.
 
 ### Fixed
 
+- REPL generation now uses a 100ms active-worker poll fallback in addition to
+  self-pipe wakeups. Lost event/completion notifications can no longer leave
+  `worker_active` stuck after a truncated stream: queued output is drained,
+  the finished thread is joined and pending/new input continues. Idle polling
+  remains unlimited, and running workers are never forcibly detached. A real-
+  PTY regression injects lost pipe wakeups across a mid-stream disconnect and
+  verifies both queued and post-recovery turns.
 - `/model` no longer redraws on raw-input timeouts, and its refreshed IDs now
   expand into an inline scrolling option list with keyboard apply/cancel and
   manual-edit fallback. Closing with unsaved changes prompts for save,
